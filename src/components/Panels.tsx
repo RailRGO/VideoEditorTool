@@ -1,0 +1,765 @@
+import { useState } from "react";
+import type { Claim, LayerStyle, LayoutState, AudioState, Segment } from "../lib/types";
+import { LAYOUT_PRESETS, SEGMENT_META } from "../lib/types";
+import { fmtTime } from "../lib/timeline";
+import type { Levels } from "../lib/audio";
+import { Btn, LiveText, Meter, Note, Section, Segmented, Slider, Toggle } from "./ui";
+import { cn } from "../utils/cn";
+
+/* ------------------------------------------------------------------ layout */
+
+export function LayoutPanel({
+  layout,
+  setLayout,
+  editLayer,
+  setEditLayer,
+  dims,
+  fileName,
+  showGuides,
+  setShowGuides,
+  selected,
+  onSegmentType,
+}: {
+  layout: LayoutState;
+  setLayout: React.Dispatch<React.SetStateAction<LayoutState>>;
+  editLayer: "content" | "cam";
+  setEditLayer: (k: "content" | "cam") => void;
+  dims: { w: number; h: number };
+  fileName: string;
+  showGuides: boolean;
+  setShowGuides: (v: boolean) => void;
+  selected: Segment | null;
+  onSegmentType: (t: Segment["type"]) => void;
+}) {
+  const isContent = editLayer === "content";
+  const rect = isContent ? layout.content : layout.cam;
+  const style: LayerStyle = isContent ? layout.contentStyle : layout.camStyle;
+
+  const setRect = (patch: Partial<typeof rect>) =>
+    setLayout((l) => ({
+      ...l,
+      [isContent ? "content" : "cam"]: { ...rect, ...patch },
+    }));
+  const setStyle = (patch: Partial<LayerStyle>) =>
+    setLayout((l) => ({
+      ...l,
+      [isContent ? "contentStyle" : "camStyle"]: { ...style, ...patch },
+    }));
+
+  const pct = (v: number) => `${Math.round(v * 1000) / 10}%`;
+
+  return (
+    <div className="space-y-2.5">
+      <Section
+        title="Source"
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            {dims.w}×{dims.h}
+          </span>
+        }
+      >
+        <p className="mb-2 truncate text-[11px] text-slate-400">{fileName}</p>
+        <div className="space-y-2">
+          <Segmented
+            value={layout.sourceMode}
+            onChange={(v) => setLayout((l) => ({ ...l, sourceMode: v }))}
+            options={[
+              { value: "split", label: "Side-by-side (3840×1080)" },
+              { value: "single", label: "Single 16:9 file" },
+            ]}
+          />
+          <Segmented
+            value={layout.cameraSide}
+            onChange={(v) => setLayout((l) => ({ ...l, cameraSide: v }))}
+            options={[
+              { value: "left", label: "Cam = left half" },
+              { value: "right", label: "Cam = right half" },
+            ]}
+          />
+          <Toggle
+            label="Composition guides"
+            hint="thirds + title-safe overlay"
+            value={showGuides}
+            onChange={setShowGuides}
+          />
+        </div>
+      </Section>
+
+      <Section title="Frame presets">
+        <div className="grid grid-cols-2 gap-1.5">
+          {LAYOUT_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() =>
+                setLayout((l) => ({
+                  ...l,
+                  content: { ...p.content },
+                  cam: { ...p.cam },
+                  contentHidden: p.hideContent,
+                  camStyle: { ...l.camStyle, shape: p.camShape },
+                }))
+              }
+              className={cn(
+                "rounded-lg border border-white/10 bg-white/[0.03] p-2 text-left transition-colors hover:border-sky-400/40 hover:bg-sky-500/10",
+                layout.content.x === p.content.x &&
+                  layout.cam.x === p.cam.x &&
+                  layout.contentHidden === p.hideContent && "border-sky-400/50 bg-sky-500/10"
+              )}
+            >
+              <span className="block text-[11px] font-medium text-slate-200">{p.name}</span>
+              <span className="block text-[9px] leading-tight text-slate-500">{p.hint}</span>
+            </button>
+          ))}
+        </div>
+        <div className="mt-2">
+          <Toggle
+            label="Hide the sharp content layer"
+            hint="only the blurred plate stays behind you"
+            value={layout.contentHidden}
+            onChange={(v) => setLayout((l) => ({ ...l, contentHidden: v }))}
+          />
+        </div>
+      </Section>
+
+      <Section
+        title="Layer"
+        right={
+          <Segmented
+            className="w-[150px]"
+            value={editLayer}
+            onChange={setEditLayer}
+            options={[
+              { value: "content", label: "Content" },
+              { value: "cam", label: "Camera" },
+            ]}
+          />
+        }
+      >
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+          <Slider label="X" value={rect.x} min={0} max={0.98} step={0.005} display={pct(rect.x)} onChange={(v) => setRect({ x: v })} />
+          <Slider label="Y" value={rect.y} min={0} max={0.98} step={0.005} display={pct(rect.y)} onChange={(v) => setRect({ y: v })} />
+          <Slider label="Width" value={rect.w} min={0.05} max={1} step={0.005} display={pct(rect.w)} onChange={(v) => setRect({ w: v })} />
+          <Slider label="Height" value={rect.h} min={0.05} max={1} step={0.005} display={pct(rect.h)} onChange={(v) => setRect({ h: v })} />
+        </div>
+        <div className="mt-2 space-y-2">
+          <div className="grid grid-cols-2 gap-1.5">
+            <Segmented
+              size="sm"
+              value={style.fit}
+              onChange={(v) => setStyle({ fit: v })}
+              options={[
+                { value: "contain", label: "Fit" },
+                { value: "cover", label: "Fill" },
+              ]}
+            />
+            <Segmented
+              size="sm"
+              value={style.shape}
+              onChange={(v) => setStyle({ shape: v })}
+              options={[
+                { value: "rect", label: "Rect" },
+                { value: "rounded", label: "Round" },
+                { value: "circle", label: "Circle" },
+                { value: "pill", label: "Pill" },
+              ]}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+            <Slider label="Zoom" value={style.zoom} min={1} max={2} step={0.01} display={`${style.zoom.toFixed(2)}×`} onChange={(v) => setStyle({ zoom: v })} />
+            <Slider label="Corner radius" value={style.radius} min={0} max={60} step={1} display={`${style.radius}px`} onChange={(v) => setStyle({ radius: v })} />
+            <Slider label="Offset X" value={style.offsetX} min={-0.5} max={0.5} step={0.005} display={pct(style.offsetX)} onChange={(v) => setStyle({ offsetX: v })} />
+            <Slider label="Offset Y" value={style.offsetY} min={-0.5} max={0.5} step={0.005} display={pct(style.offsetY)} onChange={(v) => setStyle({ offsetY: v })} />
+            <Slider label="Border" value={style.border} min={0} max={12} step={1} display={`${style.border}px`} onChange={(v) => setStyle({ border: v })} />
+            <Slider label="Opacity" value={style.opacity} min={0.1} max={1} step={0.01} display={pct(style.opacity)} onChange={(v) => setStyle({ opacity: v })} />
+          </div>
+          <div className="flex gap-1.5">
+            <Btn className="flex-1" onClick={() => setStyle({ mirror: !style.mirror })}>
+              {style.mirror ? "Mirrored ✓" : "Mirror"}
+            </Btn>
+            <Btn
+              className="flex-1"
+              onClick={() =>
+                setStyle({
+                  borderColor: style.borderColor === "#0ea5e9" ? "#f43f5e" : "#0ea5e9",
+                })
+              }
+            >
+              Border colour
+            </Btn>
+          </div>
+          <p className="text-[10px] text-slate-500">
+            Tip: drag the boxes straight on the preview — they snap to the frame edges, the centre
+            and the usual camera widths, so parking the camera in a corner is one movement.
+          </p>
+        </div>
+      </Section>
+
+      <Section title="Background plate">
+        <div className="space-y-2">
+          <Segmented
+            value={layout.bg.source}
+            onChange={(v) => setLayout((l) => ({ ...l, bg: { ...l.bg, source: v } }))}
+            options={[
+              { value: "full", label: "Full frame" },
+              { value: "content", label: "Content" },
+              { value: "camera", label: "Camera" },
+            ]}
+          />
+          <Slider
+            label="Blur"
+            value={layout.bg.blur}
+            min={0}
+            max={120}
+            step={1}
+            display={`${layout.bg.blur}px`}
+            onChange={(v) => setLayout((l) => ({ ...l, bg: { ...l.bg, blur: v } }))}
+          />
+          <Slider
+            label="Opacity"
+            value={layout.bg.opacity}
+            min={0}
+            max={1}
+            step={0.01}
+            display={pct(layout.bg.opacity)}
+            onChange={(v) => setLayout((l) => ({ ...l, bg: { ...l.bg, opacity: v } }))}
+          />
+          <div className="grid grid-cols-2 gap-x-3">
+            <Slider label="Scale" value={layout.bg.scale} min={1} max={1.4} step={0.01} display={`${layout.bg.scale.toFixed(2)}×`} onChange={(v) => setLayout((l) => ({ ...l, bg: { ...l.bg, scale: v } }))} />
+            <Slider label="Dim" value={layout.bg.dim} min={0} max={0.8} step={0.01} display={pct(layout.bg.dim)} onChange={(v) => setLayout((l) => ({ ...l, bg: { ...l.bg, dim: v } }))} />
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Intro / outro (camera full frame)">
+        <div className="space-y-2">
+          <Segmented
+            value={layout.soloStyle.fit}
+            onChange={(v) =>
+              setLayout((l) => ({ ...l, soloStyle: { ...l.soloStyle, fit: v } }))
+            }
+            options={[
+              { value: "contain", label: "Fit" },
+              { value: "cover", label: "Fill" },
+            ]}
+          />
+          <Slider
+            label="Scale"
+            value={layout.soloStyle.zoom}
+            min={1}
+            max={1.6}
+            step={0.01}
+            display={`${layout.soloStyle.zoom.toFixed(2)}×`}
+            onChange={(v) => setLayout((l) => ({ ...l, soloStyle: { ...l.soloStyle, zoom: v } }))}
+          />
+          <Toggle
+            label="Silence content audio during intro / outro"
+            hint="your mic keeps playing"
+            value={layout.muteContentInSolo}
+            onChange={(v) => setLayout((l) => ({ ...l, muteContentInSolo: v }))}
+          />
+          {selected && (
+            <div className="mt-1 rounded-lg border border-white/10 bg-black/20 p-2">
+              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-slate-500">
+                Selected segment · {fmtTime(selected.end - selected.start)}
+              </p>
+              <div className="flex flex-wrap gap-1">
+                {(Object.keys(SEGMENT_META) as Segment["type"][]).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => onSegmentType(t)}
+                    className={cn(
+                      "rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                      SEGMENT_META[t].chip,
+                      selected.type === t && "ring-2 ring-white/60"
+                    )}
+                  >
+                    {SEGMENT_META[t].short}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- audio */
+
+export function AudioPanel({
+  audio,
+  setAudio,
+  getLevels,
+}: {
+  audio: AudioState;
+  setAudio: React.Dispatch<React.SetStateAction<AudioState>>;
+  getLevels: () => Levels;
+}) {
+  const mic = audio.mic;
+  const setMic = (patch: Partial<AudioState["mic"]>) =>
+    setAudio((a) => ({ ...a, mic: { ...a.mic, ...patch } }));
+  const setComp = (patch: Partial<AudioState["mic"]["comp"]>) =>
+    setAudio((a) => ({ ...a, mic: { ...a.mic, comp: { ...a.mic.comp, ...patch } } }));
+  const setDuck = (patch: Partial<AudioState["content"]["duck"]>) =>
+    setAudio((a) => ({
+      ...a,
+      content: { ...a.content, duck: { ...a.content.duck, ...patch } },
+    }));
+
+  return (
+    <div className="space-y-2.5">
+      <Section title="Meters">
+        <div className="space-y-1.5">
+          <Meter label="mic" get={() => getLevels().mic} />
+          <Meter label="content" get={() => getLevels().content} />
+          <div className="flex items-center justify-between pt-0.5 text-[10px] text-slate-500">
+            <span>
+              gain reduction{" "}
+              <span className="font-mono text-amber-300">
+                <LiveText get={() => `${getLevels().reduction.toFixed(1)} dB`} />
+              </span>
+            </span>
+            <span>
+              ducking{" "}
+              <span className="font-mono text-teal-300">
+                <LiveText get={() => (getLevels().ducking > 0.5 ? "active" : "idle")} />
+              </span>
+            </span>
+          </div>
+        </div>
+      </Section>
+
+      <Section
+        title="Mic channel"
+        right={
+          <Segmented
+            className="w-[110px]"
+            value={mic.channel}
+            onChange={(v) => setMic({ channel: v })}
+            options={[
+              { value: "left", label: "Left" },
+              { value: "right", label: "Right" },
+            ]}
+          />
+        }
+      >
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          Your OBS file carries mic on one channel and desktop audio on the other. Pick which is
+          which — each is then processed on its own bus.
+        </p>
+        <div className="space-y-2">
+          <Slider label="Gain" value={mic.gain} min={-24} max={18} step={0.5} display={`${mic.gain.toFixed(1)} dB`} onChange={(v) => setMic({ gain: v })} />
+          <Slider label="Pan" value={mic.pan} min={-1} max={1} step={0.05} display={mic.pan.toFixed(2)} onChange={(v) => setMic({ pan: v })} />
+        </div>
+      </Section>
+
+      <Section
+        title="Compressor + limiter (mic)"
+        right={
+          <button
+            type="button"
+            onClick={() => setComp({ on: !mic.comp.on })}
+            className={cn(
+              "rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+              mic.comp.on
+                ? "border-emerald-400/40 bg-emerald-500/15 text-emerald-200"
+                : "border-white/15 bg-white/5 text-slate-400"
+            )}
+          >
+            {mic.comp.on ? "on" : "bypass"}
+          </button>
+        }
+      >
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+          <Slider label="Threshold" value={mic.comp.threshold} min={-50} max={0} step={1} display={`${mic.comp.threshold} dB`} onChange={(v) => setComp({ threshold: v })} />
+          <Slider label="Ratio" value={mic.comp.ratio} min={1} max={20} step={0.5} display={`${mic.comp.ratio}:1`} onChange={(v) => setComp({ ratio: v })} />
+          <Slider label="Knee" value={mic.comp.knee} min={0} max={40} step={1} display={`${mic.comp.knee} dB`} onChange={(v) => setComp({ knee: v })} />
+          <Slider label="Make-up" value={mic.comp.makeup} min={0} max={18} step={0.5} display={`${mic.comp.makeup} dB`} onChange={(v) => setComp({ makeup: v })} />
+          <Slider label="Attack" value={mic.comp.attack} min={0} max={100} step={1} display={`${mic.comp.attack} ms`} onChange={(v) => setComp({ attack: v })} />
+          <Slider label="Release" value={mic.comp.release} min={20} max={1000} step={10} display={`${mic.comp.release} ms`} onChange={(v) => setComp({ release: v })} />
+        </div>
+        <div className="mt-2">
+          <Slider label="Limiter ceiling" value={mic.limiter} min={-12} max={0} step={0.5} display={`${mic.limiter} dB`} onChange={(v) => setMic({ limiter: v })} hint="hard cap on peaks, 20:1 after the compressor" />
+        </div>
+      </Section>
+
+      <Section title="Content audio + side-chain ducking">
+        <div className="space-y-2">
+          <Slider label="Gain" value={audio.content.gain} min={-30} max={6} step={0.5} display={`${audio.content.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, content: { ...a.content, gain: v } }))} />
+          <Toggle
+            label="Auto-duck content while I speak"
+            hint="driven by the post-compressor mic level"
+            value={audio.content.duck.on}
+            onChange={(v) => setDuck({ on: v })}
+          />
+          <div className={cn("grid grid-cols-2 gap-x-3 gap-y-2", !audio.content.duck.on && "pointer-events-none opacity-40")}>
+            <Slider label="Trigger at" value={audio.content.duck.threshold} min={-60} max={-10} step={1} display={`${audio.content.duck.threshold} dB`} onChange={(v) => setDuck({ threshold: v })} />
+            <Slider label="Depth" value={audio.content.duck.depth} min={0} max={30} step={1} display={`−${audio.content.duck.depth} dB`} onChange={(v) => setDuck({ depth: v })} />
+            <Slider label="Attack" value={audio.content.duck.attack} min={5} max={500} step={5} display={`${audio.content.duck.attack} ms`} onChange={(v) => setDuck({ attack: v })} />
+            <Slider label="Release" value={audio.content.duck.release} min={50} max={2000} step={10} display={`${audio.content.duck.release} ms`} onChange={(v) => setDuck({ release: v })} />
+            <Slider label="Hold" value={audio.content.duck.hold} min={0} max={2000} step={20} display={`${audio.content.duck.hold} ms`} onChange={(v) => setDuck({ hold: v })} />
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Master">
+        <Slider label="Output gain" value={audio.master.gain} min={-20} max={6} step={0.5} display={`${audio.master.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, master: { gain: v } }))} hint="a −1.5 dB safety limiter is always engaged last" />
+      </Section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ claims */
+
+export function ClaimsPanel({
+  raw,
+  setRaw,
+  claims,
+  timeBase,
+  setTimeBase,
+  onParse,
+  onAction,
+  onApplyAll,
+  onClear,
+  onCopyEDL,
+  onDownloadEDL,
+  segments,
+}: {
+  raw: string;
+  setRaw: (v: string) => void;
+  claims: Claim[];
+  timeBase: "source" | "render";
+  setTimeBase: (v: "source" | "render") => void;
+  onParse: () => void;
+  onAction: (id: string, action: Claim["action"]) => void;
+  onApplyAll: () => void;
+  onClear: () => void;
+  onCopyEDL: () => void;
+  onDownloadEDL: () => void;
+  segments: Segment[];
+}) {
+  const [copied, setCopied] = useState(false);
+  const unresolved = claims.filter((c) => c.action === "none").length;
+
+  return (
+    <div className="space-y-2.5">
+      <Section title="Claimed segments">
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          In YouTube Studio → Content → the ⚠ next to your video you can see exactly which
+          segment(s) were matched. Paste them here, one per line, in any of these forms:
+        </p>
+        <pre className="mb-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 p-2 text-[10px] leading-relaxed text-slate-400">
+{`02:14 - 03:40  Song title
+00:02:14 to 00:03:40
+131 - 220`}
+        </pre>
+        <textarea
+          value={raw}
+          onChange={(e) => setRaw(e.target.value)}
+          rows={5}
+          spellCheck={false}
+          placeholder={"02:14 - 03:40  Claimed music\n12:03 - 12:47  Visual match"}
+          className="w-full resize-y rounded-lg border border-white/10 bg-black/40 p-2 font-mono text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-sky-400/50"
+        />
+        <div className="mt-2 flex items-center gap-2">
+          <Segmented
+            className="flex-1"
+            value={timeBase}
+            onChange={setTimeBase}
+            options={[
+              { value: "source", label: "Times are source" },
+              { value: "render", label: "Times are uploaded" },
+            ]}
+          />
+          <Btn variant="primary" onClick={onParse}>
+            Parse
+          </Btn>
+        </div>
+      </Section>
+
+      {claims.length > 0 && (
+        <Section
+          title={`${claims.length} claim${claims.length === 1 ? "" : "s"} mapped`}
+          right={
+            <button
+              type="button"
+              onClick={onClear}
+              className="text-[10px] text-slate-500 underline hover:text-slate-300"
+            >
+              clear
+            </button>
+          }
+        >
+          <div className="space-y-1.5">
+            {claims.map((c) => (
+              <div key={c.id} className="rounded-lg border border-white/10 bg-black/25 p-2">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="font-mono text-[11px] text-slate-200">
+                    {fmtTime(c.start)} → {fmtTime(c.end)}
+                  </span>
+                  <span className="font-mono text-[10px] text-slate-500">
+                    {Math.round(c.end - c.start)}s
+                  </span>
+                </div>
+                <p className="mb-1.5 truncate text-[10px] text-slate-400">{c.label}</p>
+                <div className="flex gap-1">
+                  {(
+                    [
+                      ["none", "keep"],
+                      ["mute", "mute audio"],
+                      ["cut", "remove"],
+                    ] as [Claim["action"], string][]
+                  ).map(([a, label]) => (
+                    <button
+                      key={a}
+                      type="button"
+                      onClick={() => onAction(c.id, a)}
+                      className={cn(
+                        "flex-1 rounded border px-1 py-1 text-[10px] font-semibold",
+                        c.action === a
+                          ? a === "cut"
+                            ? "border-rose-400/50 bg-rose-500/25 text-rose-100"
+                            : a === "mute"
+                            ? "border-amber-400/50 bg-amber-500/25 text-amber-100"
+                            : "border-white/25 bg-white/10 text-white"
+                          : "border-white/10 bg-white/[0.03] text-slate-400 hover:bg-white/10"
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 flex items-center gap-1.5">
+            <Btn variant="primary" className="flex-1" onClick={onApplyAll}>
+              Apply {unresolved ? `${unresolved} pending` : "all"} to timeline
+            </Btn>
+          </div>
+        </Section>
+      )}
+
+      <Section title="Export edit list">
+        <div className="flex gap-1.5">
+          <Btn
+            className="flex-1"
+            onClick={() => {
+              onCopyEDL();
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1600);
+            }}
+          >
+            {copied ? "Copied ✓" : "Copy EDL"}
+          </Btn>
+          <Btn className="flex-1" onClick={onDownloadEDL}>
+            Download .txt
+          </Btn>
+        </div>
+        <p className="mt-2 font-mono text-[10px] text-slate-500">
+          {segments.filter((s) => s.type === "cut").length} removed ·{" "}
+          {segments.filter((s) => s.type === "mute").length} muted
+        </p>
+      </Section>
+
+      <Note>
+        <strong className="font-semibold">Cut version here, full version on Patreon</strong> —
+        that’s exactly what this tab and the auto-cut are for. The trimmed render simply contains
+        less of the source, which is the one thing that reliably changes what a fingerprint sees.
+        <br />
+        <br />
+        If a claim still lands on the cut version:
+        <br />
+        <span className="ml-1">1.</span> <strong>Trim or mute the matched part</strong> — mark it
+        <span className="mx-1 rounded border border-rose-400/30 bg-rose-500/15 px-1 text-[10px] text-rose-200">CUT</span>
+        or
+        <span className="mx-1 rounded border border-amber-400/30 bg-amber-500/15 px-1 text-[10px] text-amber-200">MUTE</span>
+        above, re-render, re-upload. This is the same remedy YouTube’s own editor offers, so it
+        clears the claim for good rather than temporarily.
+        <br />
+        <span className="ml-1">2.</span> <strong>Check the claim type.</strong> Most claims on
+        reaction videos are “monetise” (revenue is shared, video stays up, no strike) — you can
+        just accept those. A copyright <em>strike</em> only comes from a takedown request, which is
+        a different, rarer thing.
+        <br />
+        <span className="ml-1">3.</span> <strong>Dispute</strong> if you have a licence or your
+        commentary is genuinely transformative — the more you talk over it, the stronger that
+        argument gets.
+        <br />
+        <span className="ml-1">4.</span> Keep the <strong>CARD</strong> segments in: they carry no
+        content at all, and they’re your funnel to Patreon.
+      </Note>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ export */
+
+export function ExportPanel({
+  res,
+  setRes,
+  fps,
+  setFps,
+  bitrate,
+  setBitrate,
+  exporting,
+  progress,
+  resultUrl,
+  resultSize,
+  fileName,
+  onExport,
+  onStop,
+  outDur,
+  removed,
+  duration,
+  mime,
+}: {
+  res: 720 | 1080;
+  setRes: (v: 720 | 1080) => void;
+  fps: 24 | 30 | 60;
+  setFps: (v: 24 | 30 | 60) => void;
+  bitrate: number;
+  setBitrate: (v: number) => void;
+  exporting: boolean;
+  progress: number;
+  resultUrl: string | null;
+  resultSize: number;
+  fileName: string;
+  onExport: () => void;
+  onStop: () => void;
+  outDur: number;
+  removed: number;
+  duration: number;
+  mime: string;
+}) {
+  return (
+    <div className="space-y-2.5">
+      <Section title="Render">
+        <div className="space-y-2">
+          <Segmented
+            value={String(res)}
+            onChange={(v) => setRes(Number(v) as 720 | 1080)}
+            options={[
+              { value: "720", label: "1280×720" },
+              { value: "1080", label: "1920×1080" },
+            ]}
+          />
+          <Segmented
+            value={String(fps)}
+            onChange={(v) => setFps(Number(v) as 24 | 30 | 60)}
+            options={[
+              { value: "24", label: "24 fps" },
+              { value: "30", label: "30 fps" },
+              { value: "60", label: "60 fps" },
+            ]}
+          />
+          <Slider
+            label="Video bitrate"
+            value={bitrate}
+            min={2}
+            max={40}
+            step={1}
+            display={`${bitrate} Mbps`}
+            onChange={setBitrate}
+            hint="12–20 Mbps is plenty for 1080p reaction videos"
+          />
+        </div>
+      </Section>
+
+      <Section title="Programme">
+        <div className="grid grid-cols-2 gap-2 text-[11px]">
+          <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+            <p className="text-[9px] uppercase tracking-wider text-slate-500">source</p>
+            <p className="font-mono text-slate-200">{fmtTime(duration)}</p>
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+            <p className="text-[9px] uppercase tracking-wider text-slate-500">render</p>
+            <p className="font-mono text-sky-300">{fmtTime(outDur)}</p>
+          </div>
+        </div>
+        <p className="mt-2 text-[10px] text-slate-500">
+          {removed > 0.05
+            ? `${fmtTime(removed)} of claimed/unwanted material is excluded from the render.`
+            : "Nothing is removed — the render covers the whole source."}
+        </p>
+      </Section>
+
+      <Section title="Record">
+        <div className="space-y-2">
+          {exporting ? (
+            <>
+              <div className="h-2 overflow-hidden rounded-full bg-black/50 ring-1 ring-inset ring-white/10">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-sky-400 to-violet-400 transition-[width]"
+                  style={{ width: `${Math.round(progress * 100)}%` }}
+                />
+              </div>
+              <p className="font-mono text-[11px] text-sky-300">
+                {(progress * 100).toFixed(1)}% · recording in real time
+              </p>
+              <Btn variant="danger" className="w-full" onClick={onStop}>
+                Stop &amp; keep what’s recorded
+              </Btn>
+            </>
+          ) : (
+            <Btn variant="primary" className="w-full py-2 text-[12px]" onClick={onExport}>
+              ● Render {fmtTime(outDur)} to file
+            </Btn>
+          )}
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            The render plays the programme once from the top and captures the composited canvas
+            plus the processed audio bus, so it takes about as long as the video. Keep this tab
+            visible and don’t switch spaces — browsers throttle hidden tabs.
+          </p>
+          <p className="font-mono text-[10px] text-slate-600">container: {mime || "unsupported"}</p>
+        </div>
+      </Section>
+
+      <Section title="Where the work happens">
+        <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+          <li>
+            <span className="text-slate-200">All local, nothing uploaded.</span> The browser
+            streams your 3 GB file straight off the disk, composites frames on a canvas and encodes
+            with MediaRecorder. No server is involved at any point.
+          </li>
+          <li>
+            <span className="text-slate-200">WebM uploads fine.</span> YouTube accepts WebM
+            (VP9 + Opus) natively alongside MP4 and re-encodes everything on ingest, so there is no
+            penalty for handing it a .webm.
+          </li>
+          <li>
+            <span className="text-slate-200">Output is much smaller.</span> You render 1080p at the
+            bitrate above — typically a fraction of the OBS original, so the upload is far quicker
+            than re-uploading the source.
+          </li>
+          <li>
+            <span className="text-slate-200">Chrome or Edge only.</span> Safari can neither decode
+            WebM/Opus nor run the mic scanner.
+          </li>
+        </ul>
+      </Section>
+
+      {resultUrl && (
+        <Section title="Output">
+          <video src={resultUrl} controls className="mb-2 w-full rounded-lg bg-black" />
+          <div className="flex items-center gap-1.5">
+            <a
+              href={resultUrl}
+              download={`${fileName.replace(/\.[^.]+$/, "") || "reaction"}-render.webm`}
+              className="flex-1 rounded-lg border border-emerald-400/40 bg-emerald-500/20 px-2.5 py-1.5 text-center text-[11px] font-semibold text-emerald-100 hover:bg-emerald-500/30"
+            >
+              ↓ Download {(resultSize / 1048576).toFixed(1)} MB
+            </a>
+          </div>
+          <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+            WebM/VP9+Opus uploads to YouTube directly. If you need H.264 for your archive, drop
+            the file through <span className="font-mono">ffmpeg -i in.webm -c:v libx264 -crf 18 -c:a aac out.mp4</span>.
+          </p>
+        </Section>
+      )}
+    </div>
+  );
+}
