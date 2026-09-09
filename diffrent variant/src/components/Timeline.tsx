@@ -48,7 +48,7 @@ export function Timeline({
   };
 
   return (
-    <div className="h-[178px] shrink-0 border-t border-white/5 bg-[#0a0d14] px-3 py-2">
+    <div className="h-[240px] shrink-0 border-t border-white/5 bg-[#0a0d14] px-3 py-2">
       <div className="mb-2 flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-zinc-500">
         <span>Program timeline</span>
         <span className="font-mono text-zinc-400">
