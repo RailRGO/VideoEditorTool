@@ -1,0 +1,11 @@
+{
+  "name": "reaction-webapp-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node e2e.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

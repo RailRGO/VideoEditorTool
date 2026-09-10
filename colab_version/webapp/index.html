@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reaction Studio — Colab Web Editor</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: #070a12; color: #e2e8f0;
+    font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "tnum";
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; border-bottom: 1px solid rgba(255,255,255,.1);
+    background: rgba(2,6,23,.7); position: sticky; top: 0; z-index: 50;
+  }
+  header .logo {
+    width: 24px; height: 24px; border-radius: 6px; flex: none;
+    background: linear-gradient(135deg,#38bdf8,#a78bfa);
+    color: #0f172a; font-weight: 900; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  header h1 { font-size: 13px; margin: 0; color: #fff; font-weight: 600; }
+  header .sub { font-size: 10px; color: #64748b; }
+  header .badge {
+    margin-left: auto; font-family: monospace; font-size: 11px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(0,0,0,.4);
+    padding: 4px 10px; border-radius: 8px; color: #94a3b8; white-space: nowrap;
+  }
+  header .badge b { color: #7dd3fc; font-weight: 600; }
+  #app { display: flex; min-height: calc(100vh - 45px); }
+  main { flex: 1; min-width: 0; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  aside {
+    width: 348px; flex: none; border-left: 1px solid rgba(255,255,255,.1);
+    background: rgba(2,6,23,.4); display: flex; flex-direction: column;
+  }
+  nav.tabs { display: flex; gap: 2px; padding: 6px; border-bottom: 1px solid rgba(255,255,255,.1); }
+  nav.tabs button {
+    flex: 1; border: 0; border-radius: 7px; padding: 7px 2px; cursor: pointer;
+    background: transparent; color: #64748b; font-size: 11px; font-weight: 600;
+  }
+  nav.tabs button:hover { background: rgba(255,255,255,.05); color: #cbd5e1; }
+  nav.tabs button.on {
+    background: rgba(255,255,255,.1); color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.12);
+  }
+  #tabbody { overflow-y: auto; padding: 10px; flex: 1; }
+  .sec {
+    border: 1px solid rgba(255,255,255,.1); border-radius: 10px;
+    background: rgba(255,255,255,.025); padding: 10px; margin-bottom: 10px;
+  }
+  .sec h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .06em; color: #94a3b8; font-weight: 600; }
+  .sec p.hint { font-size: 10px; color: #64748b; margin: 6px 0 0; }
+  .srow { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .srow label { width: 92px; flex: none; font-size: 11px; color: #94a3b8; }
+  .srow input[type=range] { flex: 1; accent-color: #0ea5e9; height: 18px; }
+  .srow .val { width: 62px; flex: none; text-align: right; font-size: 11px;
+    font-family: monospace; color: #7dd3fc; }
+  .btnrow { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  button.btn, select.btn, a.btn {
+    border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.06);
+    color: #e2e8f0; border-radius: 8px; padding: 6px 10px; font-size: 11px;
+    cursor: pointer; text-decoration: none; display: inline-block;
+  }
+  button.btn:hover, a.btn:hover { background: rgba(255,255,255,.12); }
+  button.btn:disabled { opacity: .4; cursor: default; }
+  button.btn.primary { background: #0284c7; border-color: #0284c7; color: #fff; font-weight: 600; }
+  button.btn.primary:hover { background: #0ea5e9; }
+  button.btn.danger { background: #be123c; border-color: #be123c; color: #fff; font-weight: 600; }
+  button.btn.danger:hover { background: #e11d48; }
+  select, input[type=text], input[type=number], textarea {
+    background: rgba(0,0,0,.4); border: 1px solid rgba(255,255,255,.12);
+    color: #e2e8f0; border-radius: 8px; padding: 6px 8px; font-size: 11px;
+  }
+  select { max-width: 100%; }
+  textarea { width: 100%; box-sizing: border-box; font-family: monospace; resize: vertical; }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #cbd5e1; margin: 5px 0; }
+  .chk input { accent-color: #0ea5e9; }
+  /* stage */
+  #stagewrap {
+    position: relative; width: 100%; aspect-ratio: 16/9; max-height: 62vh;
+    margin: 0 auto; background: #000; border-radius: 12px; overflow: hidden;
+    border: 1px solid rgba(255,255,255,.1);
+  }
+  #stage { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .box {
+    position: absolute; border: 2px solid #0ea5e9; border-radius: 6px;
+    cursor: move; box-sizing: border-box; touch-action: none;
+  }
+  .box.content { border-color: #22d3ee; }
+  .box .tag {
+    position: absolute; top: -20px; left: 0; font-size: 10px; font-weight: 700;
+    background: rgba(2,6,23,.8); padding: 1px 6px; border-radius: 4px; color: #7dd3fc;
+    white-space: nowrap;
+  }
+  .box.content .tag { color: #67e8f9; }
+  .box .handle {
+    position: absolute; right: -8px; bottom: -8px; width: 16px; height: 16px;
+    background: #fff; border: 2px solid #0ea5e9; border-radius: 50%; cursor: nwse-resize;
+  }
+  #scenebadge {
+    position: absolute; top: 8px; left: 8px; font-size: 10px; font-weight: 700;
+    padding: 3px 8px; border-radius: 6px; background: rgba(2,6,23,.75);
+    border: 1px solid rgba(255,255,255,.15); letter-spacing: .04em;
+  }
+  #proxybar {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(2,6,23,.92); z-index: 20; text-align: center; padding: 20px;
+  }
+  #proxybar.hidden { display: none; }
+  #transport {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.025);
+    border-radius: 10px; padding: 8px 10px;
+  }
+  #transport .time { font-family: monospace; font-size: 12px; }
+  #transport .time b { color: #7dd3fc; font-weight: 600; }
+  #transport .time span { color: #64748b; font-size: 10px; }
+  #playbtn { width: 34px; height: 30px; font-size: 13px; }
+  #timeline { width: 100%; height: 86px; display: block; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.1); border-radius: 10px; background: rgba(0,0,0,.3); }
+  #exactwrap { display: flex; gap: 10px; align-items: flex-start; }
+  #exactimg {
+    width: 340px; max-width: 38%; aspect-ratio: 16/9; background: #000;
+    border-radius: 10px; border: 1px solid rgba(52,211,153,.35); object-fit: contain;
+  }
+  #exactmeta { font-size: 11px; color: #94a3b8; }
+  #exactmeta b { color: #6ee7b7; }
+  #toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(190,18,60,.95); color: #fff; padding: 8px 16px; border-radius: 10px;
+    font-size: 12px; display: none; z-index: 100; max-width: 80vw;
+  }
+  #toast.show { display: block; }
+  #prog { height: 8px; background: rgba(0,0,0,.5); border-radius: 99px; overflow: hidden;
+    border: 1px solid rgba(255,255,255,.1); margin-top: 6px; }
+  #prog > div { height: 100%; width: 0; background: linear-gradient(90deg,#38bdf8,#a78bfa); }
+  #joblog { font-family: monospace; font-size: 10px; color: #94a3b8; white-space: pre-wrap;
+    max-height: 120px; overflow-y: auto; margin-top: 6px; }
+  video.sample, audio.sample { width: 100%; border-radius: 8px; background: #000; margin-top: 6px; }
+  table.tl { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 6px; }
+  table.tl td { border-top: 1px solid rgba(255,255,255,.07); padding: 2px 4px;
+    font-family: monospace; color: #94a3b8; }
+  .warn { color: #fbbf24 !important; }
+  .ok { color: #6ee7b7 !important; }
+  .segbtns { display: flex; gap: 2px; background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.1);
+    border-radius: 8px; padding: 2px; }
+  .segbtns button { border: 0; background: transparent; color: #64748b; font-size: 10px;
+    font-weight: 600; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+  .segbtns button.on { background: rgba(14,165,233,.2); color: #bae6fd; }
+  @media (max-width: 1100px) {
+    #app { flex-direction: column; }
+    aside { width: auto; border-left: 0; border-top: 1px solid rgba(255,255,255,.1); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">R</div>
+  <h1>Reaction Studio <span class="sub">Colab web editor · compute on the VM, pixels in this tab</span></h1>
+  <div class="badge" id="filebadge">connecting…</div>
+</header>
+<div id="app">
+  <main>
+    <div id="stagewrap">
+      <canvas id="stage" width="960" height="540"></canvas>
+      <div class="box content" id="box-content"><div class="tag">CONTENT</div><div class="handle"></div></div>
+      <div class="box" id="box-cam"><div class="tag">CAMERA</div><div class="handle"></div></div>
+      <div id="scenebadge">—</div>
+      <div id="proxybar"><div>
+        <div style="font-size:14px;color:#fff;margin-bottom:6px">Preparing smooth playback…</div>
+        <div style="font-size:11px;color:#94a3b8" id="proxybar-sub">one-time transcode, cached on Drive</div>
+        <div style="margin-top:10px"><button class="btn" id="stillsbtn">Continue with stills only</button></div>
+      </div></div>
+    </div>
+    <div id="transport">
+      <button class="btn" id="playbtn" title="Play/pause (Space)">▶</button>
+      <button class="btn" id="backbtn" title="Back 1 frame">◀|</button>
+      <button class="btn" id="fwdbtn" title="Forward 1 frame">|▶</button>
+      <div class="time"><b id="t-out">00:00</b> / <span id="t-outdur">00:00</span>
+        &nbsp;<span>src <span id="t-src">00:00</span></span></div>
+      <div class="segbtns" id="rateseg">
+        <button data-r="0.5">0.5×</button><button data-r="1" class="on">1×</button><button data-r="2">2×</button>
+      </div>
+      <div class="segbtns" id="sceneseg">
+        <button data-s="auto" class="on" title="Follow the timeline">AUTO</button>
+        <button data-s="body">Reaction</button><button data-s="solo">Solo</button>
+        <button data-s="card">Card</button><button data-s="lead">Lead-in</button>
+      </div>
+      <label class="chk" style="margin:0"><input type="checkbox" id="exactauto" checked> exact auto</label>
+      <button class="btn" id="exactbtn">✦ Exact still</button>
+    </div>
+    <canvas id="timeline" height="86"></canvas>
+    <div id="exactwrap">
+      <img id="exactimg" alt="pixel-exact server render">
+      <div id="exactmeta">Pixel-exact still, rendered on the Colab VM by the same code as the final file.<br><b id="exactinfo">—</b><div id="overlapmsg" style="margin-top:4px"></div></div>
+    </div>
+  </main>
+  <aside>
+    <nav class="tabs" id="tabs">
+      <button data-t="layout" class="on">Layout</button>
+      <button data-t="retouch">Retouch</button>
+      <button data-t="cuts">Cuts</button>
+      <button data-t="audio">Audio</button>
+      <button data-t="render">Render</button>
+    </nav>
+    <div id="tabbody"></div>
+  </aside>
+</div>
+<video id="proxy" style="display:none" playsinline preload="auto"></video>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ============================================================
+   Reaction Studio — Colab web client (no build step).
+   The hidden <video> streams a small proxy; the stage canvas
+   composites the layout live at full frame rate; the server
+   renders pixel-exact stills / samples / full files on demand.
+   ============================================================ */
+const $ = s => document.querySelector(s);
+const api = {
+  async get(p) { const r = await fetch(p); const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || (p + " failed")); return j; },
+  async post(p, b) { const r = await fetch(p, { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || (p + " failed")); return j; },
+};
+function toast(msg, ms = 4200) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), ms);
+}
+const fmtT = s => {
+  s = Math.max(0, s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = Math.floor(s % 60);
+  const p = n => String(n).padStart(2, "0");
+  return h ? `${p(h)}:${p(m)}:${p(x)}` : `${p(m)}:${p(x)}`;
+};
+const debounce = (fn, ms) => { let h; return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); }; };
+
+const SEG_COLORS = { intro: "#8b5cf6", body: "#0ea5e9", lead: "#22d3ee", outro: "#6366f1",
+  cut: "#e11d48", fast: "#14b8a6", mute: "#f59e0b", card: "#e879f9" };
+const PRESETS = [
+  { id: "hero-circle", name: "Hero circle", hint: "big circle face · content blurred behind",
+    cam: { x: .28, y: .06, w: .44, h: .78 }, content: { x: .25, y: .25, w: .5, h: .5 }, shape: "circle", hide: true },
+  { id: "hero-circle-left", name: "Hero circle L", hint: "big circle left · blurred content",
+    cam: { x: .04, y: .1, w: .42, h: .74 }, content: { x: .45, y: .2, w: .5, h: .6 }, shape: "circle", hide: true },
+  { id: "hero-pill", name: "Hero pill", hint: "stadium face · blurred content",
+    cam: { x: .18, y: .22, w: .64, h: .56 }, content: { x: .2, y: .25, w: .6, h: .5 }, shape: "pill", hide: true },
+  { id: "hero-rect", name: "Hero rectangle", hint: "large rounded face · blurred content",
+    cam: { x: .12, y: .08, w: .5, h: .84 }, content: { x: .6, y: .25, w: .36, h: .5 }, shape: "rounded", hide: true },
+  { id: "tl-br", name: "Cam TL · content BR", hint: "your default look",
+    cam: { x: .03, y: .045, w: .3, h: .335 }, content: { x: .35, y: .3, w: .62, h: .655 }, shape: "rounded", hide: false },
+  { id: "tl-br-tight", name: "Cam TL · content BR (tight)", hint: "small camera · bigger content",
+    cam: { x: .025, y: .04, w: .24, h: .27 }, content: { x: .29, y: .26, w: .685, h: .7 }, shape: "rounded", hide: false },
+  { id: "bl-tr", name: "Cam BL · content TR", hint: "mirrored corners",
+    cam: { x: .03, y: .62, w: .3, h: .335 }, content: { x: .35, y: .045, w: .62, h: .655 }, shape: "rounded", hide: false },
+  { id: "overlay-br", name: "Content full", hint: "camera overlaid TL",
+    cam: { x: .03, y: .045, w: .3, h: .335 }, content: { x: .02, y: .06, w: .96, h: .88 }, shape: "rounded", hide: false },
+];
+
+/* ---------------- state ---------------- */
+let S = null;              // server state snapshot
+let sceneOverride = "auto";
+let userRate = 1;
+let stillsOnly = false;
+let syncers = [];          // UI refresh fns after preset/load
+
+const activeSeg = t => (S.segments || []).find(s => t >= s.start && t < s.end) || null;
+function sceneAt(t) {
+  if (sceneOverride !== "auto") return sceneOverride;
+  const a = activeSeg(t);
+  if (!a) return "body";
+  return { intro: "solo", outro: "solo", mute: "body" }[a.type] || a.type;
+}
+function srcToOut(t) {
+  let out = 0; const fast = S.layout.fastSpeed || 4;
+  for (const s of S.segments || []) {
+    if (t <= s.start) break;
+    const ln = Math.min(t, s.end) - s.start;
+    if (s.type === "cut") continue;
+    out += s.type === "fast" ? ln / fast : ln;
+  }
+  return out;
+}
+
+/* ---------------- server sync (debounced) ---------------- */
+const pushLayout = debounce(async () => {
+  try { await api.post("/api/layout", { layout: S.layout }); } catch (e) { /* non-fatal */ }
+}, 400);
+const pushCuts = debounce(async () => {
+  try {
+    const j = await api.post("/api/cuts", { cuts: S.cuts, drops: S.drops, claims: S.claims });
+    S.segments = j.segments; S.render_duration = j.render_duration;
+    drawTimeline(); updateBadge(); refreshExactSoon();
+  } catch (e) { toast("cuts sync failed: " + e.message); }
+}, 400);
+const pushAudio = debounce(async () => {
+  try { await api.post("/api/audio", S.audio); } catch (e) { /* non-fatal */ }
+}, 400);
+const pushRetouch = debounce(async () => {
+  try { await api.post("/api/retouch", S.retouch); refreshExactSoon(); } catch (e) { /* non-fatal */ }
+}, 400);
+
+/* ---------------- stage compositing (live, client-side) ---------------- */
+const stage = $("#stage"), sctx = stage.getContext("2d");
+const proxy = $("#proxy");
+const SW = 960, SH = 540;
+/* effective playhead: proxy clock when video is present, manual stills
+   clock when the user chose (or fell back to) stills-only mode */
+let stillsTime = 0;
+const effT = () => (proxy.videoWidth ? (proxy.currentTime || 0) : stillsTime);
+function seekAbs(t) {
+  t = Math.max(0, Math.min((S.info.duration || 1) - 0.05, t));
+  if (proxy.videoWidth) proxy.currentTime = t;
+  else { stillsTime = t; refreshExactSoon(); }
+}
+function seekBy(d) { seekAbs(effT() + d); }
+
+function halves() {
+  const vw = proxy.videoWidth, vh = proxy.videoHeight;
+  const full = { x: 0, y: 0, w: vw, h: vh };
+  if (S.layout.sourceMode === "single" || !vw) return { cam: full, content: full, full };
+  const L = { x: 0, y: 0, w: vw / 2, h: vh }, R = { x: vw / 2, y: 0, w: vw / 2, h: vh };
+  return S.layout.cameraSide === "left"
+    ? { cam: L, content: R, full } : { cam: R, content: L, full };
+}
+function shapePath(c, shape, x, y, w, h, r) {
+  c.beginPath();
+  if (shape === "circle") { c.ellipse(x + w / 2, y + h / 2, Math.max(.5, w / 2), Math.max(.5, h / 2), 0, 0, 7); c.closePath(); return; }
+  let rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+  if (shape === "pill") rr = Math.min(w, h) / 2;
+  if (shape === "rect" || rr <= .5) { c.rect(x, y, w, h); return; }
+  if (c.roundRect) { c.roundRect(x, y, w, h, rr); return; }
+  c.moveTo(x + rr, y); c.lineTo(x + w - rr, y); c.quadraticCurveTo(x + w, y, x + w, y + rr);
+  c.lineTo(x + w, y + h - rr); c.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  c.lineTo(x + rr, y + h); c.quadraticCurveTo(x, y + h, x, y + h - rr);
+  c.lineTo(x, y + rr); c.quadraticCurveTo(x, y, x + rr, y); c.closePath();
+}
+function drawInto(c, src, dx, dy, dw, dh, st, k) {
+  if (!proxy.videoWidth || dw <= 1 || dh <= 1) return;
+  const sAsp = src.w / src.h, dAsp = dw / dh;
+  let sx = src.x, sy = src.y, sw = src.w, sh = src.h;
+  if (st.fit === "cover") {
+    if (sAsp > dAsp) { const nw = src.h * dAsp; sx = src.x + (src.w - nw) / 2; sw = nw; }
+    else { const nh = src.w / dAsp; sy = src.y + (src.h - nh) / 2; sh = nh; }
+  } else {
+    let w = dw, h = dh;
+    if (sAsp > dAsp) h = dw / sAsp; else w = dh * sAsp;
+    dx += (dw - w) / 2; dy += (dh - h) / 2; dw = w; dh = h;
+  }
+  const zw = dw * st.zoom, zh = dh * st.zoom;
+  const zx = dx + (dw - zw) / 2 + st.offsetX * dw, zy = dy + (dh - zh) / 2 + st.offsetY * dh;
+  c.save();
+  c.globalAlpha *= st.opacity;
+  if (st.mirror) { c.translate(zx * 2 + zw, 0); c.scale(-1, 1); }
+  if (st.shape !== "rect" || st.radius > 0) { shapePath(c, st.shape, zx, zy, zw, zh, st.radius * k); c.clip(); }
+  try { c.drawImage(proxy, sx, sy, sw, sh, zx, zy, zw, zh); } catch (e) { /* not ready */ }
+  if (st.border > 0) {
+    c.lineWidth = st.border * k; c.strokeStyle = st.borderColor || "#0b1220";
+    shapePath(c, st.shape, zx + st.border * k / 2, zy + st.border * k / 2,
+      Math.max(1, zw - st.border * k), Math.max(1, zh - st.border * k),
+      Math.max(0, st.radius * k - st.border * k / 2));
+    c.stroke();
+  }
+  c.restore();
+}
+function renderStage() {
+  const L = S.layout, k = SH / 1080, t = effT();
+  const scene = sceneAt(t), H = halves();
+  sctx.save();
+  sctx.filter = "none"; sctx.globalAlpha = 1;
+  sctx.fillStyle = "#04060c"; sctx.fillRect(0, 0, SW, SH);
+  if (scene !== "cut" && proxy.videoWidth) {
+    // backdrop
+    const bgSrc = L.bg.source === "content" ? H.content : L.bg.source === "camera" ? H.cam : H.full;
+    sctx.save();
+    sctx.globalAlpha = L.bg.opacity;
+    try { sctx.filter = `blur(${(L.bg.blur * (SH / 1080)).toFixed(1)}px) brightness(${(1 - L.bg.dim).toFixed(3)}) saturate(1.15)`; } catch (e) {}
+    const w = SW * L.bg.scale, h = SH * L.bg.scale;
+    const sAsp = bgSrc.w / bgSrc.h;
+    let sx = bgSrc.x, sy = bgSrc.y, sw = bgSrc.w, sh = bgSrc.h;
+    if (sAsp > w / h) { const nw = bgSrc.h * (w / h); sx += (bgSrc.w - nw) / 2; sw = nw; }
+    else { const nh = bgSrc.w / (w / h); sy += (bgSrc.h - nh) / 2; sh = nh; }
+    try { sctx.drawImage(proxy, sx, sy, sw, sh, (SW - w) / 2, (SH - h) / 2, w, h); } catch (e) {}
+    sctx.restore();
+    const R = r => ({ x: r.x * SW, y: r.y * SH, w: r.w * SW, h: r.h * SH });
+    if (scene === "solo") {
+      drawInto(sctx, H.cam, 0, 0, SW, SH, L.soloStyle, k);
+    } else if (scene === "card") {
+      const c = R(L.cam); drawInto(sctx, H.cam, c.x, c.y, c.w, c.h, L.camStyle, k);
+      drawCard(R(L.content));
+    } else if (scene === "lead") {
+      const c = R(L.cam); drawInto(sctx, H.cam, c.x, c.y, c.w, c.h, L.camStyle, k);
+      const b = R(L.content);
+      sctx.save(); sctx.filter = "none"; sctx.fillStyle = "#000";
+      shapePath(sctx, L.contentStyle.shape, b.x, b.y, b.w, b.h, L.contentStyle.radius * k); sctx.fill(); sctx.restore();
+    } else {
+      if (!L.contentHidden) { const c = R(L.content); drawInto(sctx, H.content, c.x, c.y, c.w, c.h, L.contentStyle, k); }
+      const c = R(L.cam); drawInto(sctx, H.cam, c.x, c.y, c.w, c.h, L.camStyle, k);
+      if (scene === "fast") {
+        sctx.save(); sctx.filter = "none";
+        sctx.font = `700 ${Math.round(20 * k * 2)}px monospace`;
+        const label = `${L.fastSpeed}× ▶▶`, tw = sctx.measureText(label).width + 22;
+        sctx.fillStyle = "rgba(13,148,136,.85)";
+        sctx.beginPath();
+        if (sctx.roundRect) sctx.roundRect(SW - tw - 14, SH - 30, tw, 22, 11);
+        else sctx.rect(SW - tw - 14, SH - 30, tw, 22);
+        sctx.fill();
+        sctx.fillStyle = "#ecfeff"; sctx.textAlign = "center"; sctx.textBaseline = "middle";
+        sctx.fillText(label, SW - tw / 2 - 14, SH - 19); sctx.restore();
+      }
+    }
+  } else if (scene === "cut") {
+    sctx.fillStyle = "#f43f5e"; sctx.font = "700 22px sans-serif";
+    sctx.textAlign = "center"; sctx.fillText("CUT — skipped in render", SW / 2, SH / 2);
+  }
+  sctx.restore();
+}
+function drawCard(b) {
+  const L = S.layout, k = SH / 1080;
+  sctx.save(); sctx.filter = "none";
+  const r = Math.min(28 * k, Math.min(b.w, b.h) / 2);
+  shapePath(sctx, "rounded", b.x, b.y, b.w, b.h, r); sctx.clip();
+  const g = sctx.createLinearGradient(b.x, b.y, b.x, b.y + b.h);
+  g.addColorStop(0, "#0b0f1a"); g.addColorStop(1, "#04060c");
+  sctx.fillStyle = g; sctx.fillRect(b.x, b.y, b.w, b.h);
+  sctx.fillStyle = L.card.accent; sctx.fillRect(b.x + b.w * .16, b.y + b.h * .34, b.w * .68, Math.max(2, 4 * k));
+  sctx.textAlign = "center"; sctx.fillStyle = "#f1f5f9";
+  const size = Math.max(11, Math.min(58 * k, b.w * .072));
+  sctx.font = `700 ${size}px sans-serif`;
+  sctx.fillText(L.card.title, b.x + b.w / 2, b.y + b.h * .5, b.w * .88);
+  sctx.font = `${Math.round(size * .62)}px sans-serif`; sctx.fillStyle = "rgba(226,232,240,.72)";
+  sctx.fillText(L.card.sub, b.x + b.w / 2, b.y + b.h * .6, b.w * .88);
+  sctx.restore();
+}
+
+/* ---------------- overlay boxes (drag + resize) ---------------- */
+function syncBoxes() {
+  const L = S.layout, scene = sceneAt(effT());
+  const show = ["body", "fast", "card", "lead"].includes(scene);
+  const bc = $("#box-cam"), bx = $("#box-content");
+  bc.style.display = show ? "block" : "none";
+  bx.style.display = (show && !L.contentHidden && scene !== "card" && scene !== "lead") ? "block" : "none";
+  for (const [el, r] of [[bc, L.cam], [bx, L.content]]) {
+    el.style.left = (r.x * 100) + "%"; el.style.top = (r.y * 100) + "%";
+    el.style.width = (r.w * 100) + "%"; el.style.height = (r.h * 100) + "%";
+  }
+  const names = { body: "REACTION", fast: "FAST-FORWARD", solo: "INTRO / OUTRO · FULL CAM",
+    card: "CARD", lead: "LEAD-IN", cut: "CUT" };
+  const b = $("#scenebadge");
+  b.textContent = names[scene] || scene;
+  b.style.color = { solo: "#c4b5fd", cut: "#fda4af", card: "#f0abfc" }[scene] || "#7dd3fc";
+}
+function makeDraggable(el, getRect) {
+  let mode = null, sx = 0, sy = 0, orig = null;
+  const wrap = $("#stagewrap");
+  el.addEventListener("pointerdown", e => {
+    if (e.target.classList.contains("handle")) mode = "resize"; else mode = "move";
+    sx = e.clientX; sy = e.clientY; orig = { ...getRect() };
+    el.setPointerCapture(e.pointerId); e.preventDefault();
+  });
+  el.addEventListener("pointermove", e => {
+    if (!mode) return;
+    const r = wrap.getBoundingClientRect();
+    const dx = (e.clientX - sx) / r.width, dy = (e.clientY - sy) / r.height;
+    const R = getRect();
+    if (mode === "move") {
+      R.x = Math.min(.98, Math.max(0, orig.x + dx));
+      R.y = Math.min(.98, Math.max(0, orig.y + dy));
+    } else {
+      R.w = Math.min(1 - R.x, Math.max(.05, orig.w + dx));
+      R.h = Math.min(1 - R.y, Math.max(.05, orig.h + dy));
+    }
+    syncBoxes(); syncers.forEach(f => f()); pushLayout(); refreshExactSoon(); updateOverlap();
+  });
+  el.addEventListener("pointerup", () => { mode = null; });
+}
+function overlap(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  return (x2 - x1) * (y2 - y1) / Math.max(1e-9, a.w * a.h) * 100;
+}
+function updateOverlap() {
+  const L = S.layout, el = $("#overlapmsg");
+  if (L.contentHidden) { el.innerHTML = `<span class="ok">✓ content hidden — face + blur look</span>`; return; }
+  const ov = overlap(L.cam, L.content);
+  el.innerHTML = ov > .5
+    ? `<span class="warn">⚠ Camera covers ${ov.toFixed(1)}% of the content — shrink it or move to a free corner.</span>`
+    : `<span class="ok">✓ No overlap — camera and content are cleanly separated.</span>`;
+}
+
+/* ---------------- transport + timeline ---------------- */
+function updateBadge() {
+  const d = S.info;
+  $("#filebadge").innerHTML =
+    `${d.path} · ${d.width}×${d.height} · render <b>${fmtT(S.render_duration)}</b> from ${fmtT(d.duration)}`;
+  $("#t-outdur").textContent = fmtT(S.render_duration);
+}
+const tl = $("#timeline"), tctx = tl.getContext("2d");
+function drawTimeline() {
+  const W = tl.clientWidth || 800, H = 86;
+  if (tl.width !== W) tl.width = W;
+  tctx.clearRect(0, 0, W, H);
+  tctx.fillStyle = "rgba(0,0,0,.3)"; tctx.fillRect(0, 0, W, H);
+  const D = S.info.duration || 1, X = t => (t / D) * W;
+  for (const s of S.segments || []) {
+    tctx.fillStyle = (SEG_COLORS[s.type] || "#888") + "55";
+    tctx.fillRect(X(s.start), 8, Math.max(2, X(s.end) - X(s.start)), H - 36);
+    tctx.strokeStyle = SEG_COLORS[s.type] || "#888"; tctx.lineWidth = 1;
+    tctx.strokeRect(X(s.start) + .5, 8.5, Math.max(2, X(s.end) - X(s.start)) - 1, H - 37);
+    if (X(s.end) - X(s.start) > 34) {
+      tctx.fillStyle = "#cbd5e1"; tctx.font = "9px sans-serif"; tctx.textAlign = "left";
+      tctx.fillText(s.type.toUpperCase(), X(s.start) + 4, 24);
+    }
+  }
+  // ruler ticks each minute
+  tctx.fillStyle = "#475569"; tctx.font = "9px monospace"; tctx.textAlign = "left";
+  for (let m = 0; m * 60 < D; m += Math.ceil(D / 60 / 8) || 1) {
+    tctx.fillText(fmtT(m * 60), X(m * 60) + 2, H - 6);
+  }
+  // playhead
+  const px = X(effT());
+  tctx.fillStyle = "#fff"; tctx.fillRect(px - 1, 0, 2, H);
+}
+tl.addEventListener("click", e => {
+  const r = tl.getBoundingClientRect();
+  seekAbs(((e.clientX - r.left) / r.width) * S.info.duration);
+});
+function tick() {
+  const t = effT();
+  // skip cut segments, follow fast/mute
+  const a = activeSeg(t);
+  if (proxy.videoWidth && a && a.type === "cut" && !proxy.paused) proxy.currentTime = Math.min(a.end + .02, S.info.duration - .05);
+  const want = (a && a.type === "fast") ? (S.layout.fastSpeed || 4) : userRate;
+  if (Math.abs(proxy.playbackRate - want) > .02) proxy.playbackRate = want;
+  $("#t-src").textContent = fmtT(t);
+  $("#t-out").textContent = fmtT(srcToOut(t));
+  renderStage(); syncBoxes(); drawTimeline();
+  requestAnimationFrame(tick);
+}
+$("#playbtn").onclick = () => { proxy.paused ? proxy.play().catch(() => {}) : proxy.pause(); };
+proxy.addEventListener("play", () => $("#playbtn").textContent = "⏸");
+proxy.addEventListener("pause", () => $("#playbtn").textContent = "▶");
+$("#backbtn").onclick = () => seekBy(-1 / 30);
+$("#fwdbtn").onclick = () => seekBy(1 / 30);
+document.addEventListener("keydown", e => {
+  if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+  if (e.code === "Space") { e.preventDefault(); $("#playbtn").click(); }
+  if (e.key === "ArrowLeft") seekBy(-(e.shiftKey ? 5 : 1 / 30));
+  if (e.key === "ArrowRight") seekBy(e.shiftKey ? 5 : 1 / 30);
+});
+$("#rateseg").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  userRate = parseFloat(b.dataset.r);
+  [...$("#rateseg").children].forEach(x => x.classList.toggle("on", x === b));
+});
+$("#sceneseg").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  sceneOverride = b.dataset.s;
+  [...$("#sceneseg").children].forEach(x => x.classList.toggle("on", x === b));
+  syncBoxes(); refreshExactSoon();
+});
+
+/* ---------------- exact stills (server-rendered proof) ---------------- */
+const refreshExactSoon = debounce(refreshExact, 600);
+async function refreshExact() {
+  try {
+    const t = effT(), mode = sceneAt(t);
+    const r = await fetch("/api/frame", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ t, mode, w: 854 }) });
+    if (!r.ok) throw new Error("frame failed");
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const old = $("#exactimg").src;
+    $("#exactimg").src = url;
+    if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+    $("#exactinfo").textContent = `t=${fmtT(t)} · scene=${mode} · server pixels`;
+  } catch (e) { /* transient; next refresh will fix */ }
+}
+$("#exactbtn").onclick = refreshExact;
+proxy.addEventListener("seeked", () => { if ($("#exactauto").checked) refreshExactSoon(); });
+
+/* ---------------- sidebar tabs ---------------- */
+function slider(parent, o) {
+  const row = document.createElement("div"); row.className = "srow";
+  const lab = document.createElement("label"); lab.textContent = o.label;
+  const inp = document.createElement("input");
+  inp.type = "range"; inp.min = o.min; inp.max = o.max; inp.step = o.step; inp.value = o.get();
+  const val = document.createElement("span"); val.className = "val"; val.textContent = o.fmt(o.get());
+  inp.addEventListener("input", () => { o.set(parseFloat(inp.value)); val.textContent = o.fmt(o.get()); o.after && o.after(); });
+  const sync = () => { inp.value = o.get(); val.textContent = o.fmt(o.get()); };
+  syncers.push(sync);
+  row.append(lab, inp, val); parent.append(row);
+  return { sync };
+}
+function sec(parent, title) {
+  const d = document.createElement("div"); d.className = "sec";
+  d.insertAdjacentHTML("beforeend", `<h3>${title}</h3>`); parent.append(d); return d;
+}
+function dropdown(parent, label, options, get, set, after) {
+  const row = document.createElement("div"); row.className = "srow";
+  row.insertAdjacentHTML("beforeend", `<label>${label}</label>`);
+  const s = document.createElement("select");
+  for (const [v, l] of options) { const o = document.createElement("option"); o.value = v; o.textContent = l; s.append(o); }
+  s.value = get();
+  s.addEventListener("change", () => { set(s.value); after && after(); });
+  syncers.push(() => s.value = get());
+  row.append(s); parent.append(row);
+}
+function check(parent, label, get, set, after) {
+  const l = document.createElement("label"); l.className = "chk";
+  const c = document.createElement("input"); c.type = "checkbox"; c.checked = !!get();
+  c.addEventListener("change", () => { set(c.checked); after && after(); });
+  syncers.push(() => c.checked = !!get());
+  l.append(c, document.createTextNode(label)); parent.append(l);
+}
+const pct = v => (v * 100).toFixed(1) + "%";
+
+function buildLayoutTab(el) {
+  const L = S.layout, after = () => { syncBoxes(); pushLayout(); refreshExactSoon(); updateOverlap(); };
+  const s0 = sec(el, "Frame preset");
+  const ps = document.createElement("select");
+  for (const p of PRESETS) { const o = document.createElement("option"); o.value = p.id; o.textContent = `${p.name} — ${p.hint}`; ps.append(o); }
+  ps.value = "tl-br";
+  const pb = document.createElement("button"); pb.className = "btn primary"; pb.textContent = "Apply";
+  pb.onclick = () => {
+    const p = PRESETS.find(x => x.id === ps.value);
+    Object.assign(L.cam, p.cam); Object.assign(L.content, p.content);
+    L.contentHidden = p.hide; L.camStyle.shape = p.shape;
+    syncers.forEach(f => f()); after();
+  };
+  const row = document.createElement("div"); row.className = "btnrow"; row.append(ps, pb); s0.append(row);
+  check(s0, "Hide sharp content (face + blur only)", () => L.contentHidden, v => L.contentHidden = v, after);
+  const s1 = sec(el, "Camera rect (drag the box, too)");
+  for (const [k, l] of [["x", "X"], ["y", "Y"], ["w", "Width"], ["h", "Height"]])
+    slider(s1, { label: l, min: 0, max: 1, step: .005, get: () => L.cam[k], set: v => L.cam[k] = v, fmt: pct, after });
+  const s2 = sec(el, "Content rect");
+  for (const [k, l] of [["x", "X"], ["y", "Y"], ["w", "Width"], ["h", "Height"]])
+    slider(s2, { label: l, min: 0, max: 1, step: .005, get: () => L.content[k], set: v => L.content[k] = v, fmt: pct, after });
+  const style = (title, st) => {
+    const s = sec(el, title);
+    dropdown(s, "Shape", [["rect", "Rect"], ["rounded", "Round"], ["circle", "Circle"], ["pill", "Pill"]],
+      () => st.shape, v => st.shape = v, after);
+    dropdown(s, "Fit", [["contain", "Fit"], ["cover", "Fill"]], () => st.fit, v => st.fit = v, after);
+    slider(s, { label: "Radius", min: 0, max: 60, step: 1, get: () => st.radius, set: v => st.radius = v, fmt: v => v + "px", after });
+    slider(s, { label: "Border", min: 0, max: 12, step: 1, get: () => st.border, set: v => st.border = v, fmt: v => v + "px", after });
+    slider(s, { label: "Zoom", min: 1, max: 2, step: .01, get: () => st.zoom, set: v => st.zoom = v, fmt: v => v.toFixed(2) + "×", after });
+    slider(s, { label: "Opacity", min: .1, max: 1, step: .01, get: () => st.opacity, set: v => st.opacity = v, fmt: pct, after });
+    slider(s, { label: "Offset X", min: -.5, max: .5, step: .005, get: () => st.offsetX, set: v => st.offsetX = v, fmt: pct, after });
+    slider(s, { label: "Offset Y", min: -.5, max: .5, step: .005, get: () => st.offsetY, set: v => st.offsetY = v, fmt: pct, after });
+    check(s, "Mirror", () => st.mirror, v => st.mirror = v, after);
+  };
+  style("Camera style", L.camStyle);
+  style("Content style", L.contentStyle);
+  const sb = sec(el, "Background plate");
+  dropdown(sb, "Source", [["full", "Full frame"], ["content", "Content"], ["camera", "Camera"]],
+    () => L.bg.source, v => L.bg.source = v, after);
+  slider(sb, { label: "Blur", min: 0, max: 120, step: 1, get: () => L.bg.blur, set: v => L.bg.blur = v, fmt: v => v + "px", after });
+  slider(sb, { label: "Opacity", min: 0, max: 1, step: .01, get: () => L.bg.opacity, set: v => L.bg.opacity = v, fmt: pct, after });
+  slider(sb, { label: "Scale", min: 1, max: 1.4, step: .01, get: () => L.bg.scale, set: v => L.bg.scale = v, fmt: v => v.toFixed(2) + "×", after });
+  slider(sb, { label: "Dim", min: 0, max: .8, step: .01, get: () => L.bg.dim, set: v => L.bg.dim = v, fmt: pct, after });
+  const ss = sec(el, "Source halves");
+  dropdown(ss, "Cam half", [["left", "Cam = left half"], ["right", "Cam = right half"]],
+    () => L.cameraSide, v => L.cameraSide = v, after);
+  dropdown(ss, "Source", [["split", "Side-by-side 3840×1080"], ["single", "Single 16:9 file"]],
+    () => L.sourceMode, v => L.sourceMode = v, after);
+  slider(ss, { label: "Solo scale", min: 1, max: 1.6, step: .01, get: () => L.soloStyle.zoom, set: v => L.soloStyle.zoom = v, fmt: v => v.toFixed(2) + "×", after });
+}
+
+function buildRetouchTab(el) {
+  const R = S.retouch;
+  const s = sec(el, "Face retouch (preview + render)");
+  check(s, "Enable face retouch", () => R.enabled, v => R.enabled = v, pushRetouch);
+  slider(s, { label: "Smooth", min: 0, max: 100, step: 1, get: () => R.smooth, set: v => R.smooth = v, fmt: v => v, after: pushRetouch });
+  slider(s, { label: "Teeth", min: 0, max: 100, step: 1, get: () => R.teeth, set: v => R.teeth = v, fmt: v => v, after: pushRetouch });
+  slider(s, { label: "Eyes", min: 0, max: 100, step: 1, get: () => R.eyes, set: v => R.eyes = v, fmt: v => v, after: pushRetouch });
+  s.insertAdjacentHTML("beforeend", `<p class="hint">Retouch shows in the <b>exact still</b> and renders (mask rebuilt every frame). The live stage stays unretouched for speed.</p>`);
+}
+
+function buildCutsTab(el) {
+  const Cc = S.cuts;
+  const s = sec(el, "Intro / outro / lead-in");
+  slider(s, { label: "Intro (s)", min: 0, max: 120, step: .5, get: () => Cc.intro_end, set: v => Cc.intro_end = v, fmt: v => v.toFixed(1) + "s", after: pushCuts });
+  slider(s, { label: "Outro last (s)", min: 0, max: 120, step: .5, get: () => Math.abs(Cc.outro_start), set: v => Cc.outro_start = -Math.abs(v), fmt: v => v.toFixed(1) + "s", after: pushCuts });
+  slider(s, { label: "Lead-in (s)", min: 0, max: 6, step: .25, get: () => Cc.lead_in, set: v => Cc.lead_in = v, fmt: v => v.toFixed(2) + "s", after: pushCuts });
+  slider(s, { label: "Black (s)", min: 0, max: 6, step: .25, get: () => Cc.black, set: v => Cc.black = v, fmt: v => v.toFixed(2) + "s", after: pushCuts });
+  const s2 = sec(el, "Silence auto-cut (reaction body only)");
+  slider(s2, { label: "Silence dB", min: -60, max: -20, step: 1, get: () => Cc.silence_db, set: v => Cc.silence_db = v, fmt: v => v + " dB", after: pushCuts });
+  slider(s2, { label: "Min silence", min: .5, max: 10, step: .5, get: () => Cc.min_silence, set: v => Cc.min_silence = v, fmt: v => v.toFixed(1) + "s", after: pushCuts });
+  const row = document.createElement("div"); row.className = "btnrow";
+  const det = document.createElement("button"); det.className = "btn primary"; det.textContent = "Detect silences";
+  det.onclick = async () => {
+    det.disabled = true; det.textContent = "Scanning… (up to ~1 min)";
+    try {
+      const j = await api.post("/api/detect", {});
+      S.drops = j.drops;
+      const t = await api.post("/api/cuts", { cuts: S.cuts, drops: S.drops, claims: S.claims });
+      S.segments = t.segments; S.render_duration = t.render_duration;
+      drawTimeline(); updateBadge(); refreshExactSoon();
+      toast(`Found ${j.drops.length} droppable spans`);
+    } catch (e) { toast("detect failed: " + e.message); }
+    det.disabled = false; det.textContent = "Detect silences";
+  };
+  const clr = document.createElement("button"); clr.className = "btn"; clr.textContent = "Clear drops";
+  clr.onclick = async () => { S.drops = []; pushCuts(); };
+  const cs = document.createElement("button"); cs.className = "btn"; cs.textContent = "Find content start";
+  cs.onclick = async () => {
+    try { const j = await api.get("/api/content_start");
+      toast(j.t == null ? "No clear silence→sound edge found" : `Content starts ~${fmtT(j.t)} — set Intro ≈ ${Math.max(0, j.t - 2).toFixed(0)}s`);
+    } catch (e) { toast("failed: " + e.message); }
+  };
+  row.append(det, clr, cs); s2.append(row);
+  const s3 = sec(el, "Claims (YouTube Studio ranges)");
+  const ta = document.createElement("textarea"); ta.rows = 3;
+  ta.placeholder = "02:14 - 03:40 cut claimed music\n12:03 - 12:47 mute";
+  ta.value = (S.claims || []).map(c => `${fmtT(c[0])} - ${fmtT(c[1])} ${c[2]}`).join("\n");
+  const apply = document.createElement("button"); apply.className = "btn primary"; apply.textContent = "Apply claims";
+  const prow = document.createElement("div"); prow.className = "btnrow"; prow.append(apply);
+  const parse = txt => {
+    const ts = s => {
+      s = s.trim();
+      if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+      const p = s.split(":").map(Number);
+      if (p.some(isNaN)) return null;
+      let m = 1, t = 0; for (let i = p.length - 1; i >= 0; i--) { t += p[i] * m; m *= 60; }
+      return t;
+    };
+    const out = [], D = S.info.duration;
+    for (const line of txt.split("\n")) {
+      const m = line.match(/([\d:.]+)\s*(?:-|to)\s*([\d:.]+)\s*(.*)/i);
+      if (!m) continue;
+      const a = ts(m[1]), b = ts(m[2]);
+      if (a == null || b == null) continue;
+      const act = /^mute/i.test(m[3] || "") ? "mute" : "cut";
+      const A = Math.max(0, Math.min(a, D)), B = Math.max(0, Math.min(b, D));
+      if (B - A > .2) out.push([A, B, act]);
+    }
+    return out;
+  };
+  apply.onclick = async () => { S.claims = parse(ta.value); pushCuts(); toast(`${S.claims.length} claims applied`); };
+  s3.append(ta, prow);
+  const s4 = sec(el, "Timeline");
+  const tbl = document.createElement("div");
+  const paint = () => {
+    tbl.innerHTML = `<div style="font-size:11px;margin-bottom:4px">render <b style="color:#7dd3fc">${fmtT(S.render_duration)}</b> from ${fmtT(S.info.duration)}</div>` +
+      `<table class="tl">` + S.segments.slice(0, 30).map(s =>
+        `<tr><td style="color:${SEG_COLORS[s.type]}">${s.type}</td><td>${fmtT(s.start)} → ${fmtT(s.end)}</td></tr>`).join("") +
+      (S.segments.length > 30 ? `<tr><td colspan="2">… +${S.segments.length - 30} more</td></tr>` : "") + `</table>`;
+  };
+  paint(); syncers.push(paint); s4.append(tbl);
+}
+
+function buildAudioTab(el) {
+  const A = S.audio;
+  const s = sec(el, "Mic bus");
+  dropdown(s, "Mic ch", [["left", "Left"], ["right", "Right"]], () => A.mic_channel, v => A.mic_channel = v, pushAudio);
+  check(s, "Compressor on", () => A.comp_on, v => A.comp_on = v, pushAudio);
+  slider(s, { label: "Mic gain", min: -12, max: 12, step: .5, get: () => A.mic_gain_db, set: v => A.mic_gain_db = v, fmt: v => (v >= 0 ? "+" : "") + v.toFixed(1) + " dB", after: pushAudio });
+  slider(s, { label: "Comp thr", min: -50, max: 0, step: 1, get: () => A.comp_threshold, set: v => A.comp_threshold = v, fmt: v => v + " dB", after: pushAudio });
+  slider(s, { label: "Comp ratio", min: 1, max: 20, step: .5, get: () => A.comp_ratio, set: v => A.comp_ratio = v, fmt: v => v.toFixed(1) + ":1", after: pushAudio });
+  slider(s, { label: "Makeup", min: 0, max: 18, step: .5, get: () => A.comp_makeup, set: v => A.comp_makeup = v, fmt: v => "+" + v.toFixed(1) + " dB", after: pushAudio });
+  slider(s, { label: "Limiter", min: -12, max: 0, step: .5, get: () => A.limiter_db, set: v => A.limiter_db = v, fmt: v => v.toFixed(1) + " dB", after: pushAudio });
+  const s2 = sec(el, "Content bus");
+  check(s2, "Duck content while I speak", () => A.duck_on, v => A.duck_on = v, pushAudio);
+  slider(s2, { label: "Content gain", min: -20, max: 6, step: .5, get: () => A.content_gain_db, set: v => A.content_gain_db = v, fmt: v => (v >= 0 ? "+" : "") + v.toFixed(1) + " dB", after: pushAudio });
+  slider(s2, { label: "Duck thr", min: -60, max: -10, step: 1, get: () => A.duck_threshold, set: v => A.duck_threshold = v, fmt: v => v + " dB", after: pushAudio });
+  slider(s2, { label: "Duck depth", min: 0, max: 30, step: 1, get: () => A.duck_depth, set: v => A.duck_depth = v, fmt: v => "−" + v + " dB", after: pushAudio });
+  const b = document.createElement("button"); b.className = "btn primary"; b.textContent = "▶ 10s audio sample at playhead";
+  const out = document.createElement("div");
+  b.onclick = async () => {
+    b.disabled = true; b.textContent = "Mixing…";
+    try {
+      await api.post("/api/audio", S.audio);
+      const j = await api.post("/api/audio_sample", { t: effT() });
+      out.innerHTML = "";
+      const a = document.createElement("audio"); a.className = "sample"; a.controls = true; a.autoplay = true;
+      a.src = "/files/" + encodeURIComponent(j.file); out.append(a);
+    } catch (e) { toast("audio sample failed: " + e.message); }
+    b.disabled = false; b.textContent = "▶ 10s audio sample at playhead";
+  };
+  s2.append(b, out);
+}
+
+function buildRenderTab(el) {
+  const s = sec(el, "Sample first, full render second");
+  const name = document.createElement("input"); name.type = "text"; name.value = "youtube_final"; name.style.width = "140px";
+  const crf = document.createElement("input"); crf.type = "number"; crf.value = 18; crf.min = 16; crf.max = 28; crf.style.width = "56px";
+  const webm = document.createElement("input"); webm.type = "checkbox"; webm.checked = true;
+  s.insertAdjacentHTML("beforeend", `<div class="srow"><label>Name</label></div>`);
+  s.lastChild.append(name);
+  s.insertAdjacentHTML("beforeend", `<div class="srow"><label>CRF</label></div>`);
+  s.lastChild.append(crf);
+  const wl = document.createElement("label"); wl.className = "chk"; wl.append(webm, document.createTextNode("Also WebM (VP9)")); s.append(wl);
+  const sb = document.createElement("button"); sb.className = "btn primary"; sb.textContent = "🎬 12s sample at playhead";
+  const fb = document.createElement("button"); fb.className = "btn danger"; fb.textContent = "⬤ RENDER FULL VIDEO";
+  const row = document.createElement("div"); row.className = "btnrow"; row.append(sb, fb); s.append(row);
+  s.insertAdjacentHTML("beforeend", `<div id="prog"><div></div></div><div id="joblog"></div><div id="filelinks" style="margin-top:6px"></div>`);
+  const sout = document.createElement("div"); s.append(sout);
+  const bar = () => $("#prog > div"), log = $("#joblog"), links = () => $("#filelinks");
+  sb.onclick = async () => {
+    sb.disabled = true; sb.textContent = "Rendering sample…";
+    try {
+      await api.post("/api/layout", { layout: S.layout });
+      const j = await api.post("/api/sample", { t: effT(), seconds: 12, mode: sceneAt(effT()) });
+      sout.innerHTML = "";
+      const v = document.createElement("video"); v.className = "sample"; v.controls = true; v.autoplay = true;
+      v.src = "/files/" + encodeURIComponent(j.file); sout.append(v);
+    } catch (e) { toast("sample failed: " + e.message); }
+    sb.disabled = false; sb.textContent = "🎬 12s sample at playhead";
+  };
+  const showLinks = j => {
+    links().innerHTML = Object.entries(j.files).map(([k, f]) =>
+      `<div><a class="btn" href="/files/${encodeURIComponent(f)}" download="${f}">↓ Download ${k.toUpperCase()} (${f})</a></div>`).join("") +
+      `<p class="hint">Files are also in your Drive output folder — they survive the session.</p>`;
+  };
+  let polling = false;
+  const poll = async () => {
+    if (polling) return; polling = true;
+    try {
+      for (;;) {
+        const j = await api.get("/api/job");
+        if (!document.contains(bar())) { polling = false; return; } // tab was rebuilt
+        bar().style.width = Math.round((j.progress || 0) * 100) + "%";
+        log.textContent = (j.log || []).join("\n");
+        if (j.state === "done") {
+          showLinks(j);
+          fb.disabled = false; fb.textContent = "⬤ RENDER FULL VIDEO"; break;
+        }
+        if (j.state === "error") { toast("render failed: " + (j.error || "?")); fb.disabled = false; fb.textContent = "⬤ RENDER FULL VIDEO"; break; }
+        if (j.state !== "running") break;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } catch (e) { /* keep polling on transient errors */ polling = false; setTimeout(poll, 3000); return; }
+    polling = false;
+  };
+  // re-entering the tab mid-render (or after a done render) resumes display
+  api.get("/api/job").then(j => {
+    if (j.state === "running") { fb.disabled = true; fb.textContent = "Rendering…"; poll(); }
+    else if (j.state === "done" && Object.keys(j.files || {}).length) {
+      bar().style.width = "100%"; log.textContent = (j.log || []).join("\n"); showLinks(j);
+    }
+  }).catch(() => {});
+  fb.onclick = async () => {
+    fb.disabled = true; fb.textContent = "Rendering…"; links().innerHTML = ""; log.textContent = "";
+    try {
+      await api.post("/api/layout", { layout: S.layout });
+      await api.post("/api/audio", S.audio);
+      await api.post("/api/retouch", S.retouch);
+      await api.post("/api/cuts", { cuts: S.cuts, drops: S.drops, claims: S.claims });
+      await api.post("/api/render_full", { name: name.value.trim() || "output",
+        crf: parseInt(crf.value) || 18, webm: webm.checked });
+      poll();
+    } catch (e) { toast("render failed: " + e.message); fb.disabled = false; fb.textContent = "⬤ RENDER FULL VIDEO"; }
+  };
+  const s2 = sec(el, "Layout file");
+  const lp = document.createElement("input"); lp.type = "text"; lp.value = "layout.json"; lp.style.width = "150px";
+  const sv = document.createElement("button"); sv.className = "btn"; sv.textContent = "Save to Drive";
+  sv.onclick = async () => { try { const j = await api.post("/api/save_layout", {}); toast("saved → layout.json in output folder"); } catch (e) { toast(e.message); } };
+  const ld = document.createElement("button"); ld.className = "btn"; ld.textContent = "Load from Drive";
+  ld.onclick = async () => {
+    try {
+      const j = await api.post("/api/load_layout", { path: lp.value.trim() || "layout.json" });
+      S.layout = j.layout; syncers.forEach(f => f()); syncBoxes(); pushLayout(); refreshExactSoon(); updateOverlap();
+      toast("layout loaded");
+    } catch (e) { toast("load failed: " + e.message); }
+  };
+  const r2 = document.createElement("div"); r2.className = "btnrow"; r2.append(lp, sv, ld); s2.append(r2);
+}
+const TABS = { layout: buildLayoutTab, retouch: buildRetouchTab, cuts: buildCutsTab, audio: buildAudioTab, render: buildRenderTab };
+$("#tabs").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  [...$("#tabs").children].forEach(x => x.classList.toggle("on", x === b));
+  const el = $("#tabbody"); el.innerHTML = "";
+  TABS[b.dataset.t](el);
+});
+
+/* ---------------- boot ---------------- */
+$("#stillsbtn").onclick = () => { stillsOnly = true; $("#proxybar").classList.add("hidden"); };
+async function waitProxy() {
+  for (;;) {
+    try {
+      const j = await api.get("/api/proxy_status");
+      if (j.ready) return true;
+      if (j.error) {
+        $("#proxybar-sub").textContent = `proxy failed (${j.error}) — use stills mode below; everything else works.`;
+        await new Promise(r => setTimeout(r, 4000));
+      } else {
+        $("#proxybar-sub").textContent = `transcoding proxy… ${Math.round((j.progress || 0) * 100)}% (one-time, cached on Drive)`;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
+    if (stillsOnly) return false;
+  }
+}
+async function boot() {
+  try {
+    S = await api.get("/api/state");
+  } catch (e) {
+    $("#filebadge").textContent = "server unreachable — is the Colab cell still running?";
+    toast("Cannot reach the Colab server: " + e.message, 8000);
+    return;
+  }
+  updateBadge();
+  $("#tabbody").innerHTML = ""; buildLayoutTab($("#tabbody"));
+  makeDraggable($("#box-cam"), () => S.layout.cam);
+  makeDraggable($("#box-content"), () => S.layout.content);
+  updateOverlap();
+  refreshExact();
+  requestAnimationFrame(tick);
+  const ok = await waitProxy();
+  if (!ok) { toast("Stills mode: exact previews still work; playback disabled.", 5000); return; }
+  $("#proxybar").classList.add("hidden");
+  proxy.src = "/api/proxy.mp4";
+  proxy.addEventListener("loadedmetadata", () => { drawTimeline(); refreshExactSoon(); }, { once: true });
+  proxy.addEventListener("error", () => toast("Proxy stream failed — stills mode still works."), { once: true });
+}
+boot();
+</script>
+</body>
+</html>

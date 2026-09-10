@@ -1,0 +1,671 @@
+"""
+WYSIWYG compositor — Python mirror of src/lib/render.ts.
+
+Every layout parameter behaves exactly like the browser editor:
+normalised rects, cover/contain fit, zoom, offsets, mirror, shapes
+(rect/rounded/circle/pill), 1080p-authored radius/border, opacity,
+background plate (source/blur/opacity/scale/dim) and the card /
+lead-in / fast-forward overlays.
+
+The GUI preview and the final render call the SAME compose_frame(),
+so what you see while dragging sliders is what gets rendered.
+That also fixes the old bug where the camera was composited at full
+resolution and covered the content.
+
+Dependencies: numpy, opencv (cv2). ffmpeg binary is used when present
+(fast pipe encoding + audio muxing) with a cv2.VideoWriter fallback.
+"""
+from __future__ import annotations
+
+import math
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+try:
+    from layouts import (
+        BackgroundStyle,
+        CardStyle,
+        LayoutState,
+        LayerStyle,
+        Rect,
+        default_layout,
+    )
+except ImportError:  # package-style import
+    from .layouts import (
+        BackgroundStyle,
+        CardStyle,
+        LayoutState,
+        LayerStyle,
+        Rect,
+        default_layout,
+    )
+
+BASE_COLOR = (12, 6, 4)  # #04060c in BGR — the app background plate
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def hex_to_bgr(h: str) -> Tuple[int, int, int]:
+    h = (h or "#ffffff").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        r, g, b = 255, 255, 255
+    return (b, g, r)
+
+
+def shape_mask(w: int, h: int, shape: str, radius: float) -> np.ndarray:
+    """Single-channel uint8 mask (255 inside) for a layer box."""
+    w, h = max(1, int(w)), max(1, int(h))
+    if shape == "circle":
+        m = np.zeros((h, w), np.uint8)
+        cv2.ellipse(m, (int(w / 2), int(h / 2)),
+                    (max(1, int(w / 2)), max(1, int(h / 2))),
+                    0, 0, 360, 255, -1, cv2.LINE_AA)
+        return m
+    rr = 0.0
+    if shape == "pill":
+        rr = min(w, h) / 2.0
+    elif shape == "rounded":
+        rr = max(0.0, min(float(radius), min(w, h) / 2.0))
+    if rr <= 0.5:
+        return np.full((h, w), 255, np.uint8)
+    r = int(round(rr))
+    m = np.zeros((h, w), np.uint8)
+    cv2.rectangle(m, (r, 0), (w - r, h), 255, -1)
+    cv2.rectangle(m, (0, r), (w, h - r), 255, -1)
+    for cx, cy in ((r, r), (w - r - 1, r), (r, h - r - 1), (w - r - 1, h - r - 1)):
+        cv2.circle(m, (max(0, cx), max(0, cy)), r, 255, -1, cv2.LINE_AA)
+    return m
+
+
+def _cover_resize(img: np.ndarray, dw: int, dh: int) -> np.ndarray:
+    """Center-crop to aspect dw/dh, then resize to exactly dw×dh."""
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0 or dw <= 0 or dh <= 0:
+        return np.zeros((max(1, dh), max(1, dw), 3), np.uint8)
+    s_asp, d_asp = w / h, dw / dh
+    if s_asp > d_asp:
+        nw = int(round(h * d_asp))
+        x = max(0, (w - nw) // 2)
+        img = img[:, x:x + nw]
+    else:
+        nh = int(round(w / d_asp))
+        y = max(0, (h - nh) // 2)
+        img = img[y:y + nh, :]
+    return cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
+
+
+def _contain_size(sw: int, sh: int, dw: int, dh: int) -> Tuple[int, int]:
+    s = min(dw / max(1, sw), dh / max(1, sh))
+    return max(1, int(round(sw * s))), max(1, int(round(sh * s)))
+
+
+# ---------------------------------------------------------------------------
+# layers
+# ---------------------------------------------------------------------------
+
+def draw_layer(canvas: np.ndarray, img: Optional[np.ndarray],
+               rect: Rect, style: LayerStyle) -> None:
+    """Paint one layer onto the canvas in place (mirrors drawInto)."""
+    H, W = canvas.shape[:2]
+    if img is None or img.size == 0:
+        return
+    k = H / 1080.0  # radius/border authored in 1080p px
+    dx, dy, dw, dh = (int(round(v)) for v in
+                      (rect.x * W, rect.y * H, rect.w * W, rect.h * H))
+    if dw <= 1 or dh <= 1:
+        return
+    sh, sw = img.shape[:2]
+
+    # fit
+    if style.fit == "cover":
+        im = _cover_resize(img, dw, dh)
+        px, py = dx, dy
+    else:
+        fw, fh = _contain_size(sw, sh, dw, dh)
+        im = cv2.resize(img, (fw, fh), interpolation=cv2.INTER_AREA)
+        px, py = dx + (dw - fw) // 2, dy + (dh - fh) // 2
+
+    # zoom + offset (offset is relative to the layer box, like the browser)
+    zw, zh = max(1, int(round(im.shape[1] * style.zoom))), \
+        max(1, int(round(im.shape[0] * style.zoom)))
+    if (zw, zh) != (im.shape[1], im.shape[0]):
+        im = cv2.resize(im, (zw, zh), interpolation=cv2.INTER_LINEAR)
+    px = int(round(px + (dw if style.fit == "cover" else im.shape[1] / style.zoom
+                         if style.zoom else 0) * 0))  # keep anchored
+    # recenter on the zoom (mirror of the TS math: zx = dx+(dw-zw)/2 + off*dw)
+    if style.fit == "cover":
+        px = int(round(dx + (dw - zw) / 2 + style.offsetX * dw))
+        py = int(round(dy + (dh - zh) / 2 + style.offsetY * dh))
+    else:
+        fw0, fh0 = _contain_size(sw, sh, dw, dh)
+        px = int(round(dx + (dw - fw0) / 2 + (fw0 - zw) / 2 + style.offsetX * dw))
+        py = int(round(dy + (dh - fh0) / 2 + (fh0 - zh) / 2 + style.offsetY * dh))
+
+    if style.mirror:
+        im = cv2.flip(im, 1)
+
+    # clip against canvas
+    x0, y0 = max(0, px), max(0, py)
+    x1, y1 = min(W, px + zw), min(H, py + zh)
+    if x1 <= x0 or y1 <= y0:
+        return
+    im = im[y0 - py:y1 - py, x0 - px:x1 - px]
+    mask = shape_mask(zw, zh, style.shape, style.radius * k)
+    mask = mask[y0 - py:y1 - py, x0 - px:x1 - px]
+
+    alpha = (mask.astype(np.float32) / 255.0) * float(style.opacity)
+    if float(style.opacity) >= 0.999 and style.shape == "rect":
+        canvas[y0:y1, x0:x1] = im
+    else:
+        a = alpha[..., None]
+        roi = canvas[y0:y1, x0:x1].astype(np.float32)
+        canvas[y0:y1, x0:x1] = (roi * (1.0 - a) + im.astype(np.float32) * a
+                                ).astype(np.uint8)
+
+    # border (inset stroke, like the browser)
+    bw = float(style.border) * k
+    if bw >= 0.75:
+        b = int(round(bw))
+        outer = shape_mask(zw, zh, style.shape, style.radius * k)
+        inner = np.zeros_like(outer)
+        iw, ih = zw - 2 * b, zh - 2 * b
+        if iw > 1 and ih > 1:
+            sub = shape_mask(iw, ih, style.shape,
+                             max(0.0, style.radius * k - b))
+            inner[b:b + ih, b:b + iw] = sub[:ih, :iw]
+        ring = cv2.subtract(outer, inner)[y0 - py:y1 - py, x0 - px:x1 - px]
+        col = np.array(hex_to_bgr(style.borderColor), np.float32)
+        a = (ring.astype(np.float32) / 255.0)[..., None]
+        roi = canvas[y0:y1, x0:x1].astype(np.float32)
+        canvas[y0:y1, x0:x1] = (roi * (1.0 - a) + col * a).astype(np.uint8)
+
+
+def render_bg(canvas: np.ndarray, src: Optional[np.ndarray], bg: BackgroundStyle) -> None:
+    """Blurred/dimmed full-frame backdrop (mirrors renderScene's backdrop)."""
+    H, W = canvas.shape[:2]
+    canvas[:] = BASE_COLOR
+    if src is None or src.size == 0:
+        return
+    # cover at bg.scale, then center-crop to the canvas
+    sw = max(8, int(round(W * bg.scale)))
+    sh = max(8, int(round(H * bg.scale)))
+    cov = _cover_resize(src, sw, sh)
+    ox, oy = max(0, (sw - W) // 2), max(0, (sh - H) // 2)
+    cov = cov[oy:oy + H, ox:ox + W]
+    if cov.shape[1] != W or cov.shape[0] != H:
+        cov = cv2.resize(cov, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # downscale -> blur -> upscale (same trick as the browser: cheap big blur)
+    ds = 0.34
+    small = cv2.resize(cov, (max(8, int(W * ds)), max(8, int(H * ds))),
+                       interpolation=cv2.INTER_AREA)
+    eff = float(bg.blur) * ds * (H / 1080.0)
+    if eff > 0.4:
+        ks = max(3, int(round(eff)) * 2 + 1)
+        small = cv2.GaussianBlur(small, (ks, ks), 0)
+    # saturate 1.15 + dim (browser: brightness(1-dim) saturate(1.15))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.15, 0, 255)
+    hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 - float(bg.dim)), 0, 255)
+    small = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    big = cv2.resize(small, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    op = float(np.clip(bg.opacity, 0.0, 1.0))
+    if op >= 0.999:
+        canvas[:] = big
+    elif op > 0.001:
+        canvas[:] = (canvas.astype(np.float32) * (1.0 - op) +
+                     big.astype(np.float32) * op).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# overlays (card / lead block / speed badge)
+# ---------------------------------------------------------------------------
+
+def _fit_text(text: str, max_w: int, font: int, start: float, thick: int):
+    scale = start
+    while scale > 0.3:
+        (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+        if tw <= max_w:
+            break
+        scale *= 0.9
+    return scale
+
+
+def draw_card(canvas: np.ndarray, layout: LayoutState) -> None:
+    H, W = canvas.shape[:2]
+    k = H / 1080.0
+    x, y, w, h = (int(round(v)) for v in layout.content.px(W, H))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return
+    bw, bh = x - x0 + (x1 - x0), y - y0 + (y1 - y0)  # full box
+    fw, fh = x1 - x0, y1 - y0
+    radius = min(28.0 * k, min(fw, fh) / 2.0)
+    mask = shape_mask(fw, fh, "rounded", radius)
+
+    # vertical gradient backdrop
+    top = np.array((26, 15, 11), np.float32)   # #0b0f1a
+    bot = np.array((12, 6, 4), np.float32)     # #04060c
+    t = np.linspace(0, 1, fh, dtype=np.float32)[:, None, None]
+    grad = (top * (1 - t) + bot * t).astype(np.uint8)
+    grad = np.repeat(grad, fw, axis=1)
+    a = (mask.astype(np.float32) / 255.0)[..., None]
+    roi = canvas[y0:y1, x0:x1].astype(np.float32)
+    canvas[y0:y1, x0:x1] = (roi * (1 - a) + grad.astype(np.float32) * a).astype(np.uint8)
+
+    accent = hex_to_bgr(layout.card.accent)
+    # accent bar
+    bx, by = int(x0 + fw * 0.16), int(y0 + fh * 0.34)
+    cv2.rectangle(canvas, (bx, by),
+                  (int(x0 + fw * 0.84), int(by + max(2, 4 * k))), accent, -1)
+    # title + sub, centered
+    font = cv2.FONT_HERSHEY_DUPLEX
+    size = max(0.4, min(2.2 * k, (fw * 0.072) / 20.0))
+    size = _fit_text(layout.card.title, int(fw * 0.88), font, size, 2)
+    (tw, th), _ = cv2.getTextSize(layout.card.title, font, size, 2)
+    cv2.putText(canvas, layout.card.title,
+                (int(x0 + (fw - tw) / 2), int(y0 + fh * 0.47 + th / 2)),
+                font, size, (241, 245, 249), 2, cv2.LINE_AA)
+    s2 = _fit_text(layout.card.sub, int(fw * 0.88),
+                   cv2.FONT_HERSHEY_SIMPLEX, size * 0.62, 1)
+    (tw2, th2), _ = cv2.getTextSize(layout.card.sub,
+                                    cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
+    cv2.putText(canvas, layout.card.sub,
+                (int(x0 + (fw - tw2) / 2), int(y0 + fh * 0.58 + th2 / 2)),
+                cv2.FONT_HERSHEY_SIMPLEX, s2, (200, 210, 225), 1, cv2.LINE_AA)
+    # accent ring
+    outer = shape_mask(fw, fh, "rounded", radius)
+    inner = np.zeros_like(outer)
+    b = max(1, int(round(2 * k)))
+    if fw - 2 * b > 2 and fh - 2 * b > 2:
+        sub = shape_mask(fw - 2 * b, fh - 2 * b, "rounded", max(0.0, radius - b))
+        inner[b:b + fh - 2 * b, b:b + fw - 2 * b] = sub
+    ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
+    roi = canvas[y0:y1, x0:x1].astype(np.float32)
+    canvas[y0:y1, x0:x1] = (
+        roi * (1 - ring[..., None]) +
+        np.array(accent, np.float32) * ring[..., None]).astype(np.uint8)
+
+
+def draw_lead_block(canvas: np.ndarray, layout: LayoutState) -> None:
+    H, W = canvas.shape[:2]
+    k = H / 1080.0
+    x, y, w, h = (int(round(v)) for v in layout.content.px(W, H))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    st = layout.contentStyle
+    mask = shape_mask(x1 - x0, y1 - y0, st.shape, st.radius * k)
+    a = (mask.astype(np.float32) / 255.0)[..., None]
+    roi = canvas[y0:y1, x0:x1].astype(np.float32)
+    canvas[y0:y1, x0:x1] = (roi * (1 - a)).astype(np.uint8)  # pure black block
+
+
+def draw_speed_badge(canvas: np.ndarray, speed: float) -> None:
+    H, W = canvas.shape[:2]
+    k = H / 1080.0
+    label = f"{int(speed) if float(speed) % 1 == 0 else round(speed, 1)}x >>"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    sc = max(0.5, 0.9 * k)
+    (tw, th), _ = cv2.getTextSize(label, font, sc, 2)
+    bw, bh = int(tw + 22 * k), int(34 * k)
+    x, y = W - bw - int(18 * k), H - bh - int(18 * k)
+    pill = shape_mask(bw, bh, "pill", 0)
+    teal = np.zeros((bh, bw, 3), np.uint8)
+    teal[:] = (136, 148, 13)  # ~ #0d9488
+    a = (pill.astype(np.float32) / 255.0 * 0.9)[..., None]
+    roi = canvas[y:y + bh, x:x + bw].astype(np.float32)
+    canvas[y:y + bh, x:x + bw] = (roi * (1 - a) +
+                                  teal.astype(np.float32) * a).astype(np.uint8)
+    cv2.putText(canvas, label, (int(x + (bw - tw) / 2), int(y + (bh + th) / 2 - 2 * k)),
+                font, sc, (255, 254, 236), 2, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# scene
+# ---------------------------------------------------------------------------
+
+def split_sources(frame: np.ndarray, layout: LayoutState):
+    """Return (cam, content, full) views of a source frame."""
+    h, w = frame.shape[:2]
+    if layout.sourceMode == "single" or w < 16:
+        return frame, frame, frame
+    mid = w // 2
+    left, right = frame[:, :mid], frame[:, mid:]
+    if layout.cameraSide == "left":
+        return left, right, frame
+    return right, left, frame
+
+
+def compose_frame(frame: np.ndarray, layout: LayoutState,
+                  mode: str = "body", W: int = 1920, H: int = 1080,
+                  cam_hook: Optional[Callable[[np.ndarray], np.ndarray]] = None
+                  ) -> np.ndarray:
+    """Compose one output frame. *mode* is solo|body|cut|fast|card|lead."""
+    canvas = np.zeros((H, W, 3), np.uint8)
+    canvas[:] = BASE_COLOR
+    if mode == "cut":
+        return canvas
+    cam, content, full = split_sources(frame, layout)
+    if cam_hook is not None and mode != "cut":
+        try:
+            cam = cam_hook(cam)
+        except Exception:
+            pass
+    bg_src = {"content": content, "camera": cam}.get(layout.bg.source, full)
+    render_bg(canvas, bg_src, layout.bg)
+
+    if mode == "solo":
+        draw_layer(canvas, cam, Rect(0, 0, 1, 1), layout.soloStyle)
+    elif mode == "card":
+        draw_layer(canvas, cam, layout.cam, layout.camStyle)
+        draw_card(canvas, layout)
+    elif mode == "lead":
+        draw_layer(canvas, cam, layout.cam, layout.camStyle)
+        draw_lead_block(canvas, layout)
+    else:  # body / fast
+        if not layout.contentHidden:
+            draw_layer(canvas, content, layout.content, layout.contentStyle)
+        draw_layer(canvas, cam, layout.cam, layout.camStyle)
+        if mode == "fast":
+            draw_speed_badge(canvas, layout.fastSpeed)
+    return canvas
+
+
+# ---------------------------------------------------------------------------
+# probing + fast single-frame extraction (powers the live preview)
+# ---------------------------------------------------------------------------
+
+_cap_cache: Dict[str, Any] = {}
+
+
+def probe_video(path: str) -> Dict[str, Any]:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"cannot open video: {path}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    dur = n / fps if fps and n else 0.0
+    return {"width": w, "height": h, "fps": fps,
+            "frames": n, "duration": dur, "path": str(path)}
+
+
+def extract_frame(path: str, t: float) -> Optional[np.ndarray]:
+    """Grab one frame near *t* seconds (cached capture for scrubbing)."""
+    key = str(path)
+    cap = _cap_cache.get(key)
+    if cap is None:
+        cap = cv2.VideoCapture(key)
+        if not cap.isOpened():
+            return None
+        _cap_cache[key] = cap
+    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t)) * 1000.0)
+    ok, frame = cap.read()
+    if not ok:
+        # retry once from the start (some files seek poorly from cache)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t)) * 1000.0)
+        ok, frame = cap.read()
+    return frame if ok else None
+
+
+def invalidate_cache(path: Optional[str] = None) -> None:
+    if path is None:
+        for c in _cap_cache.values():
+            try:
+                c.release()
+            except Exception:
+                pass
+        _cap_cache.clear()
+    else:
+        c = _cap_cache.pop(str(path), None)
+        if c is not None:
+            try:
+                c.release()
+            except Exception:
+                pass
+
+
+def preview(path: str, t: float, layout: Optional[LayoutState] = None,
+            mode: str = "body", width: int = 960,
+            cam_hook=None) -> Optional[np.ndarray]:
+    """Compose a small preview frame — what the GUI shows on every tweak."""
+    layout = layout or default_layout()
+    frame = extract_frame(path, t)
+    if frame is None:
+        return None
+    W = int(width)
+    H = int(round(width * 9 / 16))
+    return compose_frame(frame, layout, mode=mode, W=W, H=H, cam_hook=cam_hook)
+
+
+def to_jpeg(img: np.ndarray, quality: int = 72) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img,
+                           [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("jpeg encode failed")
+    return buf.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# timeline helpers
+# ---------------------------------------------------------------------------
+
+Segment = Dict[str, Any]  # {type, start, end}
+
+
+def build_segments(duration: float, intro_end: float = 8.0,
+                   outro_start: Optional[float] = None,
+                   drops: Optional[List[Tuple[float, float]]] = None,
+                   claims: Optional[List[Tuple[float, float, str]]] = None,
+                   lead_in: float = 0.0, black: float = 0.0) -> List[Segment]:
+    """Build a normalised segment list (mirrors the browser timeline).
+
+    *drops* are (start, end) spans removed entirely (silences, disruptions).
+    *claims* are (start, end, action) with action in {cut, mute}.
+    """
+    duration = max(0.5, float(duration))
+    ie = float(np.clip(intro_end, 0, duration))
+    os_ = duration + float(outro_start) if outro_start is not None and float(outro_start) <= 0 \
+        else (float(outro_start) if outro_start is not None else duration)
+    os_ = float(np.clip(os_, ie, duration))
+
+    cuts: List[Tuple[float, float]] = list(drops or [])
+    mutes: List[Tuple[float, float]] = []
+    for s, e, a in (claims or []):
+        (cuts if a == "cut" else mutes).append((float(s), float(e)))
+
+    # base spans with their scene types
+    spans: List[Tuple[float, float, str]] = []
+    if ie > 0:
+        spans.append((0.0, ie, "intro"))
+    body_s, body_e = ie, os_
+    if lead_in > 0 and black > 0 and body_e - body_s > lead_in + black + 1:
+        # lead-in block: black content for `black` s at the reaction start
+        spans.append((body_s, body_s + black, "lead"))
+        spans.append((body_s + black, body_e, "body"))
+    elif body_e > body_s:
+        spans.append((body_s, body_e, "body"))
+    if os_ < duration:
+        spans.append((os_, duration, "outro"))
+
+    # carve cuts/mutes out of the spans
+    def carve(spans, s, e, typ):
+        out = []
+        for a, b, t in spans:
+            if e <= a or s >= b:
+                out.append((a, b, t))
+                continue
+            if s > a:
+                out.append((a, min(s, b), t))
+            out.append((max(s, a), min(e, b), typ))
+            if e < b:
+                out.append((max(e, a), b, t))
+        return out
+
+    for s, e in cuts:
+        spans = carve(spans, s, e, "cut")
+    for s, e in mutes:
+        # mute only applies to body-ish spans (intro/outro already mute content)
+        spans = carve(spans, s, e, "mute")
+    # merge neighbours of the same type
+    spans.sort()
+    merged: List[Segment] = []
+    for a, b, t in spans:
+        if b - a < 1e-3:
+            continue
+        if merged and merged[-1]["type"] == t and abs(merged[-1]["end"] - a) < 1e-3:
+            merged[-1]["end"] = b
+        else:
+            merged.append({"type": t, "start": a, "end": b})
+    return merged
+
+
+def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
+    total = 0.0
+    for s in segments:
+        if s["type"] == "cut":
+            continue
+        ln = s["end"] - s["start"]
+        total += ln / fast_speed if s["type"] == "fast" else ln
+    return total
+
+
+# ---------------------------------------------------------------------------
+# full render (same compositor => preview == output)
+# ---------------------------------------------------------------------------
+
+def _open_writer(path: str, W: int, H: int, fps: float,
+                 crf: int = 18, preset: str = "fast"):
+    """Prefer an ffmpeg rawvideo pipe; fall back to cv2.VideoWriter."""
+    if has_ffmpeg():
+        cmd = ["ffmpeg", "-y", "-v", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
+               "-an", "-c:v", "libx264", "-preset", preset,
+               "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
+               "-movflags", "+faststart", str(path)]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        return ("pipe", proc)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    vw = cv2.VideoWriter(str(path), fourcc, fps, (W, H))
+    if not vw.isOpened():
+        raise RuntimeError(f"cannot open writer for {path}")
+    return ("cv2", vw)
+
+
+def render_video(input_path: str, output_path: str,
+                 layout: Optional[LayoutState] = None,
+                 segments: Optional[List[Segment]] = None,
+                 fps: Optional[float] = None,
+                 crf: int = 18, preset: str = "fast",
+                 width: int = 1920, height: int = 1080,
+                 progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cam_hook=None) -> Dict[str, Any]:
+    """Render the full programme through compose_frame().
+
+    Returns {path, frames, fps, duration}. Audio is NOT included here —
+    mux it afterwards (see video_processor.mix_and_mux) so the same
+    segment map can conform both streams.
+    """
+    layout = layout or default_layout()
+    info = probe_video(input_path)
+    fps = float(fps or info["fps"] or 30.0)
+    duration = info["duration"] or 0.0
+    if segments is None:
+        segments = [{"type": "body", "start": 0.0, "end": duration}]
+    segments = sorted(segments, key=lambda s: s["start"])
+
+    # output frame -> (source time, mode)
+    plan: List[Tuple[float, str]] = []
+    for s in segments:
+        typ = s.get("type", "body")
+        if typ == "cut":
+            continue
+        factor = layout.fastSpeed if typ == "fast" else 1.0
+        n = max(1, int(round((s["end"] - s["start"]) * fps / factor)))
+        mode = {"intro": "solo", "outro": "solo", "mute": "body"}.get(typ, typ)
+        for i in range(n):
+            plan.append((s["start"] + (i + 0.5) * factor / fps, mode))
+    total = len(plan)
+    if total == 0:
+        raise ValueError("nothing to render — all segments are cut?")
+
+    W, H = int(width), int(height)
+    kind, writer = _open_writer(output_path, W, H, fps, crf, preset)
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(input_path)
+
+    src_fps = info["fps"] or fps
+    cur_t = -1.0
+    frame = None
+    try:
+        for idx, (st, mode) in enumerate(plan):
+            # sequential read: advance until we pass the wanted timestamp
+            if st < cur_t - 1e-3:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, st) * 1000.0)
+                cur_t = st
+            while True:
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if pos >= st - 0.5 / src_fps or pos < cur_t - 1.0:
+                    break
+                ok, f = cap.read()
+                if not ok:
+                    break
+                frame, cur_t = f, pos
+                if cur_t >= st - 0.5 / src_fps:
+                    break
+            if frame is None:
+                ok, f = cap.read()
+                if ok:
+                    frame = f
+            if frame is None:
+                break
+            out = compose_frame(frame, layout, mode=mode, W=W, H=H,
+                                cam_hook=cam_hook)
+            if kind == "pipe":
+                try:
+                    writer.stdin.write(out.tobytes())
+                except BrokenPipeError:
+                    break
+            else:
+                writer.write(out)
+            if progress_cb and (idx % 30 == 0 or idx == total - 1):
+                progress_cb(idx + 1, total)
+    finally:
+        cap.release()
+        if kind == "pipe":
+            try:
+                writer.stdin.close()
+            except Exception:
+                pass
+            writer.wait()
+        else:
+            writer.release()
+
+    out_dur = total / fps
+    return {"path": str(output_path), "frames": total, "fps": fps,
+            "duration": out_dur}
