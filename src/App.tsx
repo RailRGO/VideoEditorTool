@@ -737,9 +737,9 @@ export default function App() {
     objectUrl.current = url;
     setFileName(f.name);
     setResult(null);
-    setClaims([]);
     setEnv(null);
     setDetection(null);
+    setTranscript(null);
     setPlaying(false);
     v.src = url;
     v.muted = false;
@@ -758,10 +758,12 @@ export default function App() {
     if (targetRef.current === "patreon") {
       setLayout((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
     }
-    setSegments(defaultSegments(d));
+    // keep a loaded project (clamped to this file), default only when fresh
+    setSegments((s) => (s.length ? normalize(s, d) : defaultSegments(d)));
     setSelectedId(null);
     try {
-      engine().setDirect(targetRef.current === "youtube");
+      // the remote preview stream is always a mix, even in Patreon mode
+      engine().setDirect(targetRef.current === "youtube" || !!remoteRef.current);
       engine().attach(v, audioRef.current.mic.channel);
       engine().update(audioRef.current);
       engine().updateCloak(audioCloakRef.current);
@@ -786,9 +788,9 @@ export default function App() {
           if (!v) return;
           setFileName(st.info.path);
           setResult(null);
-          setClaims([]);
           setEnv(null);
           setDetection(null);
+          setTranscript(null);
           setPlaying(false);
           // cache-bust so a re-transcoded proxy is never served stale
           v.src = `${client.proxyUrl()}?t=${Date.now()}`;
@@ -850,6 +852,8 @@ export default function App() {
       const client = remoteRef.current;
       if (!client) return;
       const token = ++connectToken.current;
+      trToken.current++;
+      setTrBusy(false);
       setConnecting(true);
       setRemoteError("");
       setProxyProgress(0);
@@ -873,6 +877,9 @@ export default function App() {
 
   const disconnectRemote = useCallback(() => {
     connectToken.current++;
+    trToken.current++;
+    setTrBusy(false);
+    setTranscript(null);
     const v = videoRef.current;
     if (v) {
       v.pause();
@@ -909,6 +916,7 @@ export default function App() {
         setSegments([]);
         setPlaying(false);
         setResult(null);
+        setTranscript(null);
       }
       setEngineMode(m);
       engine().setDirect(m === "remote" || targetRef.current === "youtube");
