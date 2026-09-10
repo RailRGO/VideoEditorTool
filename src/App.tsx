@@ -10,6 +10,13 @@ import { Btn, LiveText } from "./components/ui";
 import { AudioEngine } from "./lib/audio";
 import { FaceTracker, type TrackStatus } from "./lib/face";
 import {
+  RemoteClient,
+  sleep,
+  type RemoteJob,
+  type RemoteSource,
+  type RemoteState,
+} from "./lib/remote";
+import {
   applyRetouch,
   poseFromBox,
   poseFromLandmarks,
@@ -187,6 +194,23 @@ export default function App() {
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     return !!Ctor && typeof Ctor.prototype.createScriptProcessor === "function";
   });
+
+  /* remote engine (Colab backend) */
+  const [engineMode, setEngineMode] = useState<"local" | "remote">("local");
+  const [remoteDraft, setRemoteDraft] = useState(
+    () => localStorage.getItem("remoteUrl") ?? ""
+  );
+  const [remote, setRemote] = useState<RemoteClient | null>(null);
+  const [remoteInfo, setRemoteInfo] = useState<RemoteState | null>(null);
+  const [remoteError, setRemoteError] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [sources, setSources] = useState<RemoteSource[]>([]);
+  const [proxyProgress, setProxyProgress] = useState(0);
+  const [remoteJob, setRemoteJob] = useState<RemoteJob | null>(null);
+  const connectToken = useRef(0);
+  const remoteRef = useRef<RemoteClient | null>(null);
+  remoteRef.current = remote;
+  const isRemote = engineMode === "remote";
 
   /* auto-cut */
   const [scanning, setScanning] = useState(false);
@@ -492,7 +516,7 @@ export default function App() {
     targetRef.current = t;
     setTarget(t);
     setLayout((l) => ({ ...l, sourceMode: t === "patreon" ? "split" : "single" }));
-    engine().setDirect(t === "youtube");
+    engine().setDirect(t === "youtube" || !!remoteRef.current);
     engine().update(audioRef.current, 0);
     lastFastDb.current = 0;
     setLeftTab(t === "patreon" ? "polish" : "autocut");
@@ -741,6 +765,196 @@ export default function App() {
     }
     seekSrc(0);
   };
+
+  /* ------------------------------------------------------------- remote */
+  /** wait for the preview proxy, then load it into the shared video element */
+  const awaitProxy = useCallback(
+    async (client: RemoteClient, token: number) => {
+      for (;;) {
+        if (connectToken.current !== token) return;
+        const st = await client.state();
+        if (connectToken.current !== token) return;
+        setRemoteInfo(st);
+        if (st.proxy.error) throw new Error(st.proxy.error);
+        if (st.proxy.ready) {
+          const v = videoRef.current;
+          if (!v) return;
+          setFileName(st.info.path);
+          setResult(null);
+          setClaims([]);
+          setEnv(null);
+          setDetection(null);
+          setPlaying(false);
+          // cache-bust so a re-transcoded proxy is never served stale
+          v.src = `${client.proxyUrl()}?t=${Date.now()}`;
+          v.muted = false;
+          v.volume = 1;
+          v.playbackRate = 1;
+          v.load();
+          return;
+        }
+        setProxyProgress(st.proxy.progress);
+        await sleep(2000);
+      }
+    },
+    []
+  );
+
+  const connectRemote = useCallback(
+    async (raw: string) => {
+      const token = ++connectToken.current;
+      setConnecting(true);
+      setRemoteError("");
+      setProxyProgress(0);
+      try {
+        const client = new RemoteClient(raw);
+        if (!client.base) throw new Error("Paste the tunnel URL from the notebook cell.");
+        const st = await client.state();
+        if (connectToken.current !== token) return;
+        localStorage.setItem("remoteUrl", client.base);
+        setRemote(client);
+        setRemoteInfo(st);
+        try {
+          const s = await client.sources();
+          if (connectToken.current !== token) return;
+          setSources(s.sources);
+        } catch {
+          setSources([]);
+        }
+        try {
+          const j = await client.job();
+          if (connectToken.current === token && j.state !== "idle") setRemoteJob(j);
+        } catch {
+          /* older server without the job queue */
+        }
+        await awaitProxy(client, token);
+      } catch (e) {
+        if (connectToken.current === token) {
+          setRemote(null);
+          setRemoteError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (connectToken.current === token) setConnecting(false);
+      }
+    },
+    [awaitProxy]
+  );
+
+  const selectRemoteSource = useCallback(
+    async (name: string) => {
+      const client = remoteRef.current;
+      if (!client) return;
+      const token = ++connectToken.current;
+      setConnecting(true);
+      setRemoteError("");
+      setProxyProgress(0);
+      try {
+        await client.setSource(name);
+        if (connectToken.current !== token) return;
+        const s = await client.sources();
+        if (connectToken.current !== token) return;
+        setSources(s.sources);
+        await awaitProxy(client, token);
+      } catch (e) {
+        if (connectToken.current === token) {
+          setRemoteError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (connectToken.current === token) setConnecting(false);
+      }
+    },
+    [awaitProxy]
+  );
+
+  const disconnectRemote = useCallback(() => {
+    connectToken.current++;
+    const v = videoRef.current;
+    if (v) {
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+    }
+    setRemote(null);
+    setRemoteInfo(null);
+    setRemoteError("");
+    setSources([]);
+    setRemoteJob(null);
+    setFileName("");
+    setDuration(0);
+    setDims({ w: 0, h: 0 });
+    setSegments([]);
+    setPlaying(false);
+  }, []);
+
+  const switchEngine = useCallback(
+    (m: "local" | "remote") => {
+      if (m === engineMode) return;
+      if (exportingRef.current || scanningRef.current) return;
+      if (engineMode === "remote") disconnectRemote();
+      if (engineMode === "local") {
+        const v = videoRef.current;
+        if (v) {
+          v.pause();
+          v.removeAttribute("src");
+          v.load();
+        }
+        setFileName("");
+        setDuration(0);
+        setDims({ w: 0, h: 0 });
+        setSegments([]);
+        setPlaying(false);
+        setResult(null);
+      }
+      setEngineMode(m);
+      engine().setDirect(m === "remote" || targetRef.current === "youtube");
+    },
+    [engineMode, disconnectRemote]
+  );
+
+  const startRemoteExport = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client || !duration || remoteJob?.state === "running") return;
+    setRemoteError("");
+    try {
+      const base = (fileName || "reaction").replace(/\.[^.]+$/, "");
+      const job = await client.renderProject({
+        target: targetRef.current,
+        name: `${base}_${targetRef.current}`,
+        segments: segsRef.current.map((s) => ({
+          type: s.type,
+          start: s.start,
+          end: s.end,
+        })),
+        layout: layoutRef.current,
+        audio: audioRef.current,
+        retouch: retouchRef.current,
+        audioCloak: audioCloakRef.current,
+        videoCloak: videoCloakRef.current,
+        crf: 18,
+        webm: false,
+        fps,
+        height: res === 1080 ? 1080 : 720,
+      });
+      setRemoteJob(job);
+      setRightTab("export");
+    } catch (e) {
+      setRemoteError(e instanceof Error ? e.message : String(e));
+    }
+  }, [duration, fileName, fps, res, remoteJob?.state]);
+
+  /* poll a running remote render until it lands */
+  useEffect(() => {
+    if (!remote || remoteJob?.state !== "running") return;
+    const t = window.setInterval(async () => {
+      try {
+        const j = await remote.job();
+        setRemoteJob(j);
+      } catch {
+        /* tunnel hiccup — keep polling */
+      }
+    }, 2000);
+    return () => window.clearInterval(t);
+  }, [remote, remoteJob?.state]);
 
   /* --------------------------------------------------------------- scan */
   const stopScan = useCallback(() => {
@@ -1044,9 +1258,55 @@ export default function App() {
             if (f) loadFile(f);
           }}
         />
-        <Btn onClick={() => fileInput.current?.click()}>
-          {fileName ? "Change source" : isYT ? "Open Patreon render" : "Open recording"}
-        </Btn>
+        {!isRemote ? (
+          <Btn onClick={() => fileInput.current?.click()}>
+            {fileName ? "Change source" : isYT ? "Open Patreon render" : "Open recording"}
+          </Btn>
+        ) : !remote ? (
+          <form
+            className="flex min-w-0 flex-1 items-center gap-1.5 md:max-w-md"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void connectRemote(remoteDraft);
+            }}
+          >
+            <input
+              value={remoteDraft}
+              onChange={(e) => setRemoteDraft(e.target.value)}
+              placeholder="https://… — tunnel URL from the notebook"
+              spellCheck={false}
+              className="h-7 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-2 font-mono text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-emerald-400/50"
+            />
+            <Btn variant="primary" disabled={connecting}>
+              {connecting ? "…" : "Connect"}
+            </Btn>
+          </form>
+        ) : (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <select
+              value={sources.find((s) => s.current)?.name ?? fileName}
+              disabled={connecting || sources.length === 0}
+              onChange={(e) => void selectRemoteSource(e.target.value)}
+              className="h-7 max-w-[220px] truncate rounded-lg border border-white/10 bg-black/40 px-1.5 text-[11px] text-slate-200 outline-none focus:border-emerald-400/50 disabled:opacity-50"
+              title="Source file on the Colab side"
+            >
+              {sources.length === 0 && <option value={fileName}>{fileName}</option>}
+              {sources.map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name} · {(s.size / 1073741824).toFixed(1)} GB
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => switchEngine("local")}
+              className="shrink-0 rounded-lg px-1.5 py-1 text-[11px] text-slate-500 hover:bg-white/10 hover:text-slate-200"
+              title="Disconnect and go back to local files"
+            >
+              ✕
+            </button>
+          </span>
+        )}
         {fileName && (
           <span className="hidden min-w-0 items-center gap-2 md:flex">
             <span className="truncate text-[11px] text-slate-400">{fileName}</span>
@@ -1062,6 +1322,37 @@ export default function App() {
             {removed > 0.05 && <span className="text-rose-300"> · −{fmtTime(removed)}</span>}
             {spedUp > 0.05 && <span className="text-teal-300"> · ⇢{fmtTime(spedUp)}</span>}
           </span>
+          <div
+            className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5"
+            title="This PC: the file on your disk, rendered in the browser. Colab: files on the notebook side, previewed as a light stream and rendered by the server."
+          >
+            {(
+              [
+                ["local", "This PC"],
+                ["remote", "Colab"],
+              ] as ["local" | "remote", string][]
+            ).map(([m, label]) => (
+              <button
+                key={m}
+                type="button"
+                disabled={exporting || scanning}
+                onClick={() => switchEngine(m)}
+                className={cn(
+                  "rounded px-2 py-1 text-[11px] font-semibold transition-colors disabled:opacity-40",
+                  engineMode === m
+                    ? m === "remote"
+                      ? "bg-emerald-500/25 text-emerald-100 shadow-[inset_0_0_0_1px_rgba(52,211,153,0.4)]"
+                      : "bg-white/15 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.15)]"
+                    : "text-slate-500 hover:text-slate-300"
+                )}
+              >
+                {label}
+                {m === "remote" && remote && (
+                  <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 align-middle" />
+                )}
+              </button>
+            ))}
+          </div>
           <div
             className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5"
             title="Patreon: cut the full version from the raw capture. YouTube: cut the short version from the finished Patreon render."
@@ -1262,7 +1553,68 @@ export default function App() {
           {empty && (
             <div className="absolute inset-3 z-40 flex items-center justify-center rounded-xl">
               <div className="w-full max-w-md rounded-2xl border border-dashed border-white/15 bg-slate-950/80 p-6 text-center backdrop-blur">
-                {isYT ? (
+                {isRemote ? (
+                  !remote ? (
+                    <>
+                      <p className="text-[15px] font-semibold text-white">
+                        Connect the Colab backend
+                      </p>
+                      <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                        Run the server cell in the notebook, paste its tunnel URL
+                        {remoteDraft ? " above" : " below"} and press Connect. Your files stay on
+                        the Colab side — the browser only previews a light stream, and the
+                        finished render downloads straight from the server.
+                      </p>
+                      <form
+                        className="mx-auto mt-4 flex max-w-sm gap-1.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          void connectRemote(remoteDraft);
+                        }}
+                      >
+                        <input
+                          value={remoteDraft}
+                          onChange={(e) => setRemoteDraft(e.target.value)}
+                          placeholder="https://…tunnel URL…"
+                          spellCheck={false}
+                          className="h-8 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-2 font-mono text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-emerald-400/50"
+                        />
+                        <Btn variant="primary" disabled={connecting}>
+                          {connecting ? "…" : "Connect"}
+                        </Btn>
+                      </form>
+                      {remoteError && (
+                        <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+                          {remoteError}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-[15px] font-semibold text-white">
+                        {remoteInfo?.proxy.ready ? "Loading preview…" : "Preparing preview…"}
+                      </p>
+                      <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                        {remoteInfo?.proxy.ready
+                          ? "The stream is ready — starting playback."
+                          : "The server is transcoding a lightweight proxy of the source (once per file, cached). The timeline unlocks as soon as it arrives."}
+                      </p>
+                      {!remoteInfo?.proxy.ready && (
+                        <div className="mx-auto mt-4 h-1.5 max-w-sm overflow-hidden rounded-full bg-black/60">
+                          <div
+                            className="h-full rounded-full bg-emerald-400 transition-[width]"
+                            style={{ width: `${Math.round(proxyProgress * 100)}%` }}
+                          />
+                        </div>
+                      )}
+                      {remoteError && (
+                        <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+                          {remoteError}
+                        </p>
+                      )}
+                    </>
+                  )
+                ) : isYT ? (
                   <>
                     <p className="text-[15px] font-semibold text-white">
                       Drop your Patreon render here
@@ -1286,13 +1638,15 @@ export default function App() {
                     </p>
                   </>
                 )}
-                <Btn
-                  variant="primary"
-                  className="mt-4 px-4 py-2 text-[12px]"
-                  onClick={() => fileInput.current?.click()}
-                >
-                  Choose a video file
-                </Btn>
+                {!isRemote && (
+                  <Btn
+                    variant="primary"
+                    className="mt-4 px-4 py-2 text-[12px]"
+                    onClick={() => fileInput.current?.click()}
+                  >
+                    Choose a video file
+                  </Btn>
+                )}
               </div>
             </div>
           )}
@@ -1499,6 +1853,17 @@ export default function App() {
                 removed={removed}
                 duration={duration}
                 mime={mime}
+                remote={
+                  isRemote
+                    ? {
+                        connected: !!remote,
+                        job: remoteJob,
+                        error: remoteError,
+                        onExport: () => void startRemoteExport(),
+                        fileUrl: (n) => remote?.fileUrl(n) ?? "#",
+                      }
+                    : null
+                }
               />
             )}
           </div>
@@ -1532,6 +1897,7 @@ export default function App() {
         className="pointer-events-none fixed -left-[9999px] top-0 h-1 w-1"
         playsInline
         preload="auto"
+        crossOrigin="anonymous"
         onLoadedMetadata={onMeta}
         onError={() => setFileName((n) => n)}
       />

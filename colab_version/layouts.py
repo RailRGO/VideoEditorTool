@@ -76,15 +76,16 @@ class CardStyle:
 class LayoutState:
     cameraSide: Literal["left", "right"] = "left"
     sourceMode: Literal["split", "single"] = "split"
-    content: Rect = field(default_factory=lambda: Rect(0.35, 0.30, 0.62, 0.655))
-    cam: Rect = field(default_factory=lambda: Rect(0.03, 0.045, 0.30, 0.335))
+    # measured 1080p sizes: content 1344x756 (70%), camera 576x324 (30%)
+    content: Rect = field(default_factory=lambda: Rect(0.294, 0.289, 0.70, 0.70))
+    cam: Rect = field(default_factory=lambda: Rect(0.006, 0.011, 0.30, 0.30))
     bg: BackgroundStyle = field(default_factory=BackgroundStyle)
     contentStyle: LayerStyle = field(
-        default_factory=lambda: LayerStyle(fit="contain", shape="rounded", radius=20)
+        default_factory=lambda: LayerStyle(fit="contain", shape="rounded", radius=10)
     )
     camStyle: LayerStyle = field(
         default_factory=lambda: LayerStyle(
-            fit="contain", shape="rounded", radius=26, border=3, borderColor="#0ea5e9"
+            fit="contain", shape="rounded", radius=20, border=3, borderColor="#0ea5e9"
         )
     )
     soloStyle: LayerStyle = field(
@@ -216,8 +217,10 @@ LAYOUT_PRESETS: List[LayoutPreset] = [
                  Rect(0.20, 0.25, 0.60, 0.50), Rect(0.18, 0.22, 0.64, 0.56), "pill", True),
     LayoutPreset("hero-rect", "Hero rectangle", "large rounded face · blurred content",
                  Rect(0.60, 0.25, 0.36, 0.50), Rect(0.12, 0.08, 0.50, 0.84), "rounded", True),
+    LayoutPreset("reaction-1344", "Reaction 1344+576", "content 1344x756 r10 · cam 576x324 r20",
+                 Rect(0.294, 0.289, 0.70, 0.70), Rect(0.006, 0.011, 0.30, 0.30), "rounded", False),
     LayoutPreset("tl-br", "Cam TL · content BR", "your default look",
-                 Rect(0.35, 0.30, 0.62, 0.655), Rect(0.03, 0.045, 0.30, 0.335), "rounded", False),
+                 Rect(0.294, 0.289, 0.70, 0.70), Rect(0.006, 0.011, 0.30, 0.30), "rounded", False),
     LayoutPreset("tl-br-tight", "Cam TL · content BR (tight)", "small camera · bigger content",
                  Rect(0.29, 0.26, 0.685, 0.70), Rect(0.025, 0.04, 0.24, 0.27), "rounded", False),
     LayoutPreset("bl-tr", "Cam BL · content TR", "mirrored corners",
@@ -305,12 +308,47 @@ def default_audio() -> Dict[str, Any]:
 
 
 def default_retouch() -> Dict[str, Any]:
+    """Browser-parity keys (see src/lib/types.ts). Old keys (smooth/eyes/nose
+    as 0..100 magnitudes) are still accepted by the processor."""
     return {
         "enabled": False,
-        "smooth": 35.0,   # 0..100 skin smoothing
-        "teeth": 40.0,    # 0..100 whitening
-        "nose": 25.0,     # reserved (subtle)
-        "eyes": 35.0,     # 0..100 eye emphasis
+        "skin": 55.0,      # 0..100 smoothing
+        "detail": 45.0,    # edge preservation
+        "teeth": 40.0,     # 0..100 whitening
+        "eyeScale": 0.0,   # % around each iris
+        "noseScale": 0.0,  # % (negative narrows)
+        "feather": 45.0,   # warp/mask softness
+        "smoothing": 60.0, # temporal (offline: pose carry)
+        "everyN": 1,       # detect every Nth frame, carry pose between
+        "manual": False,
+        "manualRect": {"x": 0.3, "y": 0.1, "w": 0.4, "h": 0.55},
+    }
+
+
+def default_audio_cloak() -> Dict[str, Any]:
+    return {
+        "on": True,
+        "pitch": 0.5,    # semitones, tempo-preserving
+        "chorus": 25.0,  # 0..100
+        "reverb": 18.0,  # 0..100
+        "tilt": 2.0,     # dB, positive = brighter
+        "widen": 6.0,    # ms Haas delay on right channel
+    }
+
+
+def default_video_cloak() -> Dict[str, Any]:
+    return {
+        "on": True,
+        "zoom": 1.03,
+        "bars": 3.0,       # % of height, top + bottom
+        "border": 0.0,     # px @1080p
+        "borderColor": "#0ea5e9",
+        "saturate": 108.0,
+        "contrast": 104.0,
+        "brightness": 100.0,
+        "hue": 0.0,
+        "grain": 12.0,
+        "vignette": 25.0,
     }
 
 

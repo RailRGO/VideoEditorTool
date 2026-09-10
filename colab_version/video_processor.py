@@ -78,6 +78,405 @@ def _has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+_filter_cache: Dict[str, bool] = {}
+
+
+def _ffmpeg_has_filter(name: str) -> bool:
+    """True when this ffmpeg build ships *name* (cached per process)."""
+    if name in _filter_cache:
+        return _filter_cache[name]
+    try:
+        out = _run(["ffmpeg", "-hide_banner", "-filters"], check=False)
+    except (OSError, subprocess.CalledProcessError):
+        out = ""
+    ok = any(
+        line.strip().split()[1] == name
+        for line in out.splitlines()
+        if len(line.strip().split()) >= 2 and line.strip().split()[0].startswith(("T", "."))
+    )
+    # fallback: plain substring (covers wrapped/localised outputs)
+    if not ok:
+        ok = f" {name} " in out or f" {name}\n" in out
+    _filter_cache[name] = ok
+    return ok
+
+
+def browser_audio_to_cfg(browser: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    """Translate the React AudioState into flat mix_audio keys + master gain.
+
+    Dropped on purpose (no offline equivalent wired): mic pan, comp
+    knee/attack/release, duck attack/release/hold. Everything dropped is
+    cosmetic next to threshold/ratio/depth.
+    """
+    mic = (browser or {}).get("mic", {})
+    comp = mic.get("comp", {})
+    content = (browser or {}).get("content", {})
+    duck = content.get("duck", {})
+    master = (browser or {}).get("master", {})
+    cfg = {
+        "mic_channel": mic.get("channel", "left"),
+        "mic_gain_db": float(mic.get("gain", 0.0)),
+        "comp_on": bool(comp.get("on", True)),
+        "comp_threshold": float(comp.get("threshold", -24.0)),
+        "comp_ratio": float(comp.get("ratio", 4.0)),
+        "comp_makeup": float(comp.get("makeup", 4.0)),
+        "limiter_db": float(mic.get("limiter", -1.2)),
+        "content_gain_db": float(content.get("gain", -1.5)),
+        "duck_on": bool(duck.get("on", True)),
+        "duck_threshold": float(duck.get("threshold", -32.0)),
+        "duck_depth": float(duck.get("depth", 12.0)),
+    }
+    return cfg, float(master.get("gain", 0.0))
+
+
+def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
+                      out_label: str) -> Tuple[str, List[str]]:
+    """ffmpeg filter_complex snippet: anti-fingerprint audio treatment.
+
+    Tempo-preserving pitch (rubberband) -> chorus -> tilt EQ -> room echo ->
+    Haas widening. Returns (snippet, warnings). Anull when disabled/empty.
+    """
+    c = cfg or {}
+    if not c.get("on", False):
+        return f"[{in_label}]anull[{out_label}]", []
+    warnings: List[str] = []
+    pitch = float(c.get("pitch", 0.0))
+    chorus = float(c.get("chorus", 0.0))
+    reverb = float(c.get("reverb", 0.0))
+    tilt = float(c.get("tilt", 0.0))
+    widen = float(c.get("widen", 0.0))
+
+    cur = in_label
+    parts: List[str] = []
+    tag = [0]
+
+    def nxt() -> str:
+        tag[0] += 1
+        return f"clk{tag[0]}"
+
+    if abs(pitch) >= 0.05:
+        if _ffmpeg_has_filter("rubberband"):
+            ratio = 2.0 ** (pitch / 12.0)
+            o = nxt()
+            parts.append(f"[{cur}]rubberband=pitch={ratio:.5f}[{o}]")
+            cur = o
+        else:
+            warnings.append("rubberband filter missing — pitch shift skipped")
+    if chorus > 0.5:
+        wet = min(0.9, (chorus / 100.0) * 0.45)
+        a, b, ch, o = nxt(), nxt(), nxt(), nxt()
+        parts.append(
+            f"[{cur}]asplit[{a}][{b}];"
+            f"[{b}]chorus=0.7:0.9:45|60:0.4|0.25:0.25|0.4:1.1|1.4[{ch}];"
+            f"[{a}][{ch}]amix=inputs=2:duration=first:normalize=0:"
+            f"weights=1 {wet:.3f}[{o}]"
+        )
+        cur = o
+    if abs(tilt) >= 0.1:
+        o = nxt()
+        parts.append(
+            f"[{cur}]bass=g={-tilt / 2.0:.2f}:f=400,"
+            f"treble=g={tilt / 2.0:.2f}:f=2500[{o}]"
+        )
+        cur = o
+    if reverb > 0.5:
+        wet = min(0.9, (reverb / 100.0) * 0.35)
+        a, b, ec, o = nxt(), nxt(), nxt(), nxt()
+        parts.append(
+            f"[{cur}]asplit[{a}][{b}];"
+            f"[{b}]aecho=0.8:0.85:55|82|120:0.28|0.18|0.1[{ec}];"
+            f"[{a}][{ec}]amix=inputs=2:duration=first:normalize=0:"
+            f"weights=1 {wet:.3f}[{o}]"
+        )
+        cur = o
+    if widen > 0.1:
+        o = nxt()
+        parts.append(f"[{cur}]adelay=0|{int(round(widen))}:all=1[{o}]")
+        cur = o
+    if cur == in_label:
+        return f"[{in_label}]anull[{out_label}]", warnings
+    parts.append(f"[{cur}]anull[{out_label}]")
+    return ";".join(parts), warnings
+
+
+def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[str]:
+    """Raw vf list for the frame cloak (shared by snippet + per-segment use)."""
+    c = cfg or {}
+    if not c.get("on", False):
+        return []
+    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
+    bars = max(0.0, min(12.0, float(c.get("bars", 0.0))))
+    border = max(0.0, min(24.0, float(c.get("border", 0.0))))
+    border_color = str(c.get("borderColor", "#0ea5e9")).lstrip("#") or "0ea5e9"
+    saturate = float(c.get("saturate", 100.0)) / 100.0
+    contrast = float(c.get("contrast", 100.0)) / 100.0
+    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
+    hue = float(c.get("hue", 0.0))
+    grain = float(c.get("grain", 0.0))
+    vignette = float(c.get("vignette", 0.0))
+
+    f: List[str] = []
+    if zoom > 1.001:
+        f.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
+        f.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
+        f.append(f"scale={W}:{H}")
+    if abs(saturate - 1.0) > 0.005 or abs(contrast - 1.0) > 0.005 \
+            or abs(brightness) > 0.005:
+        f.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
+                 f"brightness={brightness:.3f}")
+    if abs(hue) > 0.5:
+        f.append(f"hue=h={hue:.1f}")
+    if grain > 0.5:
+        f.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+    if vignette > 0.5:
+        angle = (3.14159 / 2.0) - (vignette / 100.0) * (3.14159 / 2.0 - 3.14159 / 7.0)
+        f.append(f"vignette=a={angle:.4f}")
+    if bars > 0.05:
+        bh = max(1, int(round(H * bars / 100.0)))
+        f.append(f"drawbox=y=0:w=iw:h={bh}:c=black:t=fill")
+        f.append(f"drawbox=y=ih-{bh}:w=iw:h={bh}:c=black:t=fill")
+    if border > 0.5:
+        bw = max(1, int(round(border * H / 1080.0)))
+        o = bw // 2
+        f.append(f"drawbox=x={o}:y={o}:w=iw-{2 * o}:h=ih-{2 * o}:"
+                 f"c=0x{border_color}:t={bw}")
+    return f
+
+
+def video_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
+                      out_label: str, W: int, H: int) -> str:
+    """ffmpeg filter_complex snippet: anti-fingerprint frame treatment.
+
+    Punch-in zoom -> colour -> grain -> vignette -> cover bars -> frame.
+    Null when disabled.
+    """
+    f = _video_cloak_filters(cfg, W, H)
+    if not f:
+        return f"[{in_label}]null[{out_label}]"
+    return f"[{in_label}]{','.join(f)}[{out_label}]"
+
+
+def _atempo_chain(factor: float) -> List[str]:
+    """atempo only spans 0.5..2.0 — chain it for wider ranges."""
+    factor = max(0.125, min(16.0, float(factor)))
+    out: List[str] = []
+    while factor > 2.0 + 1e-6:
+        out.append("atempo=2.0")
+        factor /= 2.0
+    while factor < 0.5 - 1e-6:
+        out.append("atempo=0.5")
+        factor /= 0.5
+    out.append(f"atempo={factor:.4f}")
+    return out
+
+
+def _drawtext_font(bold: bool = True) -> Optional[str]:
+    """Find a DejaVu/Liberation TTF for drawtext (None = draw shapes only)."""
+    names = (("DejaVuSans-Bold", "DejaVuSans") if bold
+             else ("DejaVuSans", "LiberationSans-Regular"))
+    roots = ["/usr/share/fonts", "/usr/local/share/fonts",
+             str(Path.home() / ".fonts")]
+    for root in roots:
+        for name in names:
+            for p in Path(root).rglob(f"{name}.ttf"):
+                return str(p)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# browser-parity retouch (cf. src/lib/retouch.ts): skin / teeth / eye+nose warps
+# MediaPipe FaceMesh (refine_landmarks=True) exposes the same 478-point
+# topology as the browser FaceLandmarker, so the indices match one-to-one.
+# ---------------------------------------------------------------------------
+
+FACE_OVAL = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379,
+    378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+    162, 21, 54, 103, 67, 109,
+]
+INNER_LIP = [
+    78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14,
+    87, 178, 88, 95,
+]
+IRIS_R = 468
+IRIS_L = 473
+NOSE_TIP = 1
+
+
+def _pose_from_landmarks(lm: np.ndarray, w: int, h: int) -> Dict[str, Any]:
+    """lm: (478, 2) normalised -> pose in pixels (mirrors poseFromLandmarks)."""
+    pts = lm[:, :2] * np.array([w, h], np.float32)
+    oval = pts[FACE_OVAL]
+    lip = pts[INNER_LIP]
+    eye_l = pts[IRIS_L]
+    eye_r = pts[IRIS_R]
+    nose = pts[NOSE_TIP]
+    span = float(np.linalg.norm(pts[263] - pts[33]))
+    return {
+        "oval": oval, "lip": lip, "eyeL": eye_l, "eyeR": eye_r, "nose": nose,
+        "eyeRadius": max(6.0, span * 0.32),
+        "noseRadius": max(8.0, span * 0.42),
+        "box": (float(oval[:, 0].min()), float(oval[:, 1].min()),
+                float(oval[:, 0].max()), float(oval[:, 1].max())),
+    }
+
+
+def _pose_from_box(box: Dict[str, Any], w: int, h: int) -> Dict[str, Any]:
+    """Manual pose from a fractional face box (mirrors poseFromBox)."""
+    x = float(box.get("x", 0.3)) * w
+    y = float(box.get("y", 0.1)) * h
+    bw = float(box.get("w", 0.4)) * w
+    bh = float(box.get("h", 0.55)) * h
+    a = np.linspace(0, 2 * np.pi, 36, endpoint=False)
+    oval = np.stack([x + bw / 2 + np.cos(a) * bw / 2,
+                     y + bh / 2 + np.sin(a) * bh / 2], axis=1)
+    a2 = np.linspace(0, 2 * np.pi, 20, endpoint=False)
+    lip = np.stack([x + bw / 2 + np.cos(a2) * bw * 0.4 / 2,
+                    y + bh * 0.72 + np.sin(a2) * bh * 0.16 / 2], axis=1)
+    span = bw * 0.72
+    return {
+        "oval": oval.astype(np.float32), "lip": lip.astype(np.float32),
+        "eyeL": np.array([x + bw * 0.32, y + bh * 0.42], np.float32),
+        "eyeR": np.array([x + bw * 0.68, y + bh * 0.42], np.float32),
+        "nose": np.array([x + bw * 0.5, y + bh * 0.6], np.float32),
+        "eyeRadius": max(6.0, span * 0.32),
+        "noseRadius": max(8.0, span * 0.42),
+        "box": (x, y, x + bw, y + bh),
+    }
+
+
+def _soft_poly_mask(h: int, w: int, pts: np.ndarray, feather_px: float) -> np.ndarray:
+    import cv2
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
+    if feather_px > 1.0:
+        mask = cv2.GaussianBlur(mask, (0, 0), max(0.8, feather_px / 2.5))
+    return mask.astype(np.float32) / 255.0
+
+
+def _skin_selection_bgr(img: np.ndarray) -> np.ndarray:
+    """Conservative skin-tone test (BGR) — keeps smoothing off hair/walls."""
+    b = img[:, :, 0].astype(np.int16)
+    g = img[:, :, 1].astype(np.int16)
+    r = img[:, :, 2].astype(np.int16)
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    return (r > 60) & (g > 30) & (b > 15) & ((mx - mn) > 12) & \
+        (r > g + 8) & (r > b + 8)
+
+
+def _retouch_skin(img: np.ndarray, pose: Dict[str, Any], amount: float,
+                  detail: float, feather01: float) -> np.ndarray:
+    """Edge-preserving smoothing: blurred copy blended through the oval mask,
+    high-frequency detail partially re-added (hair/brows stay crisp)."""
+    import cv2
+    if amount <= 0:
+        return img
+    h, w = img.shape[:2]
+    soft = max(2.0, feather01 * max(w, h) * 0.06)
+    mask = _soft_poly_mask(h, w, pose["oval"], soft)
+    x0, y0, x1, y1 = [int(v) for v in pose["box"]]
+    x0, y0 = max(0, x0 - int(soft)), max(0, y0 - int(soft))
+    x1, y1 = min(w, x1 + int(soft)), min(h, y1 + int(soft))
+    if x1 <= x0 or y1 <= y0:
+        return img
+    small = cv2.resize(img, (max(4, w // 3), max(4, h // 3)),
+                       interpolation=cv2.INTER_LINEAR)
+    small = cv2.GaussianBlur(small, (0, 0), max(0.6, (amount / 100.0) * 2.4))
+    blur = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    f = img.astype(np.float32)
+    b = blur.astype(np.float32)
+    target = b + (f - b) * min(1.0, detail / 100.0)
+    a = (mask * min(1.0, amount / 100.0))[y0:y1, x0:x1]
+    skin = _skin_selection_bgr(img)[y0:y1, x0:x1]
+    a = np.where(skin, a, 0.0)[..., None]
+    img[y0:y1, x0:x1] = (f[y0:y1, x0:x1] * (1 - a) + target[y0:y1, x0:x1] * a
+                         ).astype(np.uint8)
+    return img
+
+
+def _retouch_teeth(img: np.ndarray, pose: Dict[str, Any], amount: float,
+                   feather01: float) -> np.ndarray:
+    """Whiten bright low-saturation pixels inside the inner-lip polygon."""
+    import cv2
+    if amount <= 0:
+        return img
+    h, w = img.shape[:2]
+    soft = max(1.5, feather01 * 22.0)
+    mask = _soft_poly_mask(h, w, pose["lip"], soft)
+    f = img.astype(np.float32)
+    b, g, r = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    sat = np.where(mx > 1, (mx - mn) / np.maximum(mx, 1), 0)
+    toothy = np.clip((lum - 55) / 90.0, 0, 1) * (1 - np.clip(sat / 0.42, 0, 1))
+    a = mask * (amount / 100.0) * toothy
+    tgt = np.clip(lum * 1.14 + 26, 0, 255)
+    f[:, :, 0] += a * (tgt * 0.97 - b)
+    f[:, :, 1] += a * (tgt * 0.995 - g)
+    f[:, :, 2] += a * (tgt - r)
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def _radial_warp(img: np.ndarray, cx: float, cy: float, radius: float,
+                 scale: float, feather01: float) -> np.ndarray:
+    """Magnify (>1) or pinch (<1) around a point, cosine falloff, no seam."""
+    import cv2
+    if abs(scale - 1) < 0.005 or radius < 2:
+        return img
+    h, w = img.shape[:2]
+    reach = radius * (1 + max(0.0, feather01) * 1.2)
+    x0, x1 = max(0, int(cx - reach)), min(w, int(cx + reach) + 1)
+    y0, y1 = max(0, int(cy - reach)), min(h, int(cy + reach) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return img
+    ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    d = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+    t = np.ones_like(d)
+    mid = (d > radius) & (d <= reach)
+    t[mid] = np.cos((d[mid] - radius) / max(1e-6, reach - radius) * np.pi / 2)
+    t[d > reach] = 0
+    mag = np.maximum(1 + (scale - 1) * t, 1e-3)
+    map_x = (cx + (xs - cx) / mag - x0).astype(np.float32)
+    map_y = (cy + (ys - cy) / mag - y0).astype(np.float32)
+    patch = img[y0:y1, x0:x1]
+    warped = cv2.remap(patch, map_x, map_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE)
+    a = t[..., None]
+    img[y0:y1, x0:x1] = (warped * a + patch * (1 - a)).astype(np.uint8)
+    return img
+
+
+def _apply_retouch_browser(img: np.ndarray, lm: Optional[np.ndarray],
+                           cfg: Dict[str, Any],
+                           manual_box: Dict[str, Any]) -> np.ndarray:
+    """Full browser-parity stack on a BGR image. *lm* is (478, 2) normalised
+    or None (manual mode derives the pose from the box instead)."""
+    h, w = img.shape[:2]
+    if cfg.get("manual"):
+        pose = _pose_from_box(manual_box or {}, w, h)
+    elif lm is not None and len(lm) >= 400:
+        pose = _pose_from_landmarks(np.asarray(lm, np.float32), w, h)
+    else:
+        return img
+    feather01 = float(cfg.get("feather", 45.0)) / 100.0
+    img = _retouch_skin(img, pose, float(cfg.get("skin", 0.0)),
+                        float(cfg.get("detail", 45.0)), feather01)
+    img = _retouch_teeth(img, pose, float(cfg.get("teeth", 0.0)), feather01)
+    eye = float(cfg.get("eyeScale", 0.0))
+    if abs(eye) > 0.05:
+        s = 1 + eye / 100.0
+        for pt in (pose["eyeL"], pose["eyeR"]):
+            img = _radial_warp(img, float(pt[0]), float(pt[1]),
+                                 pose["eyeRadius"], s, feather01)
+    nose = float(cfg.get("noseScale", 0.0))
+    if abs(nose) > 0.05:
+        img = _radial_warp(img, float(pose["nose"][0]), float(pose["nose"][1]),
+                             pose["noseRadius"], 1 + nose / 100.0, feather01)
+    return img
+
+
 # ===========================================================================
 class ReactionVideoProcessor:
     def __init__(self, input_path, work_dir=None, output_dir=None,
@@ -205,7 +604,8 @@ class ReactionVideoProcessor:
                          intro_mode=False,
                          layout: Optional[L.LayoutState] = None,
                          segments: Optional[List[Dict[str, Any]]] = None,
-                         crf: int = 18) -> str:
+                         crf: int = 18, fps: Optional[float] = None,
+                         width: int = 1920, height: int = 1080) -> str:
         """Render composited VIDEO (no audio) through the WYSIWYG compositor.
 
         Backward-compatible signature: old calls with preset= / intro_mode=
@@ -228,7 +628,7 @@ class ReactionVideoProcessor:
 
         res = C.render_video(str(self.input), str(out), layout=layout,
                              segments=segments, crf=crf, progress_cb=cb,
-                             cam_hook=hook)
+                             cam_hook=hook, fps=fps, width=width, height=height)
         print(f"Composed {res['frames']} frames -> {out}")
         return str(out)
 
@@ -348,12 +748,14 @@ class ReactionVideoProcessor:
     def mix_audio(self, input_path=None, mic_channel=None, content_channel=None,
                   output_path=None, compressor=True, limiter=True, duck=True,
                   segments: Optional[List[Dict[str, Any]]] = None,
-                  fast_speed: float = 4.0) -> str:
+                  fast_speed: float = 4.0, mute_solo: bool = True,
+                  master_gain_db: float = 0.0) -> str:
         """Mix mic + content buses, conformed to the same segment map as video.
 
-        *segments*: cut spans are dropped, fast spans get atempo, mute spans
-        silence the CONTENT bus only (your mic stays). When None, the whole
-        file is mixed (legacy behaviour).
+        *segments*: cut spans are dropped, fast spans get atempo, mute/card
+        spans silence the CONTENT bus only (your mic stays). When None, the
+        whole file is mixed (legacy behaviour). *mute_solo* also silences the
+        content bus during intro/outro (browser parity: muteContentInSolo).
 
         Works with both OBS audio layouts (2 tracks or 1 stereo track) and
         with ffmpeg 7+, where the old `-map_channel` option no longer exists.
@@ -411,24 +813,30 @@ class ReactionVideoProcessor:
         mic_final = self._conform_bus(mic_proc, segments, fast_speed, mute_to_zero=False,
                                       tag="mic")
         content_final = self._conform_bus(content_proc, segments, fast_speed,
-                                          mute_to_zero=True, tag="content")
+                                          mute_to_zero=True, tag="content",
+                                          mute_solo=mute_solo)
         self._ff(["ffmpeg", "-y", "-i", str(mic_final), "-i", str(content_final),
-                  "-filter_complex", "amix=inputs=2:duration=longest:dropout_transition=0.2[out]",
+                  "-filter_complex",
+                  "amix=inputs=2:duration=longest:dropout_transition=0.2[m];"
+                  f"[m]aformat=channel_layouts=stereo,"
+                  f"volume={float(master_gain_db):.1f}dB,"
+                  "alimiter=limit=-1.5dB:attack=5:release=50[out]",
                   "-map", "[out]", "-c:a", "pcm_s16le", str(dst)], "final mix")
         print(f"Mixed audio -> {dst}")
         return str(dst)
 
-    def _conform_bus(self, wav: Path, segments, fast_speed, mute_to_zero, tag) -> Path:
+    def _conform_bus(self, wav: Path, segments, fast_speed, mute_to_zero, tag,
+                     mute_solo: bool = False) -> Path:
         """Cut/drop/speed one audio bus identically to the video timeline."""
         if not segments:
             return wav
         kept = [s for s in segments if s.get("type") != "cut"]
         if not kept:
             raise ValueError("all segments are cut — nothing to mix")
-        # single untouched span -> no work (unless it is a mute on content)
-        if len(kept) == 1 and kept[0].get("type") not in ("fast", "mute"):
-            if not (mute_to_zero and kept[0].get("type") == "mute"):
-                return wav
+        mute_types = {"mute", "card"} | ({"intro", "outro"} if mute_solo else set())
+        # single untouched span -> no work (unless it mutes this bus)
+        if len(kept) == 1 and kept[0].get("type") not in ({"fast"} | mute_types):
+            return wav
         n = len(kept)
         outs, chain = [], []
         chain.append(f"[0:a]asplit={n}" + "".join(f"[s{i}]" for i in range(n)))
@@ -437,7 +845,7 @@ class ReactionVideoProcessor:
                  "asetpts=PTS-STARTPTS"]
             if s.get("type") == "fast":
                 f.append(f"atempo={float(fast_speed):.3f}")
-            if mute_to_zero and s.get("type") == "mute":
+            if mute_to_zero and s.get("type") in mute_types:
                 f.append("volume=0")
             outs.append(f"[b{i}]")
             chain.append(f"[s{i}]{','.join(f)}[b{i}]")
@@ -465,6 +873,174 @@ class ReactionVideoProcessor:
                       "-c:a", "libopus", "-b:a", "128k", str(wb)], "webm transcode")
             result["webm"] = str(wb)
         return result
+
+    # ------------------------------------------- passthrough (YouTube) render
+    def render_passthrough(
+        self,
+        segments: List[Dict[str, Any]],
+        audio_cloak: Optional[Dict[str, Any]] = None,
+        video_cloak: Optional[Dict[str, Any]] = None,
+        card: Optional[Dict[str, Any]] = None,
+        fast_speed: float = 4.0,
+        master_gain_db: float = 0.0,
+        crf: int = 18,
+        preset: str = "fast",
+        fps: Optional[float] = None,
+        height: int = 0,
+        name: str = "youtube_final",
+        webm: bool = False,
+        progress_cb=None,
+    ) -> Dict[str, str]:
+        """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
+
+        cuts are dropped, fast spans sped (atempo + setpts), mute/card spans
+        silence the whole mixed programme, card spans get a full-frame card,
+        everything else takes the cloak. A/V can never desync — both streams
+        are conformed from the same segment list in one command.
+        """
+        if not _has("ffmpeg"):
+            raise RuntimeError("ffmpeg not found (needed for render_passthrough)")
+        kept = sorted(
+            [s for s in (segments or []) if s.get("type") != "cut"],
+            key=lambda s: s["start"],
+        )
+        if not kept:
+            raise ValueError("nothing to render — all segments are cut?")
+        W = int(self.info.get("width") or 1920)
+        H = int(self.info.get("height") or 1080)
+        total = C.render_duration(
+            [{"type": s.get("type", "body"), "start": s["start"], "end": s["end"]}
+             for s in kept],
+            fast_speed,
+        )
+
+        n = len(kept)
+        vparts: List[str] = [
+            f"[0:v]split={n}" + "".join(f"[vin{i}]" for i in range(n))
+        ]
+        aparts: List[str] = [
+            f"[0:a]asplit={n}" + "".join(f"[ain{i}]" for i in range(n))
+        ]
+        vouts, aouts = [], []
+        cloak_vf = _video_cloak_filters(video_cloak, W, H)
+        for i, s in enumerate(kept):
+            typ = s.get("type", "body")
+            a, b = float(s["start"]), float(s["end"])
+            if typ == "fast":
+                vf = f"trim=start={a:.3f}:end={b:.3f}," \
+                     f"setpts=(PTS-STARTPTS)/{float(fast_speed):.4f}"
+                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS," \
+                     + ",".join(_atempo_chain(fast_speed))
+            else:
+                vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
+                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+            if typ in ("mute", "card"):
+                af += ",volume=0"
+            if typ == "card":
+                vf += "," + ",".join(
+                    self._card_draws(card or {}, W, H, suffix=f"_{i}")
+                )
+            elif cloak_vf:
+                vf += "," + ",".join(cloak_vf)
+            vf += ",setsar=1"
+            vparts.append(f"[vin{i}]{vf}[v{i}]")
+            aparts.append(f"[ain{i}]{af}[a{i}]")
+            vouts.append(f"[v{i}]")
+            aouts.append(f"[a{i}]")
+        vparts.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
+        aouts_s = f"{''.join(aouts)}concat=n={n}:v=0:a=1[acat]"
+        chain = vparts + aparts + [aouts_s]
+        clk, cloak_warn = audio_cloak_chain(audio_cloak, "acat", "acl")
+        chain.append(clk)
+        for w in cloak_warn:
+            print(f"  (cloak: {w})")
+        chain.append(
+            f"[acl]volume={float(master_gain_db):.1f}dB,"
+            "alimiter=limit=-1.5dB:attack=5:release=50,"
+            "aformat=channel_layouts=stereo[aout]"
+        )
+        vtail = "[vcat]"
+        if fps:
+            chain.append(f"[vcat]fps={float(fps):.3f}[vfps]")
+            vtail = "[vfps]"
+        if height and int(height) not in (0, H):
+            chain.append(f"{vtail}scale=-2:{int(height)}[vout]")
+        else:
+            chain.append(f"{vtail}null[vout]")
+
+        out = self.out / f"{name}.mp4"
+        cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(self.input),
+               "-filter_complex", ";".join(chain),
+               "-map", "[vout]", "-map", "[aout]",
+               "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+               "-movflags", "+faststart", str(out)]
+        p = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
+                             text=True, bufsize=1)
+        assert p.stdout is not None
+        tail: List[str] = []
+        for line in p.stdout:
+            tail.append(line)
+            if len(tail) > 60:
+                tail.pop(0)
+            m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+            if m and progress_cb:
+                t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                progress_cb(min(t, total), total)
+        p.wait()
+        if p.returncode != 0 or not out.exists():
+            raise RuntimeError("passthrough render failed:\n" + "".join(tail)[-2000:])
+        if progress_cb:
+            progress_cb(total, total)
+        result = {"mp4": str(out)}
+        if webm:
+            result["webm"] = self._to_webm(out)
+        print(f"Passthrough {total:.1f}s -> {out}")
+        return result
+
+    def _card_draws(self, card: Dict[str, Any], W: int, H: int,
+                    suffix: str = "") -> List[str]:
+        """Full-frame placeholder card as drawbox/drawtext filters."""
+        title = str(card.get("title", "Full uncut reaction on Patreon"))
+        sub = str(card.get("sub", "link in the description"))
+        accent = str(card.get("accent", "#e879f9")).lstrip("#") or "e879f9"
+        x = int(round(W * 0.06))
+        y = int(round(H * 0.16))
+        cw = int(round(W * 0.88))
+        ch = int(round(H * 0.68))
+        draws = [f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=black@0.94:t=fill",
+                 f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=0x{accent}80:t=2"]
+        bar_h = max(2, int(round(4 * H / 1080)))
+        draws.append(f"drawbox=x={x + int(cw * 0.16)}:y={y + int(ch * 0.34)}:"
+                     f"w={int(cw * 0.68)}:h={bar_h}:c=0x{accent}:t=fill")
+        font = _drawtext_font(bold=True)
+        # static/minimal ffmpeg builds sometimes ship without drawtext —
+        # the card still renders (shapes only) instead of failing the job
+        if font and _ffmpeg_has_filter("drawtext") and (title.strip() or sub.strip()):
+            tf = self.work / f"card_title{suffix}.txt"
+            sf = self.work / f"card_sub{suffix}.txt"
+            tf.write_text(title, encoding="utf-8")
+            sf.write_text(sub, encoding="utf-8")
+            fs = min(58 * H / 1080, cw * 0.072)
+            fs2 = max(10, fs * 0.62)
+            yt = y + int(ch * 0.47)
+            ys = y + int(ch * 0.58)
+            draws.append(
+                f"drawtext=fontfile='{font}':textfile='{tf}':"
+                f"fontsize={fs:.0f}:fontcolor=white:"
+                f"x={x}+({cw}-text_w)/2:y={yt}-text_h/2")
+            draws.append(
+                f"drawtext=fontfile='{font}':textfile='{sf}':"
+                f"fontsize={fs2:.0f}:fontcolor=0xE2E8F0:"
+                f"x={x}+({cw}-text_w)/2:y={ys}-text_h/2")
+        return draws
+
+    def _to_webm(self, mp4: Path) -> str:
+        wb = Path(mp4).with_suffix(".webm")
+        self._ff(["ffmpeg", "-y", "-i", str(mp4), "-c:v", "libvpx-vp9",
+                  "-crf", "30", "-b:v", "0", "-deadline", "good", "-cpu-used", "5",
+                  "-c:a", "libopus", "-b:a", "128k", str(wb)], "webm transcode")
+        return str(wb)
 
     # --------------------------------------------------------------- retouch
     def _mesh_get(self):
@@ -544,15 +1120,61 @@ class ReactionVideoProcessor:
         return frame
 
     def _cam_hook(self):
-        """Build the per-frame camera hook used by preview AND render."""
-        cfg = self.retouch_cfg
+        """Build the per-frame camera hook used by preview AND render.
+
+        Browser-style configs (skin/eyeScale/noseScale keys, sent by the new
+        UI) take the browser-parity path; legacy configs (smooth/eyes) keep
+        the original behaviour so the old GUIs are unaffected.
+        """
+        cfg = self.retouch_cfg or {}
         if not cfg.get("enabled"):
             return None
-        mesh = self._mesh_get()
-        smooth, teeth, eyes = cfg.get("smooth", 35), cfg.get("teeth", 40), cfg.get("eyes", 35)
+        if "skin" not in cfg and "eyeScale" not in cfg and "noseScale" not in cfg:
+            mesh = self._mesh_get()
+            smooth = cfg.get("smooth", 35)
+            teeth = cfg.get("teeth", 40)
+            eyes = cfg.get("eyes", 35)
+
+            def legacy_hook(cam_img: np.ndarray) -> np.ndarray:
+                return self.apply_retouch_frame(cam_img.copy(), mesh, smooth,
+                                                teeth, eyes)
+
+            return legacy_hook
+
+        mesh = None if cfg.get("manual") else self._mesh_get()
+        every = max(1, int(cfg.get("everyN", 1) or 1))
+        box = cfg.get("manualRect") or {}
+        state = {"n": 0, "lm": None}
 
         def hook(cam_img: np.ndarray) -> np.ndarray:
-            return self.apply_retouch_frame(cam_img.copy(), mesh, smooth, teeth, eyes)
+            import cv2
+            img = cam_img.copy()
+            lm = None
+            if not cfg.get("manual"):
+                state["n"] += 1
+                if state["lm"] is None or (state["n"] - 1) % every == 0:
+                    # detect on a small copy — much faster, same topology
+                    h0, w0 = img.shape[:2]
+                    sc = min(1.0, 640.0 / max(w0, h0))
+                    small = (img if sc >= 1.0 else
+                             cv2.resize(img, (int(w0 * sc), int(h0 * sc)),
+                                        interpolation=cv2.INTER_LINEAR))
+                    try:
+                        res = mesh.process(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+                    except Exception:
+                        res = None
+                    fl = (res.multi_face_landmarks[0]
+                          if res is not None and res.multi_face_landmarks else None)
+                    if fl is not None and len(fl.landmark) >= 400:
+                        state["lm"] = np.array([(p.x, p.y) for p in fl.landmark],
+                                               np.float32)
+                lm = state["lm"]
+                if lm is None:
+                    return img
+            try:
+                return _apply_retouch_browser(img, lm, cfg, box)
+            except Exception:
+                return img
 
         return hook
 
