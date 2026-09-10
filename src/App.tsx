@@ -4,6 +4,7 @@ import Timeline from "./components/Timeline";
 import AutoCut from "./components/AutoCut";
 import PolishPanel from "./components/Polish";
 import RetouchPanel from "./components/RetouchPanel";
+import CloakPanel from "./components/Cloak";
 import { AudioPanel, ClaimsPanel, ExportPanel, LayoutPanel, VideoPanel } from "./components/Panels";
 import { Btn, LiveText } from "./components/ui";
 import { AudioEngine } from "./lib/audio";
@@ -63,14 +64,17 @@ import {
 } from "./lib/timeline";
 import {
   defaultAudio,
+  defaultAudioCloak,
   defaultCut,
   defaultDisrupt,
   defaultLead,
   defaultLayout,
   defaultPolish,
   defaultRetouch,
+  defaultVideoCloak,
   SEGMENT_META,
   TARGET_META,
+  type AudioCloak,
   type AudioState,
   type Claim,
   type CutOptions,
@@ -83,6 +87,7 @@ import {
   type Segment,
   type SegmentType,
   type Target,
+  type VideoCloak,
 } from "./lib/types";
 import { cn } from "./utils/cn";
 
@@ -124,6 +129,7 @@ const RIGHT_TABS: Record<Target, { id: string; label: string }[]> = {
   ],
   youtube: [
     { id: "video", label: "Video" },
+    { id: "cloak", label: "Cloak" },
     { id: "audio", label: "Audio" },
     { id: "export", label: "Render" },
   ],
@@ -192,6 +198,8 @@ export default function App() {
 
   /* polish */
   const [target, setTarget] = useState<Target>("patreon");
+  const [audioCloak, setAudioCloak] = useState<AudioCloak>(defaultAudioCloak);
+  const [videoCloak, setVideoCloak] = useState<VideoCloak>(defaultVideoCloak);
   const [scanChannel, setScanChannel] = useState<"mic" | "content">("mic");
   const [micEnv, setMicEnv] = useState<Envelope | null>(null);
   const [contentEnv, setContentEnv] = useState<Envelope | null>(null);
@@ -205,6 +213,10 @@ export default function App() {
   disruptRef.current = disruptRules;
   const targetRef = useRef<Target>("patreon");
   targetRef.current = target;
+  const audioCloakRef = useRef(audioCloak);
+  audioCloakRef.current = audioCloak;
+  const videoCloakRef = useRef(videoCloak);
+  videoCloakRef.current = videoCloak;
 
   /* retouch */
   const [retouch, setRetouch] = useState<Retouch>(defaultRetouch);
@@ -426,6 +438,10 @@ export default function App() {
   }, [audio.mic.channel]);
 
   useEffect(() => {
+    engine().updateCloak(audioCloak);
+  }, [audioCloak]);
+
+  useEffect(() => {
     const v = videoRef.current;
     if (v && !scanningRef.current) v.playbackRate = rate;
   }, [rate]);
@@ -558,7 +574,13 @@ export default function App() {
       }
 
       const scene = yt
-        ? buildPassthroughScene(segs, v.currentTime, halves.full, lay.fastSpeed)
+        ? buildPassthroughScene(
+            segs,
+            v.currentTime,
+            halves.full,
+            lay.fastSpeed,
+            videoCloakRef.current
+          )
         : buildScene(lay, segs, v.currentTime, halves);
       const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
       if (hook) hook.debugPose = poseRef.current;
@@ -713,6 +735,7 @@ export default function App() {
       engine().setDirect(targetRef.current === "youtube");
       engine().attach(v, audioRef.current.mic.channel);
       engine().update(audioRef.current);
+      engine().updateCloak(audioCloakRef.current);
     } catch {
       /* audio graph already bound to this element */
     }
@@ -1444,6 +1467,14 @@ export default function App() {
                 dims={dims}
                 layout={layout}
                 setLayout={setLayout}
+              />
+            )}
+            {rightTab === "cloak" && isYT && (
+              <CloakPanel
+                audio={audioCloak}
+                setAudio={setAudioCloak}
+                video={videoCloak}
+                setVideo={setVideoCloak}
               />
             )}
             {rightTab === "audio" && (

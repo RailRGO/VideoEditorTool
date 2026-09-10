@@ -1,4 +1,4 @@
-import { defaultAudio, type AudioState } from "./types";
+import { defaultAudio, type AudioCloak, type AudioState } from "./types";
 
 export interface Levels {
   mic: number;
@@ -43,10 +43,40 @@ export class AudioEngine {
   private master: GainNode | null = null;
   private safety: DynamicsCompressorNode | null = null;
   private fastTrim: GainNode | null = null;
-  /** direct (mixed-file) path: source -> directGain -> directTrim -> master */
+  /** direct (mixed-file) path: source -> directGain -> cloak -> directTrim -> master */
   private directGain: GainNode | null = null;
   private directTrim: GainNode | null = null;
   private direct = false;
+
+  /* --- anti-fingerprint cloak (direct path only) ------------------------- */
+  private cloakIn: GainNode | null = null;
+  private shiftDry: GainNode | null = null;
+  private shiftWetA: GainNode | null = null;
+  private shiftWetB: GainNode | null = null;
+  private shiftSum: GainNode | null = null;
+  private shiftDelayA: DelayNode | null = null;
+  private shiftDelayB: DelayNode | null = null;
+  private lfoSaw: OscillatorNode | null = null;
+  private lfoSq: OscillatorNode | null = null;
+  private depthA: GainNode | null = null;
+  private depthB: GainNode | null = null;
+  private xfadeA: GainNode | null = null;
+  private xfadeB: GainNode | null = null;
+  private chorusDry: GainNode | null = null;
+  private chorusWet: GainNode | null = null;
+  private chorusSum: GainNode | null = null;
+  private chorusDelay: DelayNode | null = null;
+  private chorusLfo: OscillatorNode | null = null;
+  private chorusDepth: GainNode | null = null;
+  private tiltLo: BiquadFilterNode | null = null;
+  private tiltHi: BiquadFilterNode | null = null;
+  private verbDry: GainNode | null = null;
+  private verbWet: GainNode | null = null;
+  private verbSum: GainNode | null = null;
+  private verb: ConvolverNode | null = null;
+  private haasSplit: ChannelSplitterNode | null = null;
+  private haasMerge: ChannelMergerNode | null = null;
+  private haasDelay: DelayNode | null = null;
 
   /* --- mic loudness scanner ------------------------------------------- */
   scanning = false;
@@ -131,8 +161,9 @@ export class AudioEngine {
     this.directGain = ctx.createGain();
     this.directGain.gain.value = 0;
     this.directTrim = ctx.createGain();
+    this.buildCloak(ctx);
     this.source.connect(this.directGain);
-    this.directGain.connect(this.directTrim);
+    this.directGain.connect(this.cloakIn!);
     this.directTrim.connect(this.master);
     this.directTrim.connect(this.micMeter);
     this.directTrim.connect(this.contentMeter);
@@ -152,6 +183,157 @@ export class AudioEngine {
     const contentIdx = micIdx === 0 ? 1 : 0;
     this.splitter.connect(this.micIn, micIdx, 0);
     this.splitter.connect(this.contentIn, contentIdx, 0);
+  }
+
+  /**
+   * Anti-fingerprint chain for the YouTube cut. Pitch shift (dual modulated
+   * delay lines, tempo-preserving) -> chorus -> tilt EQ -> small-room reverb
+   * -> Haas widening. Every stage has a dry path, so bypassing is click-free
+   * and the chain is bit-neutral when the cloak is off.
+   */
+  private buildCloak(ctx: AudioContext) {
+    const D = 0.02; // pitch-shift delay depth, seconds
+    this.cloakIn = ctx.createGain();
+    this.shiftDry = ctx.createGain();
+    this.shiftSum = ctx.createGain();
+    this.shiftDelayA = ctx.createDelay(0.05);
+    this.shiftDelayB = ctx.createDelay(0.05);
+    this.shiftDelayA.delayTime.value = D / 2;
+    this.shiftDelayB.delayTime.value = D / 2;
+    this.shiftWetA = ctx.createGain();
+    this.shiftWetB = ctx.createGain();
+    // parked bypassed: static delays must contribute nothing until engaged
+    this.shiftWetA.gain.value = 0;
+    this.shiftWetB.gain.value = 0;
+
+    this.lfoSaw = ctx.createOscillator();
+    this.lfoSaw.type = "sawtooth";
+    this.lfoSaw.frequency.value = 2;
+    this.lfoSq = ctx.createOscillator();
+    this.lfoSq.type = "square";
+    this.lfoSq.frequency.value = 2;
+    this.depthA = ctx.createGain();
+    this.depthB = ctx.createGain();
+    this.depthA.gain.value = 0;
+    this.depthB.gain.value = 0;
+    this.xfadeA = ctx.createGain();
+    this.xfadeB = ctx.createGain();
+    this.xfadeA.gain.value = 0;
+    this.xfadeB.gain.value = 0;
+
+    this.cloakIn.connect(this.shiftDry);
+    this.cloakIn.connect(this.shiftDelayA);
+    this.cloakIn.connect(this.shiftDelayB);
+    this.shiftDry.connect(this.shiftSum);
+    this.shiftDelayA.connect(this.shiftWetA);
+    this.shiftDelayB.connect(this.shiftWetB);
+    this.shiftWetA.connect(this.shiftSum);
+    this.shiftWetB.connect(this.shiftSum);
+    this.lfoSaw.connect(this.depthA);
+    this.lfoSaw.connect(this.depthB);
+    this.depthA.connect(this.shiftDelayA.delayTime);
+    this.depthB.connect(this.shiftDelayB.delayTime);
+    this.lfoSq.connect(this.xfadeA);
+    this.lfoSq.connect(this.xfadeB);
+    this.xfadeA.connect(this.shiftWetA.gain);
+    this.xfadeB.connect(this.shiftWetB.gain);
+
+    this.chorusDry = ctx.createGain();
+    this.chorusWet = ctx.createGain();
+    this.chorusWet.gain.value = 0;
+    this.chorusSum = ctx.createGain();
+    this.chorusDelay = ctx.createDelay(0.05);
+    this.chorusDelay.delayTime.value = 0.012;
+    this.chorusLfo = ctx.createOscillator();
+    this.chorusLfo.type = "sine";
+    this.chorusLfo.frequency.value = 1.1;
+    this.chorusDepth = ctx.createGain();
+    this.chorusDepth.gain.value = 0.0035;
+    this.shiftSum.connect(this.chorusDry);
+    this.shiftSum.connect(this.chorusDelay);
+    this.chorusDry.connect(this.chorusSum);
+    this.chorusDelay.connect(this.chorusWet);
+    this.chorusWet.connect(this.chorusSum);
+    this.chorusLfo.connect(this.chorusDepth);
+    this.chorusDepth.connect(this.chorusDelay.delayTime);
+
+    this.tiltLo = ctx.createBiquadFilter();
+    this.tiltLo.type = "lowshelf";
+    this.tiltLo.frequency.value = 400;
+    this.tiltHi = ctx.createBiquadFilter();
+    this.tiltHi.type = "highshelf";
+    this.tiltHi.frequency.value = 2500;
+    this.chorusSum.connect(this.tiltLo);
+    this.tiltLo.connect(this.tiltHi);
+
+    this.verbDry = ctx.createGain();
+    this.verbWet = ctx.createGain();
+    this.verbWet.gain.value = 0;
+    this.verbSum = ctx.createGain();
+    this.verb = ctx.createConvolver();
+    this.verb.buffer = makeImpulse(ctx, 1.4, 2.8);
+    this.tiltHi.connect(this.verbDry);
+    this.tiltHi.connect(this.verb);
+    this.verbDry.connect(this.verbSum);
+    this.verb.connect(this.verbWet);
+    this.verbWet.connect(this.verbSum);
+
+    this.haasSplit = ctx.createChannelSplitter(2);
+    this.haasMerge = ctx.createChannelMerger(2);
+    this.haasDelay = ctx.createDelay(0.05);
+    this.haasDelay.delayTime.value = 0;
+    this.verbSum.connect(this.haasSplit);
+    this.haasSplit.connect(this.haasMerge, 0, 0);
+    this.haasSplit.connect(this.haasDelay, 1, 0);
+    this.haasDelay.connect(this.haasMerge, 0, 1);
+    this.haasMerge.connect(this.directTrim!);
+
+    this.lfoSaw.start();
+    this.lfoSq.start();
+    this.chorusLfo.start();
+  }
+
+  /** Apply the YouTube audio-cloak settings to the direct chain. */
+  updateCloak(c: AudioCloak) {
+    const ctx = this.ctx;
+    if (!ctx || !this.cloakIn) return;
+    const t = ctx.currentTime;
+    const ramp = (p: AudioParam, v: number, tc = 0.03) => p.setTargetAtTime(v, t, tc);
+
+    // tempo-preserving pitch shift: a delay ramped at k scales the pitch by (1 - k)
+    const st = c.on ? c.pitch : 0;
+    if (Math.abs(st) < 0.05) {
+      // full bypass: kill both the wet bases and the crossfade LFO depth,
+      // otherwise the parked 10 ms delays comb-filter the dry signal
+      ramp(this.shiftWetA!.gain, 0, 0.05);
+      ramp(this.shiftWetB!.gain, 0, 0.05);
+      ramp(this.xfadeA!.gain, 0, 0.05);
+      ramp(this.xfadeB!.gain, 0, 0.05);
+      ramp(this.shiftDry!.gain, 1, 0.05);
+    } else {
+      const D = 0.02;
+      const k = 1 - Math.pow(2, st / 12);
+      const f = Math.min(12, Math.max(0.2, Math.abs(k) / D));
+      this.lfoSaw!.frequency.setValueAtTime(f, t);
+      this.lfoSq!.frequency.setValueAtTime(f, t);
+      const s = k > 0 ? 1 : -1;
+      this.depthA!.gain.setValueAtTime((s * D) / 2, t);
+      this.depthB!.gain.setValueAtTime((-s * D) / 2, t);
+      // re-arm the crossfade around the new ramps
+      this.xfadeA!.gain.setValueAtTime(0.5, t);
+      this.xfadeB!.gain.setValueAtTime(-0.5, t);
+      this.shiftWetA!.gain.setValueAtTime(0.5, t);
+      this.shiftWetB!.gain.setValueAtTime(0.5, t);
+      ramp(this.shiftDry!.gain, 0, 0.05);
+    }
+
+    const chMix = c.on ? (c.chorus / 100) * 0.4 : 0;
+    ramp(this.chorusWet!.gain, chMix);
+    ramp(this.chorusDry!.gain, 1 - chMix * 0.5);
+    ramp(this.verbWet!.gain, c.on ? (c.reverb / 100) * 0.33 : 0);
+    ramp(this.tiltLo!.gain, c.on ? -c.tilt / 2 : 0);
+    ramp(this.tiltHi!.gain, c.on ? c.tilt / 2 : 0);
+    ramp(this.haasDelay!.delayTime, c.on ? c.widen / 1000 : 0, 0.01);
   }
 
   /** true = mixed stereo file straight to master, false = split mic/content buses */
@@ -345,6 +527,20 @@ export class AudioEngine {
     this.levels.ducking = this.duckingNow;
     return this.levels;
   }
+}
+
+/** Small-room impulse: stereo noise with an exponential decay. */
+function makeImpulse(ctx: AudioContext, dur: number, decay: number): AudioBuffer {
+  const rate = ctx.sampleRate;
+  const len = Math.max(1, Math.floor(rate * dur));
+  const buf = ctx.createBuffer(2, len, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+    }
+  }
+  return buf;
 }
 
 function peakDb(buf: Float32Array): number {

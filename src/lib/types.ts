@@ -148,7 +148,6 @@ export interface AudioState {
 
 /** Which deliverable we're building right now. */
 export type Target = "patreon" | "youtube";
-
 export const TARGET_META: Record<Target, { label: string; hint: string; badge: string }> = {
   patreon: {
     label: "Patreon",
@@ -372,6 +371,73 @@ export const defaultAudio: AudioState = {
     },
   },
   master: { gain: 1 },
+};
+
+/**
+ * Anti-fingerprint processing for the YouTube cut. The source there is already
+ * mixed, so this treats the whole programme (you + content) as one signal.
+ * Everything here preserves duration — no timeline remapping needed.
+ */
+export interface AudioCloak {
+  on: boolean;
+  /** tempo-preserving pitch shift in semitones (±1 ≈ ±6%) */
+  pitch: number;
+  /** chorus movement 0..100 — constantly detunes the spectrum */
+  chorus: number;
+  /** small-room reverb 0..100 */
+  reverb: number;
+  /** EQ tilt in dB: positive = brighter, negative = darker */
+  tilt: number;
+  /** Haas stereo widening in ms (delays the right channel) */
+  widen: number;
+}
+
+export const defaultAudioCloak: AudioCloak = {
+  on: true,
+  pitch: 0.5,
+  chorus: 25,
+  reverb: 18,
+  tilt: 2,
+  widen: 6,
+};
+
+/**
+ * Frame-level changes for the YouTube cut. Applied to the full frame in
+ * passthrough mode — zoom/crop, cover bars, colour and grain.
+ */
+export interface VideoCloak {
+  on: boolean;
+  /** punch-in 1..1.12 — drops edge pixels trackers rely on */
+  zoom: number;
+  /** top/bottom cover bars, % of frame height each */
+  bars: number;
+  /** inset frame border, 1080p px */
+  border: number;
+  borderColor: string;
+  /** colour, % (100 = untouched) */
+  saturate: number;
+  contrast: number;
+  brightness: number;
+  /** hue rotation in degrees */
+  hue: number;
+  /** animated film grain 0..100 */
+  grain: number;
+  /** edge darkening 0..100 */
+  vignette: number;
+}
+
+export const defaultVideoCloak: VideoCloak = {
+  on: true,
+  zoom: 1.03,
+  bars: 3,
+  border: 0,
+  borderColor: "#0ea5e9",
+  saturate: 108,
+  contrast: 104,
+  brightness: 100,
+  hue: 0,
+  grain: 12,
+  vignette: 25,
 };
 
 export const defaultCut: CutOptions = {

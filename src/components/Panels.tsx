@@ -323,7 +323,7 @@ export function AudioPanel({
             <Meter label="mix" get={() => getLevels().mic} />
             <p className="text-[10px] leading-relaxed text-slate-500">
               The YouTube job is cut from your finished Patreon render, so the audio is already
-              mixed — it plays through untouched.
+              mixed — it plays through the anti-fingerprint chain (see the Cloak tab).
             </p>
           </div>
         </Section>
