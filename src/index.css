@@ -20,17 +20,9 @@ body {
   overscroll-behavior: none;
 }
 
-/* Timeline height fix — stop it from sinking */
-.timeline-area,
-[class*="timeline"],
-[class*="Timeline"] {
-  min-height: 240px !important;
-}
-
 /* Button consistency fix */
 button, .btn, [class*="Btn"] {
   transition: all .15s ease;
-  ring: 1px solid rgba(255,255,255,0.1);
 }
 
 *::-webkit-scrollbar {

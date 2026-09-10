@@ -19,6 +19,10 @@ const dbToLin = (db: number) => Math.pow(10, db / 20);
  *                                                                         └► analyser
  *
  * `duckGain` is driven from the post-compressor mic level (side-chain style).
+ *
+ * `direct` mode is for a finished, already-mixed stereo file (the YouTube job,
+ * cut from the Patreon render): the source goes straight to master untouched,
+ * and mute / card segments simply silence the programme.
  */
 export class AudioEngine {
   ctx: AudioContext | null = null;
@@ -39,6 +43,10 @@ export class AudioEngine {
   private master: GainNode | null = null;
   private safety: DynamicsCompressorNode | null = null;
   private fastTrim: GainNode | null = null;
+  /** direct (mixed-file) path: source -> directGain -> directTrim -> master */
+  private directGain: GainNode | null = null;
+  private directTrim: GainNode | null = null;
+  private direct = false;
 
   /* --- mic loudness scanner ------------------------------------------- */
   scanning = false;
@@ -119,6 +127,16 @@ export class AudioEngine {
     this.safety.connect(ctx.destination);
     this.safety.connect(this.streamDest);
 
+    // mixed-file path, silent until direct mode is switched on
+    this.directGain = ctx.createGain();
+    this.directGain.gain.value = 0;
+    this.directTrim = ctx.createGain();
+    this.source.connect(this.directGain);
+    this.directGain.connect(this.directTrim);
+    this.directTrim.connect(this.master);
+    this.directTrim.connect(this.micMeter);
+    this.directTrim.connect(this.contentMeter);
+
     this.setMicChannel(micChannel);
   }
 
@@ -134,6 +152,15 @@ export class AudioEngine {
     const contentIdx = micIdx === 0 ? 1 : 0;
     this.splitter.connect(this.micIn, micIdx, 0);
     this.splitter.connect(this.contentIn, contentIdx, 0);
+  }
+
+  /** true = mixed stereo file straight to master, false = split mic/content buses */
+  setDirect(d: boolean) {
+    this.direct = d;
+  }
+
+  get isDirect() {
+    return this.direct;
   }
 
   resume() {
@@ -239,13 +266,15 @@ export class AudioEngine {
   update(state: AudioState, fastGainDb = 0) {
     const ctx = this.ctx;
     if (!ctx) return;
+    this.lastFastDb = fastGainDb;
     const t = ctx.currentTime;
     const ramp = (p: AudioParam, v: number) => p.setTargetAtTime(v, t, 0.02);
 
-    ramp(this.micIn!.gain, dbToLin(state.mic.gain));
+    ramp(this.micIn!.gain, this.direct ? 0 : dbToLin(state.mic.gain));
     ramp(this.micPan!.pan, state.mic.pan);
-    ramp(this.contentIn!.gain, dbToLin(state.content.gain));
+    ramp(this.contentIn!.gain, this.direct ? 0 : dbToLin(state.content.gain));
     ramp(this.fastTrim!.gain, dbToLin(fastGainDb));
+    ramp(this.directGain!.gain, this.direct ? dbToLin(fastGainDb) : 0);
     // the scan plays at several times normal speed — don't blast it out loud
     ramp(this.master!.gain, this.scanning ? 0 : dbToLin(state.master.gain));
 
@@ -270,6 +299,12 @@ export class AudioEngine {
   tick(state: AudioState, contentMuted: boolean) {
     const ctx = this.ctx;
     if (!ctx || !this.duckGain) return this.levels;
+    if (this.direct) {
+      // mixed file: mute / card segments silence the whole programme
+      this.duckingNow = 0;
+      this.directTrim!.gain.setTargetAtTime(contentMuted ? 0 : 1, ctx.currentTime, 0.01);
+      return this.levels;
+    }
     const micDb = this.levels.mic;
     const duck = state.content.duck;
     const now = ctx.currentTime;

@@ -29,6 +29,8 @@ export interface Scene {
   layers: SceneLayer[];
   mode: "solo" | "body" | "cut" | "fast" | "card" | "lead";
   speed: number;
+  /** overrides layout.content for the placeholder card (full-frame card in passthrough) */
+  cardRect?: Rect;
 }
 
 export function sourceHalves(
@@ -126,6 +128,38 @@ export function buildScene(
     base.speed = layout.fastSpeed;
   }
   return base;
+}
+
+/**
+ * YouTube mode: the source is already the finished 16:9 Patreon render, so it
+ * passes through full-frame. Only cuts / mutes / speed / cards are applied —
+ * there is no camera/content compositing to do.
+ */
+export function buildPassthroughScene(
+  segs: Segment[],
+  srcTime: number,
+  full: SrcRect,
+  speed: number
+): Scene {
+  const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
+  const type = active?.type ?? "body";
+  if (type === "cut") return { bg: null, layers: [], mode: "cut", speed: 1 };
+  if (type === "card") {
+    return {
+      bg: full,
+      layers: [],
+      mode: "card",
+      speed: 1,
+      cardRect: { x: 0.06, y: 0.16, w: 0.88, h: 0.68 },
+    };
+  }
+  const layer: SceneLayer = {
+    src: full,
+    rect: { x: 0, y: 0, w: 1, h: 1 },
+    style: FLAT,
+  };
+  if (type === "fast") return { bg: null, layers: [layer], mode: "fast", speed };
+  return { bg: null, layers: [layer], mode: "body", speed: 1 };
 }
 
 /** Clip/stroke path for any of the supported layer shapes. */
@@ -243,10 +277,11 @@ function drawCard(
   ctx: CanvasRenderingContext2D,
   layout: LayoutState,
   W: number,
-  H: number
+  H: number,
+  rect?: Rect
 ) {
   const k = H / 1080;
-  const r = layout.content;
+  const r = rect ?? layout.content;
   const x = r.x * W;
   const y = r.y * H;
   const w = r.w * W;
@@ -418,7 +453,7 @@ export function renderScene(
     }
   }
 
-  if (scene.mode === "card") drawCard(ctx, layout, W, H);
+  if (scene.mode === "card") drawCard(ctx, layout, W, H, scene.cardRect);
   if (scene.mode === "lead") drawLeadBlock(ctx, layout, W, H);
   if (scene.mode === "fast") drawSpeedBadge(ctx, scene.speed, W, H);
   ctx.restore();

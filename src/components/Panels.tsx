@@ -97,7 +97,15 @@ export function LayoutPanel({
                   content: { ...p.content },
                   cam: { ...p.cam },
                   contentHidden: p.hideContent,
-                  camStyle: { ...l.camStyle, shape: p.camShape },
+                  camStyle: {
+                    ...l.camStyle,
+                    shape: p.camShape,
+                    ...(p.camRadius != null ? { radius: p.camRadius } : {}),
+                  },
+                  contentStyle: {
+                    ...l.contentStyle,
+                    ...(p.contentRadius != null ? { radius: p.contentRadius } : {}),
+                  },
                 }))
               }
               className={cn(
@@ -142,6 +150,12 @@ export function LayoutPanel({
           <Slider label="Width" value={rect.w} min={0.05} max={1} step={0.005} display={pct(rect.w)} onChange={(v) => setRect({ w: v })} />
           <Slider label="Height" value={rect.h} min={0.05} max={1} step={0.005} display={pct(rect.h)} onChange={(v) => setRect({ h: v })} />
         </div>
+        <p className="mt-1.5 font-mono text-[10px] text-slate-500">
+          {Math.round(rect.x * 1920)}, {Math.round(rect.y * 1080)} ·{" "}
+          <span className="text-slate-300">
+            {Math.round(rect.w * 1920)}×{Math.round(rect.h * 1080)} px @1080p
+          </span>
+        </p>
         <div className="mt-2 space-y-2">
           <div className="grid grid-cols-2 gap-1.5">
             <Segmented
@@ -293,11 +307,37 @@ export function AudioPanel({
   audio,
   setAudio,
   getLevels,
+  direct = false,
 }: {
   audio: AudioState;
   setAudio: React.Dispatch<React.SetStateAction<AudioState>>;
   getLevels: () => Levels;
+  /** mixed stereo file: no mic/content split, the programme plays as-is */
+  direct?: boolean;
 }) {
+  if (direct) {
+    return (
+      <div className="space-y-2.5">
+        <Section title="Program">
+          <div className="space-y-1.5">
+            <Meter label="mix" get={() => getLevels().mic} />
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              The YouTube job is cut from your finished Patreon render, so the audio is already
+              mixed — it plays through untouched.
+            </p>
+          </div>
+        </Section>
+        <Section title="Master">
+          <Slider label="Output gain" value={audio.master.gain} min={-20} max={6} step={0.5} display={`${audio.master.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, master: { gain: v } }))} hint="a −1.5 dB safety limiter is always engaged last" />
+        </Section>
+        <Note>
+          <strong className="font-semibold">Mute and card segments silence everything</strong>{" "}
+          here — a mixed file can't be split back into voice and content. Cut segments are dropped
+          from the render entirely.
+        </Note>
+      </div>
+    );
+  }
   const mic = audio.mic;
   const setMic = (patch: Partial<AudioState["mic"]>) =>
     setAudio((a) => ({ ...a, mic: { ...a.mic, ...patch } }));
@@ -407,6 +447,69 @@ export function AudioPanel({
 
       <Section title="Master">
         <Slider label="Output gain" value={audio.master.gain} min={-20} max={6} step={0.5} display={`${audio.master.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, master: { gain: v } }))} hint="a −1.5 dB safety limiter is always engaged last" />
+      </Section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------- video (youtube mode) */
+
+export function VideoPanel({
+  fileName,
+  dims,
+  layout,
+  setLayout,
+}: {
+  fileName: string;
+  dims: { w: number; h: number };
+  layout: LayoutState;
+  setLayout: React.Dispatch<React.SetStateAction<LayoutState>>;
+}) {
+  return (
+    <div className="space-y-2.5">
+      <Section
+        title="Source"
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            {dims.w}×{dims.h}
+          </span>
+        }
+      >
+        <p className="mb-2 truncate text-[11px] text-slate-400">{fileName}</p>
+        <Note>
+          <strong className="font-semibold">Full-frame passthrough.</strong> The Patreon render is
+          already composed, so it goes to the output untouched — this mode only cuts, mutes,
+          fast-forwards and covers parts with a card.
+        </Note>
+      </Section>
+
+      <Section title="Placeholder card">
+        <div className="space-y-1.5">
+          <input
+            value={layout.card.title}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, title: e.target.value } }))}
+            placeholder="Card headline"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <input
+            value={layout.card.sub}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, sub: e.target.value } }))}
+            placeholder="Card sub-line"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={layout.card.accent}
+              onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, accent: e.target.value } }))}
+              className="h-7 w-10 cursor-pointer rounded border border-white/10 bg-black/40"
+            />
+            <span className="font-mono text-[10px] text-slate-500">{layout.card.accent}</span>
+          </div>
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Shown full-frame wherever a CARD segment sits, with the programme audio silenced.
+          </p>
+        </div>
       </Section>
     </div>
   );

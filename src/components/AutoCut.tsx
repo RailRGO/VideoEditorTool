@@ -130,6 +130,7 @@ export default function AutoCut({
   getSrcTime,
   introOutro,
   browserOk,
+  mixed = false,
 }: {
   hasSource: boolean;
   duration: number;
@@ -151,6 +152,8 @@ export default function AutoCut({
   getSrcTime: () => number;
   introOutro: { start: number; end: number }[];
   browserOk: boolean;
+  /** the source is a finished mixed render rather than a raw dual-channel capture */
+  mixed?: boolean;
 }) {
   const density =
     detection && duration > 0 ? (detection.speechSec / duration) * 100 : 0;
@@ -163,9 +166,9 @@ export default function AutoCut({
     <div className="space-y-2.5">
       <Section title="1 · Find your commentary">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          The auto-cut plays your recording once (silently, at high speed) and measures the mic
-          channel, then keeps only the stretches where you are actually talking — plus a little
-          context on each side. Intro and outro are never touched.
+          {mixed
+            ? "The auto-cut plays your Patreon render once (silently, at high speed) and measures the mixed audio, then keeps only the stretches where you are actually talking — plus a little context on each side. Intro and outro are never touched."
+            : "The auto-cut plays your recording once (silently, at high speed) and measures the mic channel, then keeps only the stretches where you are actually talking — plus a little context on each side. Intro and outro are never touched."}
         </p>
         <div className="flex items-center gap-1.5">
           <Segmented
@@ -189,7 +192,7 @@ export default function AutoCut({
               disabled={!hasSource || !browserOk}
               onClick={onScan}
             >
-              Analyse mic track
+              {mixed ? "Analyse audio" : "Analyse mic track"}
             </Btn>
           )}
         </div>
@@ -216,7 +219,7 @@ export default function AutoCut({
 
       {env && detection && (
         <>
-          <Section title="Mic level over time">
+          <Section title={mixed ? "Level over time" : "Mic level over time"}>
             <EnvelopeChart
               env={env}
               detection={detection}
@@ -394,13 +397,15 @@ export default function AutoCut({
 
       {!env && !scanning && hasSource && (
         <Note>
-          Run the analysis first. It only reads the mic channel and takes about{" "}
+          Run the analysis first. It only reads the audio and takes about{" "}
           {fmtTime(duration / scanSpeed)} at {scanSpeed}×.
         </Note>
       )}
       {!hasSource && (
         <Note>
-          Load a recording first — the analysis needs the mic channel to measure.
+          {mixed
+            ? "Load your Patreon render first — the analysis needs its audio to measure."
+            : "Load a recording first — the analysis needs the mic channel to measure."}
         </Note>
       )}
 

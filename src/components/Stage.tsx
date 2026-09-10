@@ -17,6 +17,7 @@ interface Props {
   playing: boolean;
   onTogglePlay: () => void;
   empty: boolean;
+  passthrough?: boolean;
 }
 
 const snapTo = (v: number, targets: number[]) => {
@@ -36,6 +37,7 @@ export default function Stage({
   playing,
   onTogglePlay,
   empty,
+  passthrough = false,
 }: Props) {
   const outer = useRef<HTMLDivElement>(null);
   const boxRef = useRef({ w: 0, h: 0 });
@@ -213,9 +215,11 @@ export default function Stage({
           {sceneMode === "cut"
             ? "REMOVED — NOT RENDERED"
             : sceneMode === "card"
-            ? "CARD — CONTENT HIDDEN"
+            ? "CARD — PROGRAMME HIDDEN"
             : sceneMode === "fast"
             ? "FAST-FORWARD"
+            : passthrough
+            ? "1920 × 1080 · FULL FRAME"
             : "1920 × 1080 · 16:9"}
         </div>
       </div>
