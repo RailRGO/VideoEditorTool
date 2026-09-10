@@ -1,0 +1,326 @@
+"""
+Shared layout model — Python mirror of src/lib/types.ts.
+
+The browser editor (LayoutState) and the Colab pipeline now speak the same
+language: normalised rects (0..1), per-layer styles, background plate, card.
+A layout can be saved to JSON from either side and renders identically
+because colab compose.py implements the same math as render.ts.
+
+No third-party dependencies — stdlib only.
+"""
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Union
+
+Fit = Literal["cover", "contain"]
+Shape = Literal["rect", "rounded", "circle", "pill"]
+
+
+@dataclass
+class LayerStyle:
+    fit: Fit = "contain"
+    zoom: float = 1.0
+    offsetX: float = 0.0
+    offsetY: float = 0.0
+    mirror: bool = False
+    radius: float = 0.0      # corner radius in 1080p pixels (scaled to canvas)
+    shape: Shape = "rounded"
+    border: float = 0.0      # border width in 1080p pixels
+    borderColor: str = "#0b1220"
+    opacity: float = 1.0
+
+
+@dataclass
+class Rect:
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 1.0
+
+    def px(self, W: int, H: int):
+        return (self.x * W, self.y * H, self.w * W, self.h * H)
+
+    def overlap_pct(self, other: "Rect") -> float:
+        """How much of *self* is covered by *other* (0..100)."""
+        x1 = max(self.x, other.x)
+        y1 = max(self.y, other.y)
+        x2 = min(self.x + self.w, other.x + other.w)
+        y2 = min(self.y + self.h, other.y + other.h)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        area = max(1e-9, self.w * self.h)
+        return (x2 - x1) * (y2 - y1) / area * 100.0
+
+
+@dataclass
+class BackgroundStyle:
+    source: Literal["content", "camera", "full"] = "full"
+    blur: float = 50.0       # blur radius in 1080p pixels
+    opacity: float = 0.4
+    scale: float = 1.08
+    dim: float = 0.25        # 0 = full brightness, 0.8 = very dark
+
+
+@dataclass
+class CardStyle:
+    title: str = "Full uncut reaction on Patreon"
+    sub: str = "link in the description"
+    accent: str = "#e879f9"
+
+
+@dataclass
+class LayoutState:
+    cameraSide: Literal["left", "right"] = "left"
+    sourceMode: Literal["split", "single"] = "split"
+    content: Rect = field(default_factory=lambda: Rect(0.35, 0.30, 0.62, 0.655))
+    cam: Rect = field(default_factory=lambda: Rect(0.03, 0.045, 0.30, 0.335))
+    bg: BackgroundStyle = field(default_factory=BackgroundStyle)
+    contentStyle: LayerStyle = field(
+        default_factory=lambda: LayerStyle(fit="contain", shape="rounded", radius=20)
+    )
+    camStyle: LayerStyle = field(
+        default_factory=lambda: LayerStyle(
+            fit="contain", shape="rounded", radius=26, border=3, borderColor="#0ea5e9"
+        )
+    )
+    soloStyle: LayerStyle = field(
+        default_factory=lambda: LayerStyle(fit="contain", shape="rect", zoom=1.05)
+    )
+    muteContentInSolo: bool = True
+    contentHidden: bool = False
+    fastSpeed: float = 4.0
+    fastGainDb: float = -6.0
+    chipmunk: bool = False
+    card: CardStyle = field(default_factory=CardStyle)
+
+    # -- (de)serialisation -------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "LayoutState":
+        base = asdict(default_layout())
+        merged = _deep_merge(base, d or {})
+
+        def _rect(r):
+            return Rect(float(r["x"]), float(r["y"]), float(r["w"]), float(r["h"]))
+
+        def _style(s):
+            return LayerStyle(
+                fit=s.get("fit", "contain"),
+                zoom=float(s.get("zoom", 1.0)),
+                offsetX=float(s.get("offsetX", 0.0)),
+                offsetY=float(s.get("offsetY", 0.0)),
+                mirror=bool(s.get("mirror", False)),
+                radius=float(s.get("radius", 0.0)),
+                shape=s.get("shape", "rounded"),
+                border=float(s.get("border", 0.0)),
+                borderColor=s.get("borderColor", "#0b1220"),
+                opacity=float(s.get("opacity", 1.0)),
+            )
+
+        bg = merged.get("bg", {})
+        card = merged.get("card", {})
+        return cls(
+            cameraSide=merged.get("cameraSide", "left"),
+            sourceMode=merged.get("sourceMode", "split"),
+            content=_rect(merged.get("content", {})),
+            cam=_rect(merged.get("cam", {})),
+            bg=BackgroundStyle(
+                source=bg.get("source", "full"),
+                blur=float(bg.get("blur", 50)),
+                opacity=float(bg.get("opacity", 0.4)),
+                scale=float(bg.get("scale", 1.08)),
+                dim=float(bg.get("dim", 0.25)),
+            ),
+            contentStyle=_style(merged.get("contentStyle", {})),
+            camStyle=_style(merged.get("camStyle", {})),
+            soloStyle=_style(merged.get("soloStyle", {})),
+            muteContentInSolo=bool(merged.get("muteContentInSolo", True)),
+            contentHidden=bool(merged.get("contentHidden", False)),
+            fastSpeed=float(merged.get("fastSpeed", 4.0)),
+            fastGainDb=float(merged.get("fastGainDb", -6.0)),
+            chipmunk=bool(merged.get("chipmunk", False)),
+            card=CardStyle(
+                title=card.get("title", "Full uncut reaction on Patreon"),
+                sub=card.get("sub", "link in the description"),
+                accent=card.get("accent", "#e879f9"),
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, s: Union[str, Path]) -> "LayoutState":
+        p = Path(str(s))
+        text = p.read_text() if p.exists() and len(str(s)) < 512 else str(s)
+        # heuristic: if it looks like a path that exists, read it; else parse inline
+        try:
+            if p.exists():
+                text = p.read_text()
+        except OSError:
+            text = str(s)
+        return cls.from_dict(json.loads(text))
+
+    def save(self, path: Union[str, Path]) -> str:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self.to_json())
+        return str(p)
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def default_layout() -> LayoutState:
+    """Camera top-left (~30%), content bottom-right (~70%), both rounded.
+
+    Matches the browser default exactly — the two rects do NOT overlap.
+    """
+    return LayoutState()
+
+
+# ---------------------------------------------------------------------------
+# Frame presets (mirrors LAYOUT_PRESETS in src/lib/types.ts)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayoutPreset:
+    id: str
+    name: str
+    hint: str
+    content: Rect
+    cam: Rect
+    camShape: Shape
+    hideContent: bool
+
+
+LAYOUT_PRESETS: List[LayoutPreset] = [
+    LayoutPreset("hero-circle", "Hero circle", "big circle face · content blurred behind",
+                 Rect(0.25, 0.25, 0.50, 0.50), Rect(0.28, 0.06, 0.44, 0.78), "circle", True),
+    LayoutPreset("hero-circle-left", "Hero circle L", "big circle left · blurred content",
+                 Rect(0.45, 0.20, 0.50, 0.60), Rect(0.04, 0.10, 0.42, 0.74), "circle", True),
+    LayoutPreset("hero-pill", "Hero pill", "stadium face · blurred content",
+                 Rect(0.20, 0.25, 0.60, 0.50), Rect(0.18, 0.22, 0.64, 0.56), "pill", True),
+    LayoutPreset("hero-rect", "Hero rectangle", "large rounded face · blurred content",
+                 Rect(0.60, 0.25, 0.36, 0.50), Rect(0.12, 0.08, 0.50, 0.84), "rounded", True),
+    LayoutPreset("tl-br", "Cam TL · content BR", "your default look",
+                 Rect(0.35, 0.30, 0.62, 0.655), Rect(0.03, 0.045, 0.30, 0.335), "rounded", False),
+    LayoutPreset("tl-br-tight", "Cam TL · content BR (tight)", "small camera · bigger content",
+                 Rect(0.29, 0.26, 0.685, 0.70), Rect(0.025, 0.04, 0.24, 0.27), "rounded", False),
+    LayoutPreset("bl-tr", "Cam BL · content TR", "mirrored corners",
+                 Rect(0.35, 0.045, 0.62, 0.655), Rect(0.03, 0.62, 0.30, 0.335), "rounded", False),
+    LayoutPreset("overlay-br", "Content full", "camera overlaid TL",
+                 Rect(0.02, 0.06, 0.96, 0.88), Rect(0.03, 0.045, 0.30, 0.335), "rounded", False),
+]
+
+
+def apply_preset(layout: LayoutState, preset_id: str) -> LayoutState:
+    """Return a copy of *layout* with the preset's rects/shape applied."""
+    for p in LAYOUT_PRESETS:
+        if p.id == preset_id:
+            out = deepcopy(layout)
+            out.content = deepcopy(p.content)
+            out.cam = deepcopy(p.cam)
+            out.contentHidden = p.hideContent
+            out.camStyle.shape = p.camShape
+            return out
+    raise KeyError(f"unknown preset {preset_id!r} (have {[p.id for p in LAYOUT_PRESETS]})")
+
+
+# ---------------------------------------------------------------------------
+# Backwards compatibility: old colab preset names -> LayoutState
+# ---------------------------------------------------------------------------
+
+def old_preset_to_layout(name: str) -> LayoutState:
+    """Map the first-generation colab preset names to real layouts.
+
+    The old pipeline overlaid full-resolution halves, which is why the camera
+    came out far too big and covered the content. These mappings use proper
+    normalised rects instead, so preview and render finally agree.
+    """
+    name = (name or "diagonal").lower()
+    L = default_layout()
+    if name == "diagonal":
+        return apply_preset(L, "tl-br")
+    if name == "circle_blur":
+        L = apply_preset(L, "hero-circle")
+        L.bg.blur = 90
+        L.bg.opacity = 0.58
+        return L
+    if name == "rect_blur":
+        L = apply_preset(L, "hero-rect")
+        L.bg.blur = 90
+        L.bg.opacity = 0.55
+        return L
+    if name == "hero_circle":
+        return apply_preset(L, "hero-circle")
+    if name == "hero_plus":
+        # big face + small content card kept visible
+        L = apply_preset(L, "hero-rect")
+        L.cam = Rect(0.04, 0.08, 0.56, 0.84)
+        L.content = Rect(0.63, 0.55, 0.33, 0.37)
+        L.contentHidden = False
+        return L
+    if name == "news":
+        L.cam = Rect(0.70, 0.05, 0.26, 0.29)
+        L.content = Rect(0.05, 0.25, 0.62, 0.70)
+        L.contentHidden = False
+        L.camStyle.shape = "rounded"
+        return L
+    # unknown -> default diagonal look
+    return apply_preset(L, "tl-br")
+
+
+# ---------------------------------------------------------------------------
+# Audio / retouch / cut defaults shared by the GUI and the processor
+# ---------------------------------------------------------------------------
+
+def default_audio() -> Dict[str, Any]:
+    return {
+        "mic_channel": "left",   # which stereo channel is your mic
+        "mic_gain_db": 0.0,
+        "comp_on": True,
+        "comp_threshold": -24.0,
+        "comp_ratio": 4.0,
+        "comp_makeup": 4.0,
+        "limiter_db": -1.2,
+        "content_gain_db": -1.5,
+        "duck_on": True,
+        "duck_threshold": -32.0,
+        "duck_depth": 12.0,      # dB of attenuation while you speak
+    }
+
+
+def default_retouch() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "smooth": 35.0,   # 0..100 skin smoothing
+        "teeth": 40.0,    # 0..100 whitening
+        "nose": 25.0,     # reserved (subtle)
+        "eyes": 35.0,     # 0..100 eye emphasis
+    }
+
+
+def default_cuts() -> Dict[str, Any]:
+    return {
+        "intro_end": 8.0,      # seconds of full-cam intro
+        "outro_start": -12.0,  # <=0 means "duration + value" (last 12 s)
+        "lead_in": 2.0,        # your "let's go" kept before the switch
+        "black": 1.5,          # black content block before content starts
+        "silence_db": -40.0,
+        "min_silence": 2.0,
+        "claims": [],          # [(start, end, action)] action in cut|mute
+    }
