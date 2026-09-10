@@ -102,11 +102,13 @@ await sleep(1200);
 st = await apiState();
 check('preset applied', st.layout.contentHidden === true && st.layout.camStyle.shape === 'circle');
 
-// 4) timeline click seeks (clientX=400 of 800px -> t=3.0)
+// 4) timeline click seeks (clientX=400 of 800px -> halfway through the video)
 const tl = document.getElementById('timeline');
+const D = (await apiState()).info.duration;
 tl.dispatchEvent(new window.MouseEvent('click', { bubbles: true, clientX: 400 }));
 await sleep(300);
-check('timeline click seeks', Math.abs(_ct - 3.0) < 0.01, `t=${_ct}`);
+check('timeline click seeks', Math.abs(_ct - D / 2) < 0.05,
+  `t=${_ct} expected≈${(D / 2).toFixed(2)} (duration ${D})`);
 
 // 5) box drag moves camera (50px of 800px stage -> +0.0625 x)
 const box = document.getElementById('box-cam');

@@ -42,7 +42,12 @@ don't share it publicly.
 
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
-instead reports the tunnel isn't reachable:
+instead reports that no tunnel could be verified, it has *already* tried,
+in order: Cloudflare quick tunnel (QUIC) → Cloudflare (HTTP/2) →
+ssh→localhost.run on port 443 → ssh on port 22 — each verified from the
+outside before it is offered. Colab blocks different egress paths at
+different times, which is exactly why the launcher walks the list. If
+*all* of them fail:
 1. Just re-run the cell — you get a fresh tunnel and edge; re-running
    is safe (the server and your layout/cuts/state are kept).
 2. `Runtime → Restart session`, then run cells 1→3c again.
@@ -50,6 +55,12 @@ instead reports the tunnel isn't reachable:
    `from editor_gui import launch_editor; launch_editor(proc)`.
 4. To fully stop the server + tunnel and free the port:
    `from webapp.server import stop_webapp; stop_webapp()`.
+
+If the log says **cloudflared download failed**, the session's network
+blocked GitHub releases — the error tells you the exact `!curl` command
+to download it manually; then re-run the cell (a previously downloaded,
+working binary is re-used and never re-downloaded, and broken/partial
+binaries are detected and re-fetched automatically).
 
 If you previously hit `OSError: [Errno 98] Address already in use` from
 re-running the cell, that can't happen anymore — the second run reuses
