@@ -1,0 +1,9 @@
+# Reaction Studio — hosted editor UI (free tier is enough: it's a static page).
+# The browser tab does preview + editing only; rendering happens on the Colab
+# backend you connect from inside the app (engine: Colab).
+services:
+  - type: web
+    name: reaction-studio
+    env: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist

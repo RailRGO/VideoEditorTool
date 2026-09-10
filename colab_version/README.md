@@ -40,6 +40,31 @@ Notes: keep the cell running while you edit; the link dies with the
 session (re-run for a fresh one); anyone with the link can view, so
 don't share it publicly.
 
+## The hosted editor UI (recommended for weak PCs)
+
+The same server also powers the full React editor hosted as a static
+site (root `render.yaml` — deploy once on Render, free tier is fine).
+Open your site, switch the engine to **Colab**, and paste the tunnel
+URL from notebook cell 3d:
+
+- The browser previews a light proxy stream and sends your timeline,
+  layout, audio, retouch and cloak settings to the notebook as one
+  project file (`POST /api/job/render`).
+- Patreon renders go through the WYSIWYG compositor; YouTube renders
+  are a single-pass ffmpeg cut with the anti-fingerprint cloak.
+- The finished MP4 downloads through the tunnel and also stays in the
+  notebook's output folder. Closing the tab mid-render is safe —
+  reconnect and the download is waiting in the Render tab.
+- Switch sources without touching the notebook: the header lists every
+  video in the source folder (`GET /api/sources`, `POST /api/source`).
+- No copy-paste: set `HOSTED_EDITOR` in cell 3d once and it prints a one-click
+  link that opens the site already connected (`?backend=`).
+- Speech-to-text runs here too: the Polish tab's Transcribe button sends the
+  intro/outro spans (`POST /api/job/transcript`, faster-whisper, word timings)
+  and filler removal just works — no external transcription step.
+- The Render tab's Save/Load project keeps the timeline + all settings as one
+  tiny `.reaction.json`, so the edit survives closed tabs and dead sessions.
+
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
 instead reports that no tunnel could be verified, it has *already* tried,

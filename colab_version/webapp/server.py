@@ -102,10 +102,25 @@ def ensure_proxy(proc, width: int = 960,
         return out
     if status is not None:
         status.update(ready=False, progress=0.0, path=str(out))
-    # 32:9 source -> keep aspect (960x270); stereo AAC so scrubbing has sound
+    # 32:9 source -> keep aspect (960x270); stereo AAC so scrubbing has sound.
+    # Two-track OBS files would otherwise preview with the mic bus only, so
+    # every audio stream is folded into the proxy mix (the render still uses
+    # the real buses from the full-resolution source).
+    try:
+        n_audio = len(proc._probe_audio(str(proc.input)))
+    except Exception:
+        n_audio = 1
+    if n_audio > 1:
+        audio_args = ["-filter_complex",
+                      f"[0:v]scale={width}:-2[v];"
+                      f"[0:a]amix=inputs={n_audio}:normalize=0,"
+                      "alimiter=limit=-1dB:attack=5:release=50[a]",
+                      "-map", "[v]", "-map", "[a]"]
+    else:
+        audio_args = ["-vf", f"scale={width}:-2", "-ac", "2"]
     cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
-           "-vf", f"scale={width}:-2", "-c:v", "libx264", "-preset", "veryfast",
-           "-crf", "30", "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+           *audio_args, "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "30", "-c:a", "aac", "-b:a", "96k",
            "-movflags", "+faststart", str(out)]
     # run with progress parsed from the `time=` field
     dur = max(1.0, float(proc.duration or 1.0))
@@ -361,15 +376,16 @@ def _verify_public(url: str, timeout: float = 60.0) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 class App:
-    def __init__(self, proc):
+    def __init__(self, proc, proxy_width: int = 960):
         self.proc = proc
         self.drops: List[Tuple[float, float]] = []
         self.claims: List[Tuple[float, float, str]] = []
         self.proxy_status: Dict[str, Any] = {"ready": False, "progress": 0.0,
                                              "path": None}
-        self.job: Dict[str, Any] = {"state": "idle", "progress": 0.0,
-                                    "files": {}, "error": None, "log": []}
+        self.job: Dict[str, Any] = self._fresh_job("render")
         self._job_lock = threading.Lock()
+        self.proxy_width = proxy_width
+        self.proxy_gen = 0  # orphaned workers (after a source switch) stand down
 
     # -- state ---------------------------------------------------------------
     def segments(self) -> List[Dict[str, Any]]:
@@ -397,17 +413,222 @@ class App:
             "job": self.job_state(),
         }
 
+    @staticmethod
+    def _fresh_job(kind: str, state: str = "idle") -> Dict[str, Any]:
+        return {"kind": kind, "state": state, "progress": 0.0, "files": {},
+                "result": None, "error": None, "log": []}
+
     def job_state(self) -> Dict[str, Any]:
         with self._job_lock:
             return dict(self.job)
+
+    # -- speech-to-text (drives the Polish tab's Transcribe button) -----------
+    def start_transcript(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe speech spans (intro/outro) with word timings.
+
+        Shares the single job slot with renders: returns the running job when
+        busy instead of queueing, so the UI never stacks heavy work.
+        """
+        with self._job_lock:
+            if self.job["state"] == "running":
+                raise ValueError("the server is busy with another job — "
+                                 "wait for it first")
+            self.job = self._fresh_job("transcript", "running")
+
+        def log(msg):
+            with self._job_lock:
+                self.job["log"].append(msg)
+
+        def frac(d, t):
+            with self._job_lock:
+                self.job["progress"] = max(0.0, min(1.0, d / max(1e-6, t)))
+
+        spans = body.get("spans") or []
+        lang = str(body.get("lang", "auto") or "auto")
+
+        def run():
+            try:
+                if not spans:
+                    raise ValueError("no speech spans given")
+                model = str(body.get("model", "small") or "small")
+                res = self.proc.transcribe_spans(spans, lang=lang, model=model,
+                                                 progress_cb=frac)
+                with self._job_lock:
+                    self.job.update(state="done", progress=1.0, result=res)
+                log(f"{len(res['words'])} words ({res['lang']}).")
+            except Exception as e:  # noqa: BLE001 — surfaced to the UI
+                with self._job_lock:
+                    self.job.update(state="error", error=str(e)[:500])
+                log(f"ERROR: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+        return self.job_state()
+
+    # -- project render (driven by the hosted React UI) -------------------------
+    def start_render_project(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Render a full project posted by the new UI.
+
+        body: {target, name, segments, layout, audio, retouch, audioCloak,
+        videoCloak, crf, webm, fps, height}. Patreon goes through the
+        compositor; YouTube through the single-pass ffmpeg passthrough.
+        """
+        with self._job_lock:
+            if self.job["state"] == "running":
+                return dict(self.job)
+            self.job = self._fresh_job("render", "running")
+
+        def log(msg):
+            with self._job_lock:
+                self.job["log"].append(msg)
+
+        def frac(p):
+            with self._job_lock:
+                self.job["progress"] = max(0.0, min(1.0, p))
+
+        target = str(body.get("target", "patreon"))
+        name = str(body.get("name", "youtube_final" if target == "youtube" else "render"))
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "render"
+        raw_segs = body.get("segments") or []
+        segments = [
+            {"type": str(s.get("type", "body")),
+             "start": float(s.get("start", 0)), "end": float(s.get("end", 0))}
+            for s in raw_segs
+            if float(s.get("end", 0)) > float(s.get("start", 0))
+        ]
+        layout_d = body.get("layout") or {}
+        fast = float(layout_d.get("fastSpeed", 4.0) or 4.0)
+
+        def run():
+            try:
+                from video_processor import browser_audio_to_cfg  # noqa
+                if not segments:
+                    raise ValueError("empty timeline — nothing to render")
+                if target == "youtube":
+                    log(f"YouTube passthrough: {len(segments)} segments, "
+                        f"{C.render_duration(segments, fast):.0f}s")
+                    card = layout_d.get("card") or body.get("card") or {}
+                    _, master = browser_audio_to_cfg(body.get("audio") or {})
+                    outs = self.proc.render_passthrough(
+                        segments=segments,
+                        audio_cloak=body.get("audioCloak"),
+                        video_cloak=body.get("videoCloak"),
+                        card=card, fast_speed=fast, master_gain_db=master,
+                        crf=int(body.get("crf", 18)),
+                        fps=body.get("fps") or None,
+                        height=int(body.get("height", 0) or 0),
+                        name=name, webm=bool(body.get("webm", False)),
+                        progress_cb=lambda d, t: frac(0.05 + 0.9 * d / max(1, t)),
+                    )
+                else:
+                    self.proc.layout = L.LayoutState.from_dict(layout_d)
+                    flat, master = browser_audio_to_cfg(body.get("audio") or {})
+                    self.proc.audio_cfg.update(flat)
+                    if isinstance(body.get("retouch"), dict):
+                        self.proc.retouch_cfg.update(body["retouch"])
+                    log(f"Patreon composite: {len(segments)} segments, "
+                        f"{C.render_duration(segments, fast):.0f}s")
+                    video_nc = self.proc.work / f"{name}_video.mp4"
+                    h = int(body.get("height", 0) or 0)
+                    self.proc.compose_reaction(
+                        output_path=str(video_nc), layout=self.proc.layout,
+                        segments=segments, crf=int(body.get("crf", 18)),
+                        fps=body.get("fps") or None,
+                        width=1920 if not h or h >= 1080 else 1280,
+                        height=h or 1080)
+                    frac(0.85)
+                    log("video done — mixing audio …")
+                    audio = self.proc.mix_audio(
+                        output_path=str(self.proc.work / f"{name}_mix.wav"),
+                        segments=segments, fast_speed=fast,
+                        mute_solo=bool(self.proc.layout.muteContentInSolo),
+                        master_gain_db=master)
+                    outs = self.proc.mux(video_nc, audio,
+                                         self.proc.out / f"{name}.mp4",
+                                         webm=bool(body.get("webm", False)))
+                with self._job_lock:
+                    self.job.update(state="done", progress=1.0,
+                                    files={k: Path(v).name for k, v in outs.items()})
+                log("done.")
+            except Exception as e:  # noqa: BLE001 — surfaced to the UI
+                with self._job_lock:
+                    self.job.update(state="error", error=str(e))
+                log(f"ERROR: {e}")
+
+        orig_render = C.render_video
+
+        def patched(*a, **kw):
+            kw["progress_cb"] = lambda d, t: frac(0.05 + 0.8 * d / max(1, t))
+            return orig_render(*a, **kw)
+
+        C.render_video = patched  # type: ignore
+        try:
+            threading.Thread(target=self._run_guarded(run, orig_render),
+                             daemon=True).start()
+        except Exception:
+            C.render_video = orig_render  # type: ignore
+            raise
+        return self.job_state()
+
+    def set_input(self, name: str) -> Dict[str, Any]:
+        """Switch the source file (basename inside the input folder)."""
+        from video_processor import ReactionVideoProcessor  # noqa
+        clean = Path(str(name or "")).name
+        if not clean or clean.startswith("."):
+            raise ValueError("bad file name")
+        base = Path(self.proc.input).parent
+        cand = (base / clean).resolve()
+        if base.resolve() not in cand.parents and cand.parent != base.resolve():
+            raise ValueError("file is outside the media folder")
+        if not cand.exists() or not cand.is_file():
+            raise ValueError(f"file not found: {clean}")
+        if cand.suffix.lower() not in (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"):
+            raise ValueError("not a video file")
+        with self._job_lock:
+            if self.job["state"] == "running":
+                raise ValueError("a render is running — wait for it first")
+        old = self.proc
+        proc = ReactionVideoProcessor(str(cand), work_dir=str(old.work),
+                                      output_dir=str(old.out))
+        proc.layout = old.layout
+        proc.layout.sourceMode = "split" if proc.is_side_by_side else "single"
+        proc.audio_cfg = old.audio_cfg
+        proc.retouch_cfg = old.retouch_cfg
+        proc.cuts_cfg = old.cuts_cfg
+        C.invalidate_cache(str(old.input))
+        self.proc = proc
+        self.drops = []
+        self.claims = []
+        with self._job_lock:
+            self.job = self._fresh_job("render")
+        self.proxy_status.update(ready=False, progress=0.0, path=None)
+        self.proxy_gen += 1
+        _start_proxy_worker(self, self.proxy_width)
+        return self.state()
+
+    def list_sources(self) -> List[Dict[str, Any]]:
+        base = Path(self.proc.input).parent
+        out = []
+        try:
+            names = sorted(p.name for p in base.iterdir()
+                           if p.is_file() and p.suffix.lower() in
+                           (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"))
+        except OSError:
+            names = []
+        for nm in names[:200]:
+            try:
+                st = (base / nm).stat()
+                out.append({"name": nm, "size": st.st_size, "mtime": st.st_mtime,
+                            "current": nm == Path(self.proc.input).name})
+            except OSError:
+                continue
+        return out
 
     # -- background full render ----------------------------------------------
     def start_render(self, name: str, crf: int, webm: bool) -> Dict[str, Any]:
         with self._job_lock:
             if self.job["state"] == "running":
                 return dict(self.job)
-            self.job = {"state": "running", "progress": 0.0, "files": {},
-                        "error": None, "log": []}
+            self.job = self._fresh_job("render", "running")
 
         def log(msg):
             with self._job_lock:
@@ -481,7 +702,8 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Range, ngrok-skip-browser-warning")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -586,6 +808,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file(p, "video/mp4")
             elif path == "/api/job":
                 self._json(app.job_state())
+            elif path == "/api/sources":
+                self._json({"sources": app.list_sources(),
+                            "current": Path(proc.input).name})
             elif path == "/api/content_start":
                 t = proc.detect_content_start()
                 self._json({"t": t})
@@ -689,6 +914,18 @@ class Handler(BaseHTTPRequestHandler):
                                        int(body.get("crf", 18)),
                                        bool(body.get("webm", True)))
                 self._json(job)
+            elif path == "/api/job/render":
+                self._json(app.start_render_project(body))
+            elif path == "/api/job/transcript":
+                try:
+                    self._json(app.start_transcript(body))
+                except ValueError as e:
+                    self._json({"error": str(e)}, 409)
+            elif path == "/api/source":
+                try:
+                    self._json(app.set_input(str(body.get("name", ""))))
+                except ValueError as e:
+                    self._json({"error": str(e)}, 400)
             elif path == "/api/save_layout":
                 # always a basename inside the output dir (no traversal)
                 name = Path(str(body.get("path") or "layout.json")).name
@@ -715,20 +952,31 @@ class Handler(BaseHTTPRequestHandler):
 # launch
 # ---------------------------------------------------------------------------
 
-def serve_forever(proc, port: int = 8000,
-                 proxy_width: int = 960) -> Tuple[ThreadingHTTPServer, App]:
-    app = App(proc)
+def _start_proxy_worker(app: App, proxy_width: int) -> None:
+    gen = app.proxy_gen
+    proc = app.proc
 
     def _proxy_worker():
         try:
             print("Preparing streamable proxy (one-time, cached on Drive)…")
             ensure_proxy(proc, proxy_width, app.proxy_status)
+            if gen != app.proxy_gen:
+                print("Proxy worker orphaned by a source switch — standing down.")
+                return
             print(f"Proxy ready: {app.proxy_status['path']}")
         except Exception as e:
+            if gen != app.proxy_gen:
+                return
             app.proxy_status.update(ready=False, error=str(e)[:300])
             print(f"Proxy failed: {e} — exact stills still work.")
 
     threading.Thread(target=_proxy_worker, daemon=True).start()
+
+
+def serve_forever(proc, port: int = 8000,
+                 proxy_width: int = 960) -> Tuple[ThreadingHTTPServer, App]:
+    app = App(proc, proxy_width)
+    _start_proxy_worker(app, proxy_width)
 
     # per-server Handler subclass so two servers (two videos/ports) never
     # share one App through the class attribute

@@ -1,4 +1,4 @@
-import type { LayerStyle, LayoutState, Rect, Segment, Shape } from "./types";
+import type { LayerStyle, LayoutState, Rect, Segment, Shape, VideoCloak } from "./types";
 import type { FacePose } from "./retouch";
 
 export type SrcRect = { x: number; y: number; w: number; h: number };
@@ -29,6 +29,10 @@ export interface Scene {
   layers: SceneLayer[];
   mode: "solo" | "body" | "cut" | "fast" | "card" | "lead";
   speed: number;
+  /** overrides layout.content for the placeholder card (full-frame card in passthrough) */
+  cardRect?: Rect;
+  /** anti-fingerprint frame treatment (YouTube passthrough only) */
+  cloak?: VideoCloak | null;
 }
 
 export function sourceHalves(
@@ -126,6 +130,40 @@ export function buildScene(
     base.speed = layout.fastSpeed;
   }
   return base;
+}
+
+/**
+ * YouTube mode: the source is already the finished 16:9 Patreon render, so it
+ * passes through full-frame. Only cuts / mutes / speed / cards are applied —
+ * there is no camera/content compositing to do.
+ */
+export function buildPassthroughScene(
+  segs: Segment[],
+  srcTime: number,
+  full: SrcRect,
+  speed: number,
+  cloak?: VideoCloak | null
+): Scene {
+  const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
+  const type = active?.type ?? "body";
+  if (type === "cut") return { bg: null, layers: [], mode: "cut", speed: 1 };
+  if (type === "card") {
+    return {
+      bg: full,
+      layers: [],
+      mode: "card",
+      speed: 1,
+      cardRect: { x: 0.06, y: 0.16, w: 0.88, h: 0.68 },
+    };
+  }
+  const layer: SceneLayer = {
+    src: full,
+    rect: { x: 0, y: 0, w: 1, h: 1 },
+    style: FLAT,
+  };
+  const c = cloak && cloak.on ? cloak : null;
+  if (type === "fast") return { bg: null, layers: [layer], mode: "fast", speed, cloak: c };
+  return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c };
 }
 
 /** Clip/stroke path for any of the supported layer shapes. */
@@ -243,10 +281,11 @@ function drawCard(
   ctx: CanvasRenderingContext2D,
   layout: LayoutState,
   W: number,
-  H: number
+  H: number,
+  rect?: Rect
 ) {
   const k = H / 1080;
-  const r = layout.content;
+  const r = rect ?? layout.content;
   const x = r.x * W;
   const y = r.y * H;
   const w = r.w * W;
@@ -333,6 +372,113 @@ function drawSpeedBadge(
   ctx.restore();
 }
 
+/** Reusable monochrome noise tile for the animated grain overlay. */
+let noiseTile: HTMLCanvasElement | null = null;
+function getNoiseTile(): HTMLCanvasElement {
+  if (noiseTile) return noiseTile;
+  const cv = document.createElement("canvas");
+  cv.width = 160;
+  cv.height = 160;
+  const c = cv.getContext("2d");
+  if (c) {
+    const img = c.createImageData(160, 160);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = (Math.random() * 255) | 0;
+      img.data[i] = v;
+      img.data[i + 1] = v;
+      img.data[i + 2] = v;
+      img.data[i + 3] = 255;
+    }
+    c.putImageData(img, 0, 0);
+  }
+  noiseTile = cv;
+  return cv;
+}
+
+/**
+ * Full-frame draw with the anti-fingerprint treatment: slight punch-in,
+ * colour shift, animated grain, vignette, cover bars and an optional frame.
+ */
+function drawCloakedFrame(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  src: SrcRect,
+  W: number,
+  H: number,
+  c: VideoCloak
+) {
+  const k = H / 1080;
+  // cover the (zoomed) frame from the source rect
+  const zw = W * c.zoom;
+  const zh = H * c.zoom;
+  const sAsp = src.w / Math.max(1, src.h);
+  const dAsp = zw / Math.max(1, zh);
+  let sx = src.x;
+  let sy = src.y;
+  let sw = src.w;
+  let sh = src.h;
+  if (sAsp > dAsp) {
+    sw = src.h * dAsp;
+    sx = src.x + (src.w - sw) / 2;
+  } else {
+    sh = src.w / dAsp;
+    sy = src.y + (src.h - sh) / 2;
+  }
+  ctx.save();
+  const f: string[] = [];
+  if (Math.abs(c.saturate - 100) > 0.5) f.push(`saturate(${(c.saturate / 100).toFixed(3)})`);
+  if (Math.abs(c.contrast - 100) > 0.5) f.push(`contrast(${(c.contrast / 100).toFixed(3)})`);
+  if (Math.abs(c.brightness - 100) > 0.5) f.push(`brightness(${(c.brightness / 100).toFixed(3)})`);
+  if (Math.abs(c.hue) > 0.5) f.push(`hue-rotate(${c.hue.toFixed(1)}deg)`);
+  ctx.filter = f.length ? f.join(" ") : "none";
+  try {
+    ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);
+  } catch {
+    /* frame not ready yet */
+  }
+  ctx.filter = "none";
+
+  if (c.grain > 0.5) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+    const tile = getNoiseTile();
+    const pat = ctx.createPattern(tile, "repeat");
+    if (pat) {
+      ctx.fillStyle = pat;
+      // random offset every frame so the grain crawls instead of sitting still
+      ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+      ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+    }
+    ctx.restore();
+  }
+
+  if (c.vignette > 0.5) {
+    const g = ctx.createRadialGradient(
+      W / 2, H / 2, Math.min(W, H) * 0.36,
+      W / 2, H / 2, Math.max(W, H) * 0.72
+    );
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, `rgba(0,0,0,${((c.vignette / 100) * 0.55).toFixed(3)})`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (c.bars > 0.05) {
+    const bh = (H * c.bars) / 100;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, Math.ceil(bh));
+    ctx.fillRect(0, H - Math.ceil(bh), W, Math.ceil(bh));
+  }
+
+  if (c.border > 0.5) {
+    ctx.lineWidth = Math.max(1, c.border * k);
+    ctx.strokeStyle = c.borderColor;
+    const o = ctx.lineWidth / 2;
+    ctx.strokeRect(o, o, W - ctx.lineWidth, H - ctx.lineWidth);
+  }
+  ctx.restore();
+}
+
 /**
  * Blurred / dimmed full-frame backdrop. The video is first down-scaled into a
  * scratch canvas — blurring a small bitmap and scaling it back up is an order of
@@ -384,6 +530,11 @@ export function renderScene(
   // radius / border are authored in 1080p pixels, scale them for this canvas
   const k = H / 1080;
   for (const l of scene.layers) {
+    // cloaked full-frame layer (YouTube passthrough) takes its own path
+    if (scene.cloak && !l.isCam) {
+      drawCloakedFrame(ctx, video, l.src, W, H, scene.cloak);
+      continue;
+    }
     const style: LayerStyle =
       l.style.radius || l.style.border
         ? { ...l.style, radius: l.style.radius * k, border: l.style.border * k }
@@ -418,7 +569,7 @@ export function renderScene(
     }
   }
 
-  if (scene.mode === "card") drawCard(ctx, layout, W, H);
+  if (scene.mode === "card") drawCard(ctx, layout, W, H, scene.cardRect);
   if (scene.mode === "lead") drawLeadBlock(ctx, layout, W, H);
   if (scene.mode === "fast") drawSpeedBadge(ctx, scene.speed, W, H);
   ctx.restore();

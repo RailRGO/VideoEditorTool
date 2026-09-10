@@ -4,10 +4,18 @@ import Timeline from "./components/Timeline";
 import AutoCut from "./components/AutoCut";
 import PolishPanel from "./components/Polish";
 import RetouchPanel from "./components/RetouchPanel";
-import { AudioPanel, ClaimsPanel, ExportPanel, LayoutPanel } from "./components/Panels";
+import CloakPanel from "./components/Cloak";
+import { AudioPanel, ClaimsPanel, ExportPanel, LayoutPanel, VideoPanel } from "./components/Panels";
 import { Btn, LiveText } from "./components/ui";
 import { AudioEngine } from "./lib/audio";
 import { FaceTracker, type TrackStatus } from "./lib/face";
+import {
+  RemoteClient,
+  sleep,
+  type RemoteJob,
+  type RemoteSource,
+  type RemoteState,
+} from "./lib/remote";
 import {
   applyRetouch,
   poseFromBox,
@@ -16,7 +24,13 @@ import {
 } from "./lib/retouch";
 import type { RetouchHook, SrcRect } from "./lib/render";
 import { buildEnvelope, detectSpeech, type Detection, type Envelope } from "./lib/analyze";
-import { buildScene, pickRecorderMime, renderScene, sourceHalves } from "./lib/render";
+import {
+  buildPassthroughScene,
+  buildScene,
+  pickRecorderMime,
+  renderScene,
+  sourceHalves,
+} from "./lib/render";
 import {
   analyseDisruptions,
   findContentStart,
@@ -57,14 +71,17 @@ import {
 } from "./lib/timeline";
 import {
   defaultAudio,
+  defaultAudioCloak,
   defaultCut,
   defaultDisrupt,
   defaultLead,
   defaultLayout,
   defaultPolish,
   defaultRetouch,
+  defaultVideoCloak,
   SEGMENT_META,
   TARGET_META,
+  type AudioCloak,
   type AudioState,
   type Claim,
   type CutOptions,
@@ -73,9 +90,11 @@ import {
   type LeadConfig,
   type PolishRules,
   type Rect,
+  type Retouch,
   type Segment,
   type SegmentType,
   type Target,
+  type VideoCloak,
 } from "./lib/types";
 import { cn } from "./utils/cn";
 
@@ -96,13 +115,32 @@ function defaultSegments(d: number): Segment[] {
   );
 }
 
-const TABS: { id: string; label: string }[] = [
-  { id: "layout", label: "Layout" },
-  { id: "autocut", label: "Auto-cut" },
-  { id: "audio", label: "Audio" },
-  { id: "claims", label: "Claims" },
-  { id: "export", label: "Render" },
-];
+/** CapCut-style side rails. Left = workflow tools, right = inspector. */
+const LEFT_TABS: Record<Target, { id: string; label: string }[]> = {
+  patreon: [
+    { id: "polish", label: "Polish" },
+    { id: "claims", label: "Claims" },
+  ],
+  youtube: [
+    { id: "autocut", label: "Auto-cut" },
+    { id: "claims", label: "Claims" },
+  ],
+};
+
+const RIGHT_TABS: Record<Target, { id: string; label: string }[]> = {
+  patreon: [
+    { id: "layout", label: "Layout" },
+    { id: "retouch", label: "Retouch" },
+    { id: "audio", label: "Audio" },
+    { id: "export", label: "Render" },
+  ],
+  youtube: [
+    { id: "video", label: "Video" },
+    { id: "cloak", label: "Cloak" },
+    { id: "audio", label: "Audio" },
+    { id: "export", label: "Render" },
+  ],
+};
 
 export default function App() {
   /* ---------------------------------------------------------------- refs */
@@ -118,6 +156,8 @@ export default function App() {
   const timeRef = useRef({ src: 0, out: 0 });
   const lastProgress = useRef(0);
   const lastFastDb = useRef(0);
+  const trackStatusRef = useRef<TrackStatus>("idle");
+  const trackFpsRef = useRef(0);
 
   const engine = () => (engineRef.current ??= new AudioEngine());
 
@@ -135,7 +175,8 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedClaim, setSelectedClaim] = useState<string | null>(null);
-  const [tab, setTab] = useState("polish");
+  const [leftTab, setLeftTab] = useState("polish");
+  const [rightTab, setRightTab] = useState("layout");
   const [editLayer, setEditLayer] = useState<"content" | "cam">("cam");
   const [showGuides, setShowGuides] = useState(false);
   const [zoom, setZoom] = useState(1);
@@ -154,6 +195,23 @@ export default function App() {
     return !!Ctor && typeof Ctor.prototype.createScriptProcessor === "function";
   });
 
+  /* remote engine (Colab backend) */
+  const [engineMode, setEngineMode] = useState<"local" | "remote">("local");
+  const [remoteDraft, setRemoteDraft] = useState(
+    () => localStorage.getItem("remoteUrl") ?? ""
+  );
+  const [remote, setRemote] = useState<RemoteClient | null>(null);
+  const [remoteInfo, setRemoteInfo] = useState<RemoteState | null>(null);
+  const [remoteError, setRemoteError] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [sources, setSources] = useState<RemoteSource[]>([]);
+  const [proxyProgress, setProxyProgress] = useState(0);
+  const [remoteJob, setRemoteJob] = useState<RemoteJob | null>(null);
+  const connectToken = useRef(0);
+  const remoteRef = useRef<RemoteClient | null>(null);
+  remoteRef.current = remote;
+  const isRemote = engineMode === "remote";
+
   /* auto-cut */
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState(0);
@@ -164,10 +222,17 @@ export default function App() {
 
   /* polish */
   const [target, setTarget] = useState<Target>("patreon");
+  const [audioCloak, setAudioCloak] = useState<AudioCloak>(defaultAudioCloak);
+  const [videoCloak, setVideoCloak] = useState<VideoCloak>(defaultVideoCloak);
   const [scanChannel, setScanChannel] = useState<"mic" | "content">("mic");
   const [micEnv, setMicEnv] = useState<Envelope | null>(null);
   const [contentEnv, setContentEnv] = useState<Envelope | null>(null);
   const [transcript, setTranscript] = useState<Transcript | null>(null);
+  const [trBusy, setTrBusy] = useState(false);
+  const [trProgress, setTrProgress] = useState(0);
+  const [trLang, setTrLang] = useState("auto");
+  const [trError, setTrError] = useState("");
+  const trToken = useRef(0);
   const [polish, setPolish] = useState<PolishRules>(defaultPolish);
   const [disruptRules, setDisruptRules] = useState<DisruptRules>(defaultDisrupt);
   const [leadCfg, setLeadCfg] = useState<LeadConfig>(defaultLead);
@@ -175,6 +240,12 @@ export default function App() {
   const disruptRef = useRef(disruptRules);
   polishRef.current = polish;
   disruptRef.current = disruptRules;
+  const targetRef = useRef<Target>("patreon");
+  targetRef.current = target;
+  const audioCloakRef = useRef(audioCloak);
+  audioCloakRef.current = audioCloak;
+  const videoCloakRef = useRef(videoCloak);
+  videoCloakRef.current = videoCloak;
 
   /* retouch */
   const [retouch, setRetouch] = useState<Retouch>(defaultRetouch);
@@ -307,6 +378,11 @@ export default function App() {
     };
   }, [segments, duration]);
 
+  const isYT = target === "youtube";
+  const aspect = dims.w > 0 && dims.h > 0 ? dims.w / dims.h : 0;
+  const mismatchWide = isYT && aspect > 1.9;
+  const mismatchNarrow = !isYT && aspect > 0 && aspect <= 1.9;
+
   /* ------------------------------------------------------ polish analysis */
   const reactionStart = useMemo(
     () => (contentEnv ? findContentStart(contentEnv, 2) : null),
@@ -391,6 +467,10 @@ export default function App() {
   }, [audio.mic.channel]);
 
   useEffect(() => {
+    engine().updateCloak(audioCloak);
+  }, [audioCloak]);
+
+  useEffect(() => {
     const v = videoRef.current;
     if (v && !scanningRef.current) v.playbackRate = rate;
   }, [rate]);
@@ -435,6 +515,33 @@ export default function App() {
     recorderRef.current = null;
   }, []);
 
+  /** Patreon = raw 32:9 capture with split audio; YouTube = finished 16:9 mixed render. */
+  const switchTarget = useCallback((t: Target) => {
+    if (targetRef.current === t) return;
+    targetRef.current = t;
+    setTarget(t);
+    setLayout((l) => ({ ...l, sourceMode: t === "patreon" ? "split" : "single" }));
+    engine().setDirect(t === "youtube" || !!remoteRef.current);
+    engine().update(audioRef.current, 0);
+    lastFastDb.current = 0;
+    setLeftTab(t === "patreon" ? "polish" : "autocut");
+    setRightTab(t === "patreon" ? "layout" : "video");
+  }, []);
+
+  const loadFaceModel = useCallback(() => {
+    const tr = (trackerRef.current ??= new FaceTracker());
+    setTrackStatus("loading");
+    setTrackError("");
+    void tr.load().then((ok) => {
+      setTrackStatus(tr.status);
+      setTrackError(tr.error);
+      if (ok) {
+        const v = videoRef.current;
+        if (v && v.readyState >= 2) void tr.warm(v);
+      }
+    });
+  }, []);
+
   /* ------------------------------------------------------- animation loop */
   useEffect(() => {
     let raf = 0;
@@ -448,6 +555,7 @@ export default function App() {
 
       const segs = segsRef.current;
       const lay = layoutRef.current;
+      const yt = targetRef.current === "youtube";
       const act = activeSegment(segs, v.currentTime);
 
       // removed segments are never decoded, shown or exported
@@ -470,8 +578,9 @@ export default function App() {
 
       const halves = sourceHalves(v.videoWidth, v.videoHeight, lay.sourceMode, lay.cameraSide);
 
-      // face tracking runs on the raw video, independent of the layout
-      if (retouchRef.current.enabled && !retouchRef.current.manual) {
+      // face tracking runs on the raw video, independent of the layout.
+      // Patreon mode only — the YouTube source has no separate camera layer.
+      if (!yt && retouchRef.current.enabled && !retouchRef.current.manual) {
         const tr = (trackerRef.current ??= new FaceTracker());
         const camSrc =
           lay.sourceMode === "single"
@@ -493,8 +602,16 @@ export default function App() {
         faceLmRef.current = null;
       }
 
-      const scene = buildScene(lay, segs, v.currentTime, halves);
-      const hook = retouchRef.current.enabled ? retouchHook : null;
+      const scene = yt
+        ? buildPassthroughScene(
+            segs,
+            v.currentTime,
+            halves.full,
+            lay.fastSpeed,
+            videoCloakRef.current
+          )
+        : buildScene(lay, segs, v.currentTime, halves);
+      const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
       if (hook) hook.debugPose = poseRef.current;
 
       const ctx = cv.getContext("2d");
@@ -523,7 +640,7 @@ export default function App() {
       if (exportingRef.current) {
         const ec = exportRef.current;
         const ectx = ec?.getContext("2d");
-        if (ec && ectx) renderScene(ectx, v, scene, lay, ec.width, ec.height, scratch, 0.4);
+        if (ec && ectx) renderScene(ectx, v, scene, lay, ec.width, ec.height, scratch, 0.4, hook);
         const total = outDuration(segs, lay.fastSpeed);
         const p = total > 0 ? clamp(timeRef.current.out / total, 0, 1) : 0;
         if (Math.abs(p - lastProgress.current) > 0.002) {
@@ -539,10 +656,13 @@ export default function App() {
         if (v.ended || v.currentTime >= durRef.current - 0.05) stopScanRef.current();
       }
 
+      // in YouTube mode the file is already mixed, so mute / card silence everything;
+      // intro & outro keep playing (the voice is baked into the mix)
       const contentMuted = act
-        ? act.type === "mute" ||
+        ? act.type === "cut" ||
+          act.type === "mute" ||
           act.type === "card" ||
-          ((act.type === "intro" || act.type === "outro") && lay.muteContentInSolo)
+          (!yt && (act.type === "intro" || act.type === "outro") && lay.muteContentInSolo)
         : false;
       engine().tick(audioRef.current, contentMuted);
       engine().read();
@@ -570,7 +690,7 @@ export default function App() {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [finish]);
+  }, [finish, retouchHook]);
 
   /* ------------------------------------------------------------ keyboard */
   const doSplit = useCallback(() => {
@@ -617,9 +737,9 @@ export default function App() {
     objectUrl.current = url;
     setFileName(f.name);
     setResult(null);
-    setClaims([]);
     setEnv(null);
     setDetection(null);
+    setTranscript(null);
     setPlaying(false);
     v.src = url;
     v.muted = false;
@@ -635,17 +755,233 @@ export default function App() {
     setDims({ w: v.videoWidth, h: v.videoHeight });
     durRef.current = d;
     const asp = v.videoWidth / Math.max(1, v.videoHeight);
-    setLayout((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
-    setSegments(defaultSegments(d));
+    if (targetRef.current === "patreon") {
+      setLayout((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
+    }
+    // keep a loaded project (clamped to this file), default only when fresh
+    setSegments((s) => (s.length ? normalize(s, d) : defaultSegments(d)));
     setSelectedId(null);
     try {
+      // the remote preview stream is always a mix, even in Patreon mode
+      engine().setDirect(targetRef.current === "youtube" || !!remoteRef.current);
       engine().attach(v, audioRef.current.mic.channel);
       engine().update(audioRef.current);
+      engine().updateCloak(audioCloakRef.current);
     } catch {
       /* audio graph already bound to this element */
     }
     seekSrc(0);
   };
+
+  /* ------------------------------------------------------------- remote */
+  /** wait for the preview proxy, then load it into the shared video element */
+  const awaitProxy = useCallback(
+    async (client: RemoteClient, token: number) => {
+      for (;;) {
+        if (connectToken.current !== token) return;
+        const st = await client.state();
+        if (connectToken.current !== token) return;
+        setRemoteInfo(st);
+        if (st.proxy.error) throw new Error(st.proxy.error);
+        if (st.proxy.ready) {
+          const v = videoRef.current;
+          if (!v) return;
+          setFileName(st.info.path);
+          setResult(null);
+          setEnv(null);
+          setDetection(null);
+          setTranscript(null);
+          setPlaying(false);
+          // cache-bust so a re-transcoded proxy is never served stale
+          v.src = `${client.proxyUrl()}?t=${Date.now()}`;
+          v.muted = false;
+          v.volume = 1;
+          v.playbackRate = 1;
+          v.load();
+          return;
+        }
+        setProxyProgress(st.proxy.progress);
+        await sleep(2000);
+      }
+    },
+    []
+  );
+
+  const connectRemote = useCallback(
+    async (raw: string) => {
+      const token = ++connectToken.current;
+      setConnecting(true);
+      setRemoteError("");
+      setProxyProgress(0);
+      try {
+        const client = new RemoteClient(raw);
+        if (!client.base) throw new Error("Paste the tunnel URL from the notebook cell.");
+        const st = await client.state();
+        if (connectToken.current !== token) return;
+        localStorage.setItem("remoteUrl", client.base);
+        setRemote(client);
+        setRemoteInfo(st);
+        try {
+          const s = await client.sources();
+          if (connectToken.current !== token) return;
+          setSources(s.sources);
+        } catch {
+          setSources([]);
+        }
+        try {
+          const j = await client.job();
+          if (connectToken.current === token && j.state !== "idle") setRemoteJob(j);
+        } catch {
+          /* older server without the job queue */
+        }
+        await awaitProxy(client, token);
+      } catch (e) {
+        if (connectToken.current === token) {
+          setRemote(null);
+          setRemoteError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (connectToken.current === token) setConnecting(false);
+      }
+    },
+    [awaitProxy]
+  );
+
+  const selectRemoteSource = useCallback(
+    async (name: string) => {
+      const client = remoteRef.current;
+      if (!client) return;
+      const token = ++connectToken.current;
+      trToken.current++;
+      setTrBusy(false);
+      setConnecting(true);
+      setRemoteError("");
+      setProxyProgress(0);
+      try {
+        await client.setSource(name);
+        if (connectToken.current !== token) return;
+        const s = await client.sources();
+        if (connectToken.current !== token) return;
+        setSources(s.sources);
+        await awaitProxy(client, token);
+      } catch (e) {
+        if (connectToken.current === token) {
+          setRemoteError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (connectToken.current === token) setConnecting(false);
+      }
+    },
+    [awaitProxy]
+  );
+
+  const disconnectRemote = useCallback(() => {
+    connectToken.current++;
+    trToken.current++;
+    setTrBusy(false);
+    setTranscript(null);
+    const v = videoRef.current;
+    if (v) {
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+    }
+    setRemote(null);
+    setRemoteInfo(null);
+    setRemoteError("");
+    setSources([]);
+    setRemoteJob(null);
+    setFileName("");
+    setDuration(0);
+    setDims({ w: 0, h: 0 });
+    setSegments([]);
+    setPlaying(false);
+  }, []);
+
+  const switchEngine = useCallback(
+    (m: "local" | "remote") => {
+      if (m === engineMode) return;
+      if (exportingRef.current || scanningRef.current) return;
+      if (engineMode === "remote") disconnectRemote();
+      if (engineMode === "local") {
+        const v = videoRef.current;
+        if (v) {
+          v.pause();
+          v.removeAttribute("src");
+          v.load();
+        }
+        setFileName("");
+        setDuration(0);
+        setDims({ w: 0, h: 0 });
+        setSegments([]);
+        setPlaying(false);
+        setResult(null);
+        setTranscript(null);
+      }
+      setEngineMode(m);
+      engine().setDirect(m === "remote" || targetRef.current === "youtube");
+    },
+    [engineMode, disconnectRemote]
+  );
+
+  const startRemoteExport = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client || !duration || remoteJob?.state === "running") return;
+    setRemoteError("");
+    try {
+      const base = (fileName || "reaction").replace(/\.[^.]+$/, "");
+      const job = await client.renderProject({
+        target: targetRef.current,
+        name: `${base}_${targetRef.current}`,
+        segments: segsRef.current.map((s) => ({
+          type: s.type,
+          start: s.start,
+          end: s.end,
+        })),
+        layout: layoutRef.current,
+        audio: audioRef.current,
+        retouch: retouchRef.current,
+        audioCloak: audioCloakRef.current,
+        videoCloak: videoCloakRef.current,
+        crf: 18,
+        webm: false,
+        fps,
+        height: res === 1080 ? 1080 : 720,
+      });
+      setRemoteJob(job);
+      setRightTab("export");
+    } catch (e) {
+      setRemoteError(e instanceof Error ? e.message : String(e));
+    }
+  }, [duration, fileName, fps, res, remoteJob?.state]);
+
+  /* poll a running remote render until it lands */
+  useEffect(() => {
+    if (!remote || remoteJob?.state !== "running") return;
+    const t = window.setInterval(async () => {
+      try {
+        const j = await remote.job();
+        setRemoteJob(j);
+      } catch {
+        /* tunnel hiccup — keep polling */
+      }
+    }, 2000);
+    return () => window.clearInterval(t);
+  }, [remote, remoteJob?.state]);
+
+  /* one-click connect: the notebook prints a link with ?backend=<tunnel url> */
+  const autoBackend = useRef(false);
+  useEffect(() => {
+    if (autoBackend.current) return;
+    autoBackend.current = true;
+    const q = new URLSearchParams(window.location.search).get("backend");
+    if (q) {
+      setRemoteDraft(q);
+      switchEngine("remote");
+      window.history.replaceState({}, "", window.location.pathname);
+      void connectRemote(q);
+    }
+  }, [connectRemote, switchEngine]);
 
   /* --------------------------------------------------------------- scan */
   const stopScan = useCallback(() => {
@@ -730,6 +1066,58 @@ export default function App() {
     },
     [loadTranscript]
   );
+
+  const runTranscript = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client || trBusy) return;
+    const spans = segsRef.current
+      .filter((s) => s.type === "intro" || s.type === "outro")
+      .map((s) => ({ start: s.start, end: s.end }));
+    if (!spans.length) {
+      setTrError("No intro/outro segments on the timeline — nothing to transcribe.");
+      return;
+    }
+    const token = ++trToken.current;
+    setTrBusy(true);
+    setTrError("");
+    setTrProgress(0);
+    try {
+      await client.transcribe(spans, trLang);
+      for (;;) {
+        if (trToken.current !== token) return;
+        await sleep(2000);
+        const j = await client.job();
+        if (trToken.current !== token) return;
+        if (j.kind !== "transcript") continue;
+        setTrProgress(j.progress);
+        if (j.state === "done") {
+          if (j.result && j.result.words.length) {
+            setTranscript({
+              words: j.result.words,
+              timed: true,
+              source: `whisper (${j.result.lang})`,
+            });
+          } else {
+            setTrError("No speech detected in the intro/outro — check the mic channel.");
+          }
+          break;
+        }
+        if (j.state === "error") {
+          setTrError(j.error || "Transcription failed.");
+          break;
+        }
+      }
+    } catch (e) {
+      if (trToken.current === token) {
+        setTrError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (trToken.current === token) {
+        setTrBusy(false);
+        setTrProgress(0);
+      }
+    }
+  }, [trBusy, trLang]);
 
   const doBuildSkeleton = useCallback(() => {
     if (reactionStart === null || !duration) return;
@@ -823,6 +1211,95 @@ export default function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
 
+  /* -------------------------------------------------------- project file */
+  const [projectMsg, setProjectMsg] = useState("");
+
+  const saveProject = useCallback(() => {
+    const data = {
+      app: "reaction-studio",
+      version: 1,
+      savedAt: new Date().toISOString(),
+      sourceFile: fileName,
+      sourceDuration: duration,
+      target,
+      segments,
+      claims,
+      layout,
+      audio,
+      retouch,
+      audioCloak,
+      videoCloak,
+      cutOpts,
+      polish,
+      disruptRules,
+      leadCfg,
+      res,
+      fps,
+    };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(fileName || "reaction").replace(/\.[^.]+$/, "")}.reaction.json`;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+    setProjectMsg(`Saved ${segments.length} segments + all settings.`);
+  }, [
+    fileName, duration, target, segments, claims, layout, audio, retouch,
+    audioCloak, videoCloak, cutOpts, polish, disruptRules, leadCfg, res, fps,
+  ]);
+
+  const loadProjectFile = useCallback(
+    (f: File) => {
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const p = JSON.parse(String(r.result ?? "")) as Record<string, unknown>;
+          if (p.app !== "reaction-studio") throw new Error("Not a Reaction Studio project file.");
+          if (p.target === "patreon" || p.target === "youtube") {
+            switchTarget(p.target as Target);
+          }
+          if (Array.isArray(p.segments) && p.segments.length) {
+            const clean = (p.segments as Segment[]).filter(
+              (s) => s && typeof s.start === "number" && typeof s.end === "number" && s.end > s.start
+            ).map((s) => ({
+              id: typeof s.id === "string" ? s.id : uid(),
+              type: (s.type in SEGMENT_META ? s.type : "body") as Segment["type"],
+              start: s.start,
+              end: s.end,
+            }));
+            setSegments(durRef.current > 0 ? normalize(clean, durRef.current) : clean);
+          }
+          if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
+          if (p.layout) setLayout(p.layout as LayoutState);
+          if (p.audio) setAudio(p.audio as AudioState);
+          if (p.retouch) setRetouch(p.retouch as Retouch);
+          if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
+          if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
+          if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
+          if (p.polish) setPolish(p.polish as PolishRules);
+          if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
+          if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
+          if (p.res === 720 || p.res === 1080) setRes(p.res);
+          if (p.fps === 24 || p.fps === 30 || p.fps === 60) setFps(p.fps);
+          setSelectedId(null);
+          setTranscript(null);
+          const src = typeof p.sourceFile === "string" && p.sourceFile ? p.sourceFile : null;
+          setProjectMsg(
+            src
+              ? `Loaded project for “${src}”.` +
+                (fileName && src !== fileName ? " Current file differs — check the timeline." : "")
+              : "Project loaded."
+          );
+        } catch (e) {
+          setProjectMsg(e instanceof Error ? e.message : "Could not read that file.");
+        }
+      };
+      r.readAsText(f);
+    },
+    [fileName, switchTarget]
+  );
+
   /* -------------------------------------------------------------- render */
   const startExport = async () => {
     const v = videoRef.current;
@@ -912,10 +1389,10 @@ export default function App() {
     : outDur;
 
   const stageLayers: { key: "content" | "cam"; rect: Rect; name: string }[] =
-    sceneMode === "solo"
-      ? [{ key: "cam", rect: { x: 0, y: 0, w: 1, h: 1 }, name: "Camera (full frame)" }]
-      : sceneMode === "cut"
+    isYT || sceneMode === "cut"
       ? []
+      : sceneMode === "solo"
+      ? [{ key: "cam", rect: { x: 0, y: 0, w: 1, h: 1 }, name: "Camera (full frame)" }]
       : sceneMode === "card" || sceneMode === "lead"
       ? [
           { key: "cam", rect: layout.cam, name: "Camera" },
@@ -937,9 +1414,6 @@ export default function App() {
           <h1 className="text-[13px] font-semibold tracking-tight text-white">
             Reaction Studio
           </h1>
-          <span className="hidden text-[10px] text-slate-500 lg:inline">
-            cut version for YouTube · full version stays on Patreon
-          </span>
         </div>
 
         <input
@@ -952,9 +1426,55 @@ export default function App() {
             if (f) loadFile(f);
           }}
         />
-        <Btn onClick={() => fileInput.current?.click()}>
-          {fileName ? "Change source" : "Open recording"}
-        </Btn>
+        {!isRemote ? (
+          <Btn onClick={() => fileInput.current?.click()}>
+            {fileName ? "Change source" : isYT ? "Open Patreon render" : "Open recording"}
+          </Btn>
+        ) : !remote ? (
+          <form
+            className="flex min-w-0 flex-1 items-center gap-1.5 md:max-w-md"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void connectRemote(remoteDraft);
+            }}
+          >
+            <input
+              value={remoteDraft}
+              onChange={(e) => setRemoteDraft(e.target.value)}
+              placeholder="https://… — tunnel URL from the notebook"
+              spellCheck={false}
+              className="h-7 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-2 font-mono text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-emerald-400/50"
+            />
+            <Btn variant="primary" disabled={connecting}>
+              {connecting ? "…" : "Connect"}
+            </Btn>
+          </form>
+        ) : (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <select
+              value={sources.find((s) => s.current)?.name ?? fileName}
+              disabled={connecting || sources.length === 0}
+              onChange={(e) => void selectRemoteSource(e.target.value)}
+              className="h-7 max-w-[220px] truncate rounded-lg border border-white/10 bg-black/40 px-1.5 text-[11px] text-slate-200 outline-none focus:border-emerald-400/50 disabled:opacity-50"
+              title="Source file on the Colab side"
+            >
+              {sources.length === 0 && <option value={fileName}>{fileName}</option>}
+              {sources.map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name} · {(s.size / 1073741824).toFixed(1)} GB
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => switchEngine("local")}
+              className="shrink-0 rounded-lg px-1.5 py-1 text-[11px] text-slate-500 hover:bg-white/10 hover:text-slate-200"
+              title="Disconnect and go back to local files"
+            >
+              ✕
+            </button>
+          </span>
+        )}
         {fileName && (
           <span className="hidden min-w-0 items-center gap-2 md:flex">
             <span className="truncate text-[11px] text-slate-400">{fileName}</span>
@@ -970,22 +1490,53 @@ export default function App() {
             {removed > 0.05 && <span className="text-rose-300"> · −{fmtTime(removed)}</span>}
             {spedUp > 0.05 && <span className="text-teal-300"> · ⇢{fmtTime(spedUp)}</span>}
           </span>
-          <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5">
+          <div
+            className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5"
+            title="This PC: the file on your disk, rendered in the browser. Colab: files on the notebook side, previewed as a light stream and rendered by the server."
+          >
+            {(
+              [
+                ["local", "This PC"],
+                ["remote", "Colab"],
+              ] as ["local" | "remote", string][]
+            ).map(([m, label]) => (
+              <button
+                key={m}
+                type="button"
+                disabled={exporting || scanning}
+                onClick={() => switchEngine(m)}
+                className={cn(
+                  "rounded px-2 py-1 text-[11px] font-semibold transition-colors disabled:opacity-40",
+                  engineMode === m
+                    ? m === "remote"
+                      ? "bg-emerald-500/25 text-emerald-100 shadow-[inset_0_0_0_1px_rgba(52,211,153,0.4)]"
+                      : "bg-white/15 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.15)]"
+                    : "text-slate-500 hover:text-slate-300"
+                )}
+              >
+                {label}
+                {m === "remote" && remote && (
+                  <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 align-middle" />
+                )}
+              </button>
+            ))}
+          </div>
+          <div
+            className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5"
+            title="Patreon: cut the full version from the raw capture. YouTube: cut the short version from the finished Patreon render."
+          >
             {(["patreon", "youtube"] as Target[]).map((t) => (
               <button
                 key={t}
                 type="button"
                 title={TARGET_META[t].hint}
-                onClick={() => {
-                  setTarget(t);
-                  setTab(t === "patreon" ? "polish" : "autocut");
-                }}
+                onClick={() => switchTarget(t)}
                 className={cn(
-                  "rounded px-2 py-1 text-[10px] font-semibold transition-colors",
+                  "rounded px-2.5 py-1 text-[11px] font-semibold transition-colors",
                   target === t
                     ? t === "patreon"
-                      ? "bg-fuchsia-500/20 text-fuchsia-100"
-                      : "bg-sky-500/20 text-sky-100"
+                      ? "bg-fuchsia-500/25 text-fuchsia-100 shadow-[inset_0_0_0_1px_rgba(232,121,249,0.4)]"
+                      : "bg-sky-500/25 text-sky-100 shadow-[inset_0_0_0_1px_rgba(56,189,248,0.4)]"
                     : "text-slate-500 hover:text-slate-300"
                 )}
               >
@@ -995,14 +1546,7 @@ export default function App() {
           </div>
           <Btn
             variant="primary"
-            onClick={() => setTab("polish")}
-            disabled={!duration}
-            title="Polish the intro and outro"
-          >
-            ✦ Polish
-          </Btn>
-          <Btn
-            onClick={() => setTab("export")}
+            onClick={() => setRightTab("export")}
             disabled={!duration}
             title="Go to render settings"
           >
@@ -1011,205 +1555,26 @@ export default function App() {
         </div>
       </header>
 
+      {/* middle: left tools | preview | right inspector */}
       <div className="flex min-h-0 flex-1">
-        <main className="flex min-w-0 flex-1 flex-col">
+        <aside className="flex w-[292px] shrink-0 flex-col border-r border-white/10 bg-slate-950/40">
           <div
-            className="relative flex min-h-0 flex-1 flex-col p-4"
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              const f = e.dataTransfer.files?.[0];
-              if (f) loadFile(f);
-            }}
+            className={cn(
+              "shrink-0 border-b border-white/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.12em]",
+              isYT ? "bg-sky-500/10 text-sky-200" : "bg-fuchsia-500/10 text-fuchsia-200"
+            )}
           >
-            <Stage
-              canvasRef={previewRef}
-              layout={layout}
-              onRect={setRect}
-              layers={stageLayers}
-              editLayer={editLayer}
-              setEditLayer={setEditLayer}
-              sceneMode={sceneMode}
-              showGuides={showGuides}
-              playing={playing}
-              onTogglePlay={togglePlay}
-              empty={empty}
-            />
-
-            {empty && (
-              <div className="absolute inset-4 z-40 flex items-center justify-center rounded-xl">
-                <div className="w-full max-w-md rounded-2xl border border-dashed border-white/15 bg-slate-950/80 p-6 text-center backdrop-blur">
-                  <p className="text-[15px] font-semibold text-white">
-                    Drop your OBS recording here
-                  </p>
-                  <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
-                    Built for the 3840×1080 side-by-side capture: webcam on one half, watched
-                    content on the other, mic and desktop audio on separate channels. The app finds
-                    the moments you actually speak and builds a cut version around them. Everything
-                    runs locally — your 3 GB file never leaves the machine.
-                  </p>
-                  <Btn
-                    variant="primary"
-                    className="mt-4 px-4 py-2 text-[12px]"
-                    onClick={() => fileInput.current?.click()}
-                  >
-                    Choose a video file
-                  </Btn>
-                  <p className="mt-3 text-[10px] text-slate-600">
-                    A normal 16:9 file works too — switch the source mode to “Single 16:9 file”.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {scanning && (
-              <div className="absolute inset-x-4 top-4 z-40 flex items-center gap-3 rounded-xl border border-sky-400/30 bg-slate-950/90 px-3 py-2 backdrop-blur">
-                <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-400" />
-                <span className="text-[11px] text-sky-200">
-                  Analysing your mic at {scanSpeed}× — {Math.round(scanProgress * 100)}%
-                </span>
-                <div className="ml-auto h-1.5 w-40 overflow-hidden rounded-full bg-black/60">
-                  <div
-                    className="h-full rounded-full bg-sky-400"
-                    style={{ width: `${scanProgress * 100}%` }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* transport */}
-            <div className="mt-3 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.025] px-2.5 py-2">
-              <button
-                type="button"
-                onClick={() => seekSrc(timeRef.current.src - 1 / 30)}
-                className="rounded-lg px-2 py-1 text-[13px] text-slate-400 hover:bg-white/10 hover:text-white"
-                title="Back one frame (←)"
-              >
-                ◀|
-              </button>
-              <button
-                type="button"
-                onClick={togglePlay}
-                disabled={!duration}
-                className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10 text-white hover:bg-white/20 disabled:opacity-40"
-                title="Play / pause (Space)"
-              >
-                {playing ? (
-                  <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current">
-                    <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 24 24" className="ml-0.5 h-4 w-4 fill-current">
-                    <path d="M8 5v14l11-7z" />
-                  </svg>
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => seekSrc(timeRef.current.src + 1 / 30)}
-                className="rounded-lg px-2 py-1 text-[13px] text-slate-400 hover:bg-white/10 hover:text-white"
-                title="Forward one frame (→)"
-              >
-                |▶
-              </button>
-
-              <div className="ml-1 flex items-baseline gap-1.5 font-mono text-[12px] tabular-nums">
-                <span className="text-sky-300">
-                  <LiveText get={() => fmtTime(getOutTime())} />
-                </span>
-                <span className="text-slate-600">/</span>
-                <span className="text-slate-400">{fmtTime(outDur)}</span>
-                <span className="ml-2 text-[10px] text-slate-600">
-                  src <LiveText get={() => fmtTime(getSrcTime())} />
-                </span>
-              </div>
-
-              <div className="ml-auto flex items-center gap-2">
-                {selected && (
-                  <span
-                    className={cn(
-                      "rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-                      SEGMENT_META[selected.type].chip
-                    )}
-                    title={SEGMENT_META[selected.type].text}
-                  >
-                    {SEGMENT_META[selected.type].label} ·{" "}
-                    {fmtTime(selected.end - selected.start)}
-                    {selected.type === "fast" && ` @${fast}×`}
-                  </span>
-                )}
-                <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5">
-                  {[0.5, 1, 2].map((r) => (
-                    <button
-                      key={r}
-                      type="button"
-                      disabled={exporting || scanning}
-                      onClick={() => setRate(r)}
-                      className={cn(
-                        "rounded px-1.5 py-0.5 text-[10px] font-medium",
-                        rate === r
-                          ? "bg-sky-500/20 text-sky-200"
-                          : "text-slate-500 hover:text-slate-300",
-                        (exporting || scanning) && "opacity-40"
-                      )}
-                    >
-                      {r}×
-                    </button>
-                  ))}
-                </div>
-                <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5">
-                  {[1, 2, 4, 8].map((z) => (
-                    <button
-                      key={z}
-                      type="button"
-                      onClick={() => setZoom(z)}
-                      className={cn(
-                        "rounded px-1.5 py-0.5 text-[10px] font-medium",
-                        zoom === z
-                          ? "bg-sky-500/20 text-sky-200"
-                          : "text-slate-500 hover:text-slate-300"
-                      )}
-                    >
-                      {z}×
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
+            {isYT ? "YouTube · cut the Patreon render" : "Patreon · from the raw capture"}
           </div>
-
-          <div className="flex h-[196px] shrink-0 flex-col">
-            <Timeline
-              segments={segments}
-              claims={claims}
-              selectedId={selectedId}
-              selectedClaim={selectedClaim}
-              duration={duration}
-              zoom={zoom}
-              fastSpeed={fast}
-              playing={isPlaying}
-              getSrcTime={getSrcTime}
-              onSelect={setSelectedId}
-              onSelectClaim={setSelectedClaim}
-              onChange={(s) => setSegments(normalize(s, duration))}
-              onSeek={seekSrc}
-              onSplit={doSplit}
-              onAddSegment={addSegment}
-              onDelete={doDelete}
-            />
-          </div>
-        </main>
-
-        <aside className="flex w-[360px] shrink-0 flex-col border-l border-white/10 bg-slate-950/40">
           <nav className="flex shrink-0 gap-0.5 border-b border-white/10 p-1.5">
-            {TABS.map((t) => (
+            {LEFT_TABS[target].map((t) => (
               <button
                 key={t.id}
                 type="button"
-                onClick={() => setTab(t.id)}
+                onClick={() => setLeftTab(t.id)}
                 className={cn(
                   "flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-colors",
-                  tab === t.id
+                  leftTab === t.id
                     ? "bg-white/10 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.12)]"
                     : "text-slate-500 hover:bg-white/5 hover:text-slate-300"
                 )}
@@ -1224,23 +1589,7 @@ export default function App() {
             ))}
           </nav>
           <div className="min-h-0 flex-1 overflow-y-auto p-2.5">
-            {tab === "layout" && (
-              <LayoutPanel
-                layout={layout}
-                setLayout={setLayout}
-                editLayer={editLayer}
-                setEditLayer={setEditLayer}
-                dims={dims}
-                fileName={fileName || "no source loaded"}
-                showGuides={showGuides}
-                setShowGuides={setShowGuides}
-                selected={selected}
-                onSegmentType={(t) =>
-                  setSegments((s) => s.map((x) => (x.id === selectedId ? { ...x, type: t } : x)))
-                }
-              />
-            )}
-            {tab === "polish" && (
+            {leftTab === "polish" && !isYT && (
               <PolishPanel
                 hasSource={!!duration}
                 duration={duration}
@@ -1266,6 +1615,13 @@ export default function App() {
                 onStopScan={stopScan}
                 onTranscriptFile={onTranscriptFile}
                 onTranscriptText={loadTranscript}
+                canTranscribe={isRemote && !!remote}
+                trBusy={trBusy}
+                trProgress={trProgress}
+                trLang={trLang}
+                setTrLang={setTrLang}
+                onTranscribe={() => void runTranscript()}
+                trError={trError}
                 onApproxAlign={() =>
                   setTranscript((t) =>
                     t ? approxAlign(t, introOutro, polish.approxWps) : t
@@ -1279,7 +1635,7 @@ export default function App() {
                 bodySpan={bodySpan}
               />
             )}
-            {tab === "autocut" && (
+            {leftTab === "autocut" && isYT && (
               <AutoCut
                 hasSource={!!duration}
                 duration={duration}
@@ -1301,12 +1657,10 @@ export default function App() {
                 getSrcTime={getSrcTime}
                 introOutro={introOutro}
                 browserOk={browserOk}
+                mixed
               />
             )}
-            {tab === "audio" && (
-              <AudioPanel audio={audio} setAudio={setAudio} getLevels={getLevels} />
-            )}
-            {tab === "claims" && (
+            {leftTab === "claims" && (
               <ClaimsPanel
                 raw={raw}
                 setRaw={setRaw}
@@ -1322,7 +1676,340 @@ export default function App() {
                 segments={segments}
               />
             )}
-            {tab === "export" && (
+          </div>
+        </aside>
+
+        <main
+          className="relative flex min-w-0 flex-1 flex-col p-3"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            const f = e.dataTransfer.files?.[0];
+            if (f) loadFile(f);
+          }}
+        >
+          {mismatchWide && (
+            <div className="mb-2 flex shrink-0 items-center gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-100">
+              <span>
+                This looks like the raw 32:9 capture — YouTube mode expects the finished 16:9
+                Patreon render.
+              </span>
+              <button
+                type="button"
+                onClick={() => switchTarget("patreon")}
+                className="ml-auto shrink-0 rounded-lg border border-amber-400/40 bg-amber-500/20 px-2 py-1 text-[10px] font-semibold hover:bg-amber-500/30"
+              >
+                Switch to Patreon
+              </button>
+            </div>
+          )}
+          {mismatchNarrow && (
+            <div className="mb-2 shrink-0 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400">
+              16:9 file in Patreon mode — camera and content share the full frame. For the usual
+              side-by-side capture, load the raw 3840×1080 recording.
+            </div>
+          )}
+
+          <Stage
+            canvasRef={previewRef}
+            layout={layout}
+            onRect={setRect}
+            layers={stageLayers}
+            editLayer={editLayer}
+            setEditLayer={setEditLayer}
+            sceneMode={sceneMode}
+            showGuides={showGuides}
+            playing={playing}
+            onTogglePlay={togglePlay}
+            empty={empty}
+            passthrough={isYT}
+          />
+
+          {empty && (
+            <div className="absolute inset-3 z-40 flex items-center justify-center rounded-xl">
+              <div className="w-full max-w-md rounded-2xl border border-dashed border-white/15 bg-slate-950/80 p-6 text-center backdrop-blur">
+                {isRemote ? (
+                  !remote ? (
+                    <>
+                      <p className="text-[15px] font-semibold text-white">
+                        Connect the Colab backend
+                      </p>
+                      <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                        Run the server cell in the notebook, paste its tunnel URL
+                        {remoteDraft ? " above" : " below"} and press Connect. Your files stay on
+                        the Colab side — the browser only previews a light stream, and the
+                        finished render downloads straight from the server.
+                      </p>
+                      <form
+                        className="mx-auto mt-4 flex max-w-sm gap-1.5"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          void connectRemote(remoteDraft);
+                        }}
+                      >
+                        <input
+                          value={remoteDraft}
+                          onChange={(e) => setRemoteDraft(e.target.value)}
+                          placeholder="https://…tunnel URL…"
+                          spellCheck={false}
+                          className="h-8 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-2 font-mono text-[11px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-emerald-400/50"
+                        />
+                        <Btn variant="primary" disabled={connecting}>
+                          {connecting ? "…" : "Connect"}
+                        </Btn>
+                      </form>
+                      {remoteError && (
+                        <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+                          {remoteError}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-[15px] font-semibold text-white">
+                        {remoteInfo?.proxy.ready ? "Loading preview…" : "Preparing preview…"}
+                      </p>
+                      <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                        {remoteInfo?.proxy.ready
+                          ? "The stream is ready — starting playback."
+                          : "The server is transcoding a lightweight proxy of the source (once per file, cached). The timeline unlocks as soon as it arrives."}
+                      </p>
+                      {!remoteInfo?.proxy.ready && (
+                        <div className="mx-auto mt-4 h-1.5 max-w-sm overflow-hidden rounded-full bg-black/60">
+                          <div
+                            className="h-full rounded-full bg-emerald-400 transition-[width]"
+                            style={{ width: `${Math.round(proxyProgress * 100)}%` }}
+                          />
+                        </div>
+                      )}
+                      {remoteError && (
+                        <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+                          {remoteError}
+                        </p>
+                      )}
+                    </>
+                  )
+                ) : isYT ? (
+                  <>
+                    <p className="text-[15px] font-semibold text-white">
+                      Drop your Patreon render here
+                    </p>
+                    <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                      Load the finished 1920×1080 version with its mixed audio. It plays through
+                      full-frame — mark what stays with auto-cut, claims or straight cuts, then
+                      render the upload. Everything runs locally.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-[15px] font-semibold text-white">
+                      Drop your OBS recording here
+                    </p>
+                    <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
+                      Built for the 3840×1080 side-by-side capture: webcam on one half, watched
+                      content on the other, mic and desktop audio on separate channels. Polish the
+                      intro and outro, repair the dropouts, compose the frame. Everything runs
+                      locally — your 3 GB file never leaves the machine.
+                    </p>
+                  </>
+                )}
+                {!isRemote && (
+                  <Btn
+                    variant="primary"
+                    className="mt-4 px-4 py-2 text-[12px]"
+                    onClick={() => fileInput.current?.click()}
+                  >
+                    Choose a video file
+                  </Btn>
+                )}
+              </div>
+            </div>
+          )}
+
+          {scanning && (
+            <div className="absolute inset-x-3 top-3 z-40 flex items-center gap-3 rounded-xl border border-sky-400/30 bg-slate-950/90 px-3 py-2 backdrop-blur">
+              <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-400" />
+              <span className="text-[11px] text-sky-200">
+                Analysing {isYT ? "mixed audio" : "your mic"} at {scanSpeed}× — {Math.round(scanProgress * 100)}%
+              </span>
+              <div className="ml-auto h-1.5 w-40 overflow-hidden rounded-full bg-black/60">
+                <div
+                  className="h-full rounded-full bg-sky-400"
+                  style={{ width: `${scanProgress * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* transport */}
+          <div className="mt-2.5 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.025] px-2.5 py-2">
+            <button
+              type="button"
+              onClick={() => seekSrc(timeRef.current.src - 1 / 30)}
+              className="rounded-lg px-2 py-1 text-[13px] text-slate-400 hover:bg-white/10 hover:text-white"
+              title="Back one frame (←)"
+            >
+              ◀|
+            </button>
+            <button
+              type="button"
+              onClick={togglePlay}
+              disabled={!duration}
+              className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10 text-white hover:bg-white/20 disabled:opacity-40"
+              title="Play / pause (Space)"
+            >
+              {playing ? (
+                <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current">
+                  <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" className="ml-0.5 h-4 w-4 fill-current">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => seekSrc(timeRef.current.src + 1 / 30)}
+              className="rounded-lg px-2 py-1 text-[13px] text-slate-400 hover:bg-white/10 hover:text-white"
+              title="Forward one frame (→)"
+            >
+              |▶
+            </button>
+
+            <div className="ml-1 flex items-baseline gap-1.5 font-mono text-[12px] tabular-nums">
+              <span className="text-sky-300">
+                <LiveText get={() => fmtTime(getOutTime())} />
+              </span>
+              <span className="text-slate-600">/</span>
+              <span className="text-slate-400">{fmtTime(outDur)}</span>
+              <span className="ml-2 hidden text-[10px] text-slate-600 sm:inline">
+                src <LiveText get={() => fmtTime(getSrcTime())} />
+              </span>
+            </div>
+
+            <div className="ml-auto flex items-center gap-2">
+              {selected && (
+                <span
+                  className={cn(
+                    "hidden rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase lg:inline",
+                    SEGMENT_META[selected.type].chip
+                  )}
+                  title={SEGMENT_META[selected.type].text}
+                >
+                  {SEGMENT_META[selected.type].label} · {fmtTime(selected.end - selected.start)}
+                  {selected.type === "fast" && ` @${fast}×`}
+                </span>
+              )}
+              <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5">
+                {[0.5, 1, 2].map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    disabled={exporting || scanning}
+                    onClick={() => setRate(r)}
+                    className={cn(
+                      "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                      rate === r
+                        ? "bg-sky-500/20 text-sky-200"
+                        : "text-slate-500 hover:text-slate-300",
+                      (exporting || scanning) && "opacity-40"
+                    )}
+                  >
+                    {r}×
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5">
+                {[1, 2, 4, 8].map((z) => (
+                  <button
+                    key={z}
+                    type="button"
+                    onClick={() => setZoom(z)}
+                    className={cn(
+                      "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                      zoom === z
+                        ? "bg-sky-500/20 text-sky-200"
+                        : "text-slate-500 hover:text-slate-300"
+                    )}
+                  >
+                    {z}×
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <aside className="flex w-[320px] shrink-0 flex-col border-l border-white/10 bg-slate-950/40">
+          <nav className="flex shrink-0 gap-0.5 border-b border-white/10 p-1.5">
+            {RIGHT_TABS[target].map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setRightTab(t.id)}
+                className={cn(
+                  "flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-colors",
+                  rightTab === t.id
+                    ? "bg-white/10 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.12)]"
+                    : "text-slate-500 hover:bg-white/5 hover:text-slate-300"
+                )}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+          <div className="min-h-0 flex-1 overflow-y-auto p-2.5">
+            {rightTab === "layout" && !isYT && (
+              <LayoutPanel
+                layout={layout}
+                setLayout={setLayout}
+                editLayer={editLayer}
+                setEditLayer={setEditLayer}
+                dims={dims}
+                fileName={fileName || "no source loaded"}
+                showGuides={showGuides}
+                setShowGuides={setShowGuides}
+                selected={selected}
+                onSegmentType={(t) =>
+                  setSegments((s) => s.map((x) => (x.id === selectedId ? { ...x, type: t } : x)))
+                }
+              />
+            )}
+            {rightTab === "retouch" && !isYT && (
+              <RetouchPanel
+                cfg={retouch}
+                setCfg={setRetouch}
+                status={trackStatus}
+                statusText={trackError}
+                fps={trackFps}
+                onLoad={loadFaceModel}
+                showFaceBox={showFaceBox}
+                setShowFaceBox={setShowFaceBox}
+                manualBox={retouch.manualRect}
+                setManualBox={(b) => setRetouch((c) => ({ ...c, manualRect: { ...b } }))}
+              />
+            )}
+            {rightTab === "video" && isYT && (
+              <VideoPanel
+                fileName={fileName || "no source loaded"}
+                dims={dims}
+                layout={layout}
+                setLayout={setLayout}
+              />
+            )}
+            {rightTab === "cloak" && isYT && (
+              <CloakPanel
+                audio={audioCloak}
+                setAudio={setAudioCloak}
+                video={videoCloak}
+                setVideo={setVideoCloak}
+              />
+            )}
+            {rightTab === "audio" && (
+              <AudioPanel audio={audio} setAudio={setAudio} getLevels={getLevels} direct={isYT} />
+            )}
+            {rightTab === "export" && (
               <ExportPanel
                 res={res}
                 setRes={setRes}
@@ -1341,10 +2028,46 @@ export default function App() {
                 removed={removed}
                 duration={duration}
                 mime={mime}
+                onSaveProject={saveProject}
+                onLoadProject={loadProjectFile}
+                projectMsg={projectMsg}
+                remote={
+                  isRemote
+                    ? {
+                        connected: !!remote,
+                        job: remoteJob,
+                        error: remoteError,
+                        onExport: () => void startRemoteExport(),
+                        fileUrl: (n) => remote?.fileUrl(n) ?? "#",
+                      }
+                    : null
+                }
               />
             )}
           </div>
         </aside>
+      </div>
+
+      {/* timeline spans the full width, under everything */}
+      <div className="flex h-[190px] shrink-0 flex-col border-t border-white/10">
+        <Timeline
+          segments={segments}
+          claims={claims}
+          selectedId={selectedId}
+          selectedClaim={selectedClaim}
+          duration={duration}
+          zoom={zoom}
+          fastSpeed={fast}
+          playing={isPlaying}
+          getSrcTime={getSrcTime}
+          onSelect={setSelectedId}
+          onSelectClaim={setSelectedClaim}
+          onChange={(s) => setSegments(normalize(s, duration))}
+          onSeek={seekSrc}
+          onSplit={doSplit}
+          onAddSegment={addSegment}
+          onDelete={doDelete}
+        />
       </div>
 
       <video
@@ -1352,43 +2075,7 @@ export default function App() {
         className="pointer-events-none fixed -left-[9999px] top-0 h-1 w-1"
         playsInline
         preload="auto"
-        onLoadedMetadata={onMeta}
-        onError={() => setFileName((n) => n)}
-      />
-      <canvas
-        ref={exportRef}
-        className="pointer-events-none fixed -left-[9999px] top-0 h-1 w-1"
-      />
-    </div>
-  );
-}
-             setRes={setRes}
-                fps={fps}
-                setFps={setFps}
-                bitrate={bitrate}
-                setBitrate={setBitrate}
-                exporting={exporting}
-                progress={progress}
-                resultUrl={result?.url ?? null}
-                resultSize={result?.size ?? 0}
-                fileName={fileName || "reaction"}
-                onExport={() => void startExport()}
-                onStop={finish}
-                outDur={outDur}
-                removed={removed}
-                duration={duration}
-                mime={mime}
-              />
-            )}
-          </div>
-        </aside>
-      </div>
-
-      <video
-        ref={videoRef}
-        className="pointer-events-none fixed -left-[9999px] top-0 h-1 w-1"
-        playsInline
-        preload="auto"
+        crossOrigin="anonymous"
         onLoadedMetadata={onMeta}
         onError={() => setFileName((n) => n)}
       />

@@ -148,16 +148,15 @@ export interface AudioState {
 
 /** Which deliverable we're building right now. */
 export type Target = "patreon" | "youtube";
-
 export const TARGET_META: Record<Target, { label: string; hint: string; badge: string }> = {
   patreon: {
     label: "Patreon",
-    hint: "full content · polished intro & outro · dropouts repaired",
+    hint: "from the raw 32:9 capture · separate mic + content channels · full compositing",
     badge: "border-fuchsia-400/40 bg-fuchsia-500/15 text-fuchsia-100",
   },
   youtube: {
     label: "YouTube",
-    hint: "cut down to your commentary · cards / fast-forward between",
+    hint: "from the finished 16:9 Patreon render · mixed audio · straight cuts only",
     badge: "border-sky-400/40 bg-sky-500/15 text-sky-100",
   },
 };
@@ -313,17 +312,21 @@ const baseStyle = (fit: Fit): LayerStyle => ({
   opacity: 1,
 });
 
-/** camera top-left, content bottom-right, both rounded */
+/**
+ * Camera top-left, content bottom-right, both rounded.
+ * Measured sizes at 1080p: content 1344x756 (70%), camera 576x324 (30%),
+ * corner radius 10 on content, 20 on camera.
+ */
 export const defaultLayout: LayoutState = {
   cameraSide: "left",
   sourceMode: "split",
-  cam: { x: 0.03, y: 0.045, w: 0.3, h: 0.335 },
-  content: { x: 0.35, y: 0.3, w: 0.62, h: 0.655 },
+  cam: { x: 0.006, y: 0.011, w: 0.3, h: 0.3 },
+  content: { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
   bg: { source: "full", blur: 50, opacity: 0.4, scale: 1.08, dim: 0.25 },
-  contentStyle: { ...baseStyle("contain"), radius: 20, shape: "rounded" },
+  contentStyle: { ...baseStyle("contain"), radius: 10, shape: "rounded" },
   camStyle: {
     ...baseStyle("contain"),
-    radius: 26,
+    radius: 20,
     border: 3,
     borderColor: "#0ea5e9",
   },
@@ -370,6 +373,73 @@ export const defaultAudio: AudioState = {
   master: { gain: 1 },
 };
 
+/**
+ * Anti-fingerprint processing for the YouTube cut. The source there is already
+ * mixed, so this treats the whole programme (you + content) as one signal.
+ * Everything here preserves duration — no timeline remapping needed.
+ */
+export interface AudioCloak {
+  on: boolean;
+  /** tempo-preserving pitch shift in semitones (±1 ≈ ±6%) */
+  pitch: number;
+  /** chorus movement 0..100 — constantly detunes the spectrum */
+  chorus: number;
+  /** small-room reverb 0..100 */
+  reverb: number;
+  /** EQ tilt in dB: positive = brighter, negative = darker */
+  tilt: number;
+  /** Haas stereo widening in ms (delays the right channel) */
+  widen: number;
+}
+
+export const defaultAudioCloak: AudioCloak = {
+  on: true,
+  pitch: 0.5,
+  chorus: 25,
+  reverb: 18,
+  tilt: 2,
+  widen: 6,
+};
+
+/**
+ * Frame-level changes for the YouTube cut. Applied to the full frame in
+ * passthrough mode — zoom/crop, cover bars, colour and grain.
+ */
+export interface VideoCloak {
+  on: boolean;
+  /** punch-in 1..1.12 — drops edge pixels trackers rely on */
+  zoom: number;
+  /** top/bottom cover bars, % of frame height each */
+  bars: number;
+  /** inset frame border, 1080p px */
+  border: number;
+  borderColor: string;
+  /** colour, % (100 = untouched) */
+  saturate: number;
+  contrast: number;
+  brightness: number;
+  /** hue rotation in degrees */
+  hue: number;
+  /** animated film grain 0..100 */
+  grain: number;
+  /** edge darkening 0..100 */
+  vignette: number;
+}
+
+export const defaultVideoCloak: VideoCloak = {
+  on: true,
+  zoom: 1.03,
+  bars: 3,
+  border: 0,
+  borderColor: "#0ea5e9",
+  saturate: 108,
+  contrast: 104,
+  brightness: 100,
+  hue: 0,
+  grain: 12,
+  vignette: 25,
+};
+
 export const defaultCut: CutOptions = {
   marginDb: 7,
   minSpeech: 0.3,
@@ -387,9 +457,23 @@ export type LayoutPreset = {
   cam: Rect;
   camShape: Shape;
   hideContent: boolean;
+  /** corner radii in 1080p px; applied when present */
+  contentRadius?: number;
+  camRadius?: number;
 };
 
 export const LAYOUT_PRESETS: LayoutPreset[] = [
+  {
+    id: "reaction-1344",
+    name: "Reaction 1344+576",
+    hint: "content 1344×756 r10 · cam 576×324 r20",
+    cam: { x: 0.006, y: 0.011, w: 0.3, h: 0.3 },
+    content: { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
+    camShape: "rounded",
+    hideContent: false,
+    contentRadius: 10,
+    camRadius: 20,
+  },
   {
     id: "hero-circle",
     name: "Hero circle",
@@ -430,10 +514,12 @@ export const LAYOUT_PRESETS: LayoutPreset[] = [
     id: "tl-br",
     name: "Cam TL · content BR",
     hint: "your default look",
-    cam: { x: 0.03, y: 0.045, w: 0.3, h: 0.335 },
-    content: { x: 0.35, y: 0.3, w: 0.62, h: 0.655 },
+    cam: { x: 0.006, y: 0.011, w: 0.3, h: 0.3 },
+    content: { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
     camShape: "rounded",
     hideContent: false,
+    contentRadius: 10,
+    camRadius: 20,
   },
   {
     id: "tl-br-tight",

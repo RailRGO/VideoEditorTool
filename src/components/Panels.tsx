@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Claim, LayerStyle, LayoutState, AudioState, Segment } from "../lib/types";
 import { LAYOUT_PRESETS, SEGMENT_META } from "../lib/types";
 import { fmtTime } from "../lib/timeline";
 import type { Levels } from "../lib/audio";
+import type { RemoteJob } from "../lib/remote";
 import { Btn, LiveText, Meter, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { cn } from "../utils/cn";
 
@@ -97,7 +98,15 @@ export function LayoutPanel({
                   content: { ...p.content },
                   cam: { ...p.cam },
                   contentHidden: p.hideContent,
-                  camStyle: { ...l.camStyle, shape: p.camShape },
+                  camStyle: {
+                    ...l.camStyle,
+                    shape: p.camShape,
+                    ...(p.camRadius != null ? { radius: p.camRadius } : {}),
+                  },
+                  contentStyle: {
+                    ...l.contentStyle,
+                    ...(p.contentRadius != null ? { radius: p.contentRadius } : {}),
+                  },
                 }))
               }
               className={cn(
@@ -142,6 +151,12 @@ export function LayoutPanel({
           <Slider label="Width" value={rect.w} min={0.05} max={1} step={0.005} display={pct(rect.w)} onChange={(v) => setRect({ w: v })} />
           <Slider label="Height" value={rect.h} min={0.05} max={1} step={0.005} display={pct(rect.h)} onChange={(v) => setRect({ h: v })} />
         </div>
+        <p className="mt-1.5 font-mono text-[10px] text-slate-500">
+          {Math.round(rect.x * 1920)}, {Math.round(rect.y * 1080)} ·{" "}
+          <span className="text-slate-300">
+            {Math.round(rect.w * 1920)}×{Math.round(rect.h * 1080)} px @1080p
+          </span>
+        </p>
         <div className="mt-2 space-y-2">
           <div className="grid grid-cols-2 gap-1.5">
             <Segmented
@@ -293,11 +308,40 @@ export function AudioPanel({
   audio,
   setAudio,
   getLevels,
+  direct = false,
+  previewMixed = false,
 }: {
   audio: AudioState;
   setAudio: React.Dispatch<React.SetStateAction<AudioState>>;
   getLevels: () => Levels;
+  /** mixed stereo file: no mic/content split, the programme plays as-is */
+  direct?: boolean;
+  /** remote preview plays a mixed proxy — the split below still tunes the server render */
+  previewMixed?: boolean;
 }) {
+  if (direct) {
+    return (
+      <div className="space-y-2.5">
+        <Section title="Program">
+          <div className="space-y-1.5">
+            <Meter label="mix" get={() => getLevels().mic} />
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              The YouTube job is cut from your finished Patreon render, so the audio is already
+              mixed — it plays through the anti-fingerprint chain (see the Cloak tab).
+            </p>
+          </div>
+        </Section>
+        <Section title="Master">
+          <Slider label="Output gain" value={audio.master.gain} min={-20} max={6} step={0.5} display={`${audio.master.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, master: { gain: v } }))} hint="a −1.5 dB safety limiter is always engaged last" />
+        </Section>
+        <Note>
+          <strong className="font-semibold">Mute and card segments silence everything</strong>{" "}
+          here — a mixed file can't be split back into voice and content. Cut segments are dropped
+          from the render entirely.
+        </Note>
+      </div>
+    );
+  }
   const mic = audio.mic;
   const setMic = (patch: Partial<AudioState["mic"]>) =>
     setAudio((a) => ({ ...a, mic: { ...a.mic, ...patch } }));
@@ -311,6 +355,12 @@ export function AudioPanel({
 
   return (
     <div className="space-y-2.5">
+      {previewMixed && (
+        <Note>
+          The preview stream is mixed, so what you hear is the rough blend — but every slider
+          below is honoured by the server render, which mixes the real mic and content buses.
+        </Note>
+      )}
       <Section title="Meters">
         <div className="space-y-1.5">
           <Meter label="mic" get={() => getLevels().mic} />
@@ -407,6 +457,69 @@ export function AudioPanel({
 
       <Section title="Master">
         <Slider label="Output gain" value={audio.master.gain} min={-20} max={6} step={0.5} display={`${audio.master.gain.toFixed(1)} dB`} onChange={(v) => setAudio((a) => ({ ...a, master: { gain: v } }))} hint="a −1.5 dB safety limiter is always engaged last" />
+      </Section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------- video (youtube mode) */
+
+export function VideoPanel({
+  fileName,
+  dims,
+  layout,
+  setLayout,
+}: {
+  fileName: string;
+  dims: { w: number; h: number };
+  layout: LayoutState;
+  setLayout: React.Dispatch<React.SetStateAction<LayoutState>>;
+}) {
+  return (
+    <div className="space-y-2.5">
+      <Section
+        title="Source"
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            {dims.w}×{dims.h}
+          </span>
+        }
+      >
+        <p className="mb-2 truncate text-[11px] text-slate-400">{fileName}</p>
+        <Note>
+          <strong className="font-semibold">Full-frame passthrough.</strong> The Patreon render is
+          already composed, so it goes to the output untouched — this mode only cuts, mutes,
+          fast-forwards and covers parts with a card.
+        </Note>
+      </Section>
+
+      <Section title="Placeholder card">
+        <div className="space-y-1.5">
+          <input
+            value={layout.card.title}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, title: e.target.value } }))}
+            placeholder="Card headline"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <input
+            value={layout.card.sub}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, sub: e.target.value } }))}
+            placeholder="Card sub-line"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={layout.card.accent}
+              onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, accent: e.target.value } }))}
+              className="h-7 w-10 cursor-pointer rounded border border-white/10 bg-black/40"
+            />
+            <span className="font-mono text-[10px] text-slate-500">{layout.card.accent}</span>
+          </div>
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Shown full-frame wherever a CARD segment sits, with the programme audio silenced.
+          </p>
+        </div>
       </Section>
     </div>
   );
@@ -616,6 +729,10 @@ export function ExportPanel({
   removed,
   duration,
   mime,
+  onSaveProject,
+  onLoadProject,
+  projectMsg,
+  remote = null,
 }: {
   res: 720 | 1080;
   setRes: (v: 720 | 1080) => void;
@@ -634,9 +751,48 @@ export function ExportPanel({
   removed: number;
   duration: number;
   mime: string;
+  onSaveProject: () => void;
+  onLoadProject: (f: File) => void;
+  projectMsg: string;
+  remote?: {
+    connected: boolean;
+    job: RemoteJob | null;
+    error: string;
+    onExport: () => void;
+    fileUrl: (name: string) => string;
+  } | null;
 }) {
+  const job = remote?.job ?? null;
+  const running = job?.state === "running";
+  const projectRef = useRef<HTMLInputElement>(null);
   return (
     <div className="space-y-2.5">
+      <Section title="Project file">
+        <div className="flex gap-1.5">
+          <Btn className="flex-1" onClick={onSaveProject}>
+            Save project
+          </Btn>
+          <Btn className="flex-1" onClick={() => projectRef.current?.click()}>
+            Load project
+          </Btn>
+          <input
+            ref={projectRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onLoadProject(f);
+              e.target.value = "";
+            }}
+          />
+        </div>
+        <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+          {projectMsg ||
+            "The timeline and every setting as one tiny .json — keep it next to the video, it survives closed tabs and dead sessions."}
+        </p>
+      </Section>
+
       <Section title="Render">
         <div className="space-y-2">
           <Segmented
@@ -687,9 +843,41 @@ export function ExportPanel({
         </p>
       </Section>
 
-      <Section title="Record">
+      <Section title={remote ? "Render on the server" : "Record"}>
         <div className="space-y-2">
-          {exporting ? (
+          {remote ? (
+            !remote.connected ? (
+              <p className="text-[11px] leading-relaxed text-slate-400">
+                Connect the Colab backend first — the render button appears here once the preview
+                stream is up.
+              </p>
+            ) : running ? (
+              <>
+                <div className="h-2 overflow-hidden rounded-full bg-black/50 ring-1 ring-inset ring-white/10">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-teal-400 transition-[width]"
+                    style={{ width: `${Math.round((job?.progress ?? 0) * 100)}%` }}
+                  />
+                </div>
+                <p className="font-mono text-[11px] text-emerald-300">
+                  {((job?.progress ?? 0) * 100).toFixed(1)}% · rendering on the server
+                </p>
+                <p className="text-[10px] leading-relaxed text-slate-500">
+                  This tab only watches — the render keeps going if you close it. Reconnect later
+                  and the download will be waiting here.
+                </p>
+              </>
+            ) : (
+              <Btn
+                variant="primary"
+                className="w-full py-2 text-[12px]"
+                onClick={remote.onExport}
+                disabled={!duration}
+              >
+                Render {fmtTime(outDur)} on Colab
+              </Btn>
+            )
+          ) : exporting ? (
             <>
               <div className="h-2 overflow-hidden rounded-full bg-black/50 ring-1 ring-inset ring-white/10">
                 <div
@@ -709,37 +897,99 @@ export function ExportPanel({
               ● Render {fmtTime(outDur)} to file
             </Btn>
           )}
-          <p className="text-[10px] leading-relaxed text-slate-500">
-            The render plays the programme once from the top and captures the composited canvas
-            plus the processed audio bus, so it takes about as long as the video. Keep this tab
-            visible and don’t switch spaces — browsers throttle hidden tabs.
-          </p>
-          <p className="font-mono text-[10px] text-slate-600">container: {mime || "unsupported"}</p>
+          {remote && remote.error && (
+            <p className="rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+              {remote.error}
+            </p>
+          )}
+          {remote && job?.state === "error" && (
+            <p className="rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
+              Render failed: {job.error ?? "unknown error"}
+            </p>
+          )}
+          {remote && job?.state === "done" && job.files.mp4 && (
+            <div className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 p-2">
+              <a
+                href={remote.fileUrl(job.files.mp4)}
+                download={job.files.mp4}
+                className="block rounded-lg border border-emerald-400/40 bg-emerald-500/20 px-2.5 py-1.5 text-center text-[11px] font-semibold text-emerald-100 hover:bg-emerald-500/30"
+              >
+                ↓ Download {job.files.mp4}
+              </a>
+              {job.files.webm && (
+                <a
+                  href={remote.fileUrl(job.files.webm)}
+                  download={job.files.webm}
+                  className="mt-1.5 block text-center text-[10px] text-emerald-300/80 underline hover:text-emerald-200"
+                >
+                  {job.files.webm} instead
+                </a>
+              )}
+              <p className="mt-1.5 text-[10px] leading-relaxed text-slate-400">
+                H.264 + AAC in MP4 — uploads to YouTube and Patreon directly. The file also stays
+                in the notebook’s output folder.
+              </p>
+            </div>
+          )}
+          {remote && job && job.log.length > 0 && (
+            <pre className="max-h-32 overflow-y-auto rounded-lg border border-white/10 bg-black/40 p-2 font-mono text-[10px] leading-relaxed text-slate-400">
+              {job.log.slice(-12).join("\n")}
+            </pre>
+          )}
+          {!remote && (
+            <>
+              <p className="text-[10px] leading-relaxed text-slate-500">
+                The render plays the programme once from the top and captures the composited canvas
+                plus the processed audio bus, so it takes about as long as the video. Keep this tab
+                visible and don’t switch spaces — browsers throttle hidden tabs.
+              </p>
+              <p className="font-mono text-[10px] text-slate-600">container: {mime || "unsupported"}</p>
+            </>
+          )}
         </div>
       </Section>
 
       <Section title="Where the work happens">
-        <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
-          <li>
-            <span className="text-slate-200">All local, nothing uploaded.</span> The browser
-            streams your 3 GB file straight off the disk, composites frames on a canvas and encodes
-            with MediaRecorder. No server is involved at any point.
-          </li>
-          <li>
-            <span className="text-slate-200">WebM uploads fine.</span> YouTube accepts WebM
-            (VP9 + Opus) natively alongside MP4 and re-encodes everything on ingest, so there is no
-            penalty for handing it a .webm.
-          </li>
-          <li>
-            <span className="text-slate-200">Output is much smaller.</span> You render 1080p at the
-            bitrate above — typically a fraction of the OBS original, so the upload is far quicker
-            than re-uploading the source.
-          </li>
-          <li>
-            <span className="text-slate-200">Chrome or Edge only.</span> Safari can neither decode
-            WebM/Opus nor run the mic scanner.
-          </li>
-        </ul>
+        {remote ? (
+          <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+            <li>
+              <span className="text-slate-200">Preview here, render there.</span> This tab shows a
+              lightweight proxy stream; the timeline, layout and audio settings you see are sent to
+              the server as a project file.
+            </li>
+            <li>
+              <span className="text-slate-200">Full quality from the original.</span> The server
+              renders from the full-resolution source on its own disk — nothing uploads from your
+              machine at any point.
+            </li>
+            <li>
+              <span className="text-slate-200">MP4 straight back.</span> The finished file
+              downloads through the same tunnel and also stays in the notebook’s output folder.
+            </li>
+          </ul>
+        ) : (
+          <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+            <li>
+              <span className="text-slate-200">All local, nothing uploaded.</span> The browser
+              streams your 3 GB file straight off the disk, composites frames on a canvas and encodes
+              with MediaRecorder. No server is involved at any point.
+            </li>
+            <li>
+              <span className="text-slate-200">WebM uploads fine.</span> YouTube accepts WebM
+              (VP9 + Opus) natively alongside MP4 and re-encodes everything on ingest, so there is no
+              penalty for handing it a .webm.
+            </li>
+            <li>
+              <span className="text-slate-200">Output is much smaller.</span> You render 1080p at the
+              bitrate above — typically a fraction of the OBS original, so the upload is far quicker
+              than re-uploading the source.
+            </li>
+            <li>
+              <span className="text-slate-200">Chrome or Edge only.</span> Safari can neither decode
+              WebM/Opus nor run the mic scanner.
+            </li>
+          </ul>
+        )}
       </Section>
 
       {resultUrl && (
