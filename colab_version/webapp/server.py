@@ -132,17 +132,80 @@ def ensure_proxy(proc, width: int = 960,
 # cloudflare quick tunnel (no account)
 # ---------------------------------------------------------------------------
 
+def _binary_ok(exe: str) -> bool:
+    """True if *exe* actually runs (catches partial/broken downloads)."""
+    try:
+        p = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                           timeout=15)
+        return p.returncode == 0 and "cloudflared" in (p.stdout + p.stderr)
+    except Exception:
+        return False
+
+
+def _download(exe: Path, url: str) -> None:
+    """Download *url* to *exe* via curl, then wget, then urllib (in that
+    order — curl is what Colab always has and handles GitHub's S3 release
+    redirects most reliably). Raises RuntimeError with the last error seen."""
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    tmp = exe.with_suffix(exe.suffix + ".part")
+    errors: List[str] = []
+    if shutil.which("curl"):
+        for attempt in (1, 2):
+            p = subprocess.run(
+                ["curl", "-fL", "--retry", "2", "--retry-delay", "2",
+                 "--max-time", "600", "-o", str(tmp), url],
+                capture_output=True, text=True)
+            if p.returncode == 0 and tmp.exists() and tmp.stat().st_size > 5_000_000:
+                break
+            tmp.unlink(missing_ok=True)
+            errors.append(f"curl: {(p.stderr or 'failed').strip()[-200:]}")
+    if not (tmp.exists() and tmp.stat().st_size > 5_000_000) and shutil.which("wget"):
+        p = subprocess.run(
+            ["wget", "-q", "--tries=2", "--timeout=60", "-O", str(tmp), url],
+            capture_output=True, text=True)
+        if p.returncode == 0 and tmp.exists() and tmp.stat().st_size > 5_000_000:
+            pass
+        else:
+            tmp.unlink(missing_ok=True)
+            errors.append(f"wget: {(p.stderr or 'failed').strip()[-200:]}")
+    if not (tmp.exists() and tmp.stat().st_size > 5_000_000):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            if not (tmp.exists() and tmp.stat().st_size > 5_000_000):
+                raise RuntimeError("download too small")
+        except Exception as e:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            errors.append(f"urllib: {e}")
+    if not (tmp.exists() and tmp.stat().st_size > 5_000_000):
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("cloudflared download failed:\n    " +
+                           "\n    ".join(errors[-3:]))
+    tmp.replace(exe)
+    exe.chmod(0o755)
+
+
 def ensure_cloudflared() -> str:
     if shutil.which("cloudflared"):
-        return str(shutil.which("cloudflared"))
+        exe = str(shutil.which("cloudflared"))
+        if _binary_ok(exe):
+            return exe
+        print(f"  (ignoring broken cloudflared in PATH: {exe})")
     if CLOUDFLARED.exists():
-        return str(CLOUDFLARED)
-    CLOUDFLARED.parent.mkdir(parents=True, exist_ok=True)
+        if _binary_ok(str(CLOUDFLARED)):
+            return str(CLOUDFLARED)
+        print("  (removing broken cloudflared binary — re-downloading …)")
+        CLOUDFLARED.unlink(missing_ok=True)
     url = ("https://github.com/cloudflare/cloudflared/releases/latest/download/"
            "cloudflared-linux-amd64")
-    print(f"Downloading cloudflared (~30 MB) …")
-    urllib.request.urlretrieve(url, str(CLOUDFLARED))
-    CLOUDFLARED.chmod(0o755)
+    print("Downloading cloudflared (~30 MB) …")
+    _download(CLOUDFLARED, url)
+    if not _binary_ok(str(CLOUDFLARED)):
+        CLOUDFLARED.unlink(missing_ok=True)
+        raise RuntimeError(
+            "cloudflared downloaded but does not run (file corrupted or\n"
+            "blocked by the network). Re-run the cell to retry; if it\n"
+            "persists the launch will try the built-in fallback tunnel.")
     return str(CLOUDFLARED)
 
 
@@ -189,10 +252,76 @@ def start_tunnel(port: int, timeout: float = 90.0,
             p.terminate()
         except Exception:
             pass
-        raise RuntimeError("cloudflared did not print a tunnel URL in time. "
-                           "Re-run the cell; if it persists, Colab may be "
-                           "blocking outbound tunnels right now.")
+        tail = " | ".join(l for l in _log[-6:] if l.strip()) or "(no output — the binary may be broken or blocked)"
+        raise RuntimeError(
+            "cloudflared did not print a tunnel URL in time.\n"
+            f"    cloudflared said: {tail}\n"
+            "Re-run the cell; if it persists, Colab may be blocking "
+            "outbound tunnels right now (the launch will also try the\n"
+            "built-in fallback tunnel).")
     # drain output in background so the pipe never blocks the tunnel
+    def _drain():
+        try:
+            for line in p.stdout:
+                _note(line)
+        except Exception:
+            pass
+    threading.Thread(target=_drain, daemon=True).start()
+    return url, p
+
+
+def start_fallback_tunnel(port: int, timeout: float = 60.0,
+                          ssh_port: int = 443,
+                          _log: Optional[List[str]] = None) -> Tuple[str, subprocess.Popen]:
+    """Fallback quick tunnel: ssh -R to localhost.run (no account needed).
+
+    Used automatically when Cloudflare's quick tunnel can't get out — Colab
+    blocks different egress paths at different times, and SSH over 443 to
+    localhost.run is the classic workaround. Colab ships an ssh client.
+    """
+    if not shutil.which("ssh"):
+        raise RuntimeError("no ssh client found (fallback tunnel needs it)")
+    if _log is None:
+        _log = []
+    args = ["ssh", "-N", "-p", str(ssh_port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=20",
+            f"-R 80:localhost:{port}", "nokey@localhost.run"]
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1)
+    assert p.stdout is not None
+    url = None
+    pat = re.compile(r"https://[A-Za-z0-9-]+\.(?:lhr\.life|loca\.lt|localhost\.run)")
+
+    def _note(line: str):
+        _log.append(line.rstrip())
+        del _log[:-60]
+
+    killer = threading.Timer(timeout, lambda: p.poll() is None and p.kill())
+    killer.daemon = True
+    killer.start()
+    try:
+        for line in p.stdout:
+            _note(line)
+            m = pat.search(line)
+            if m:
+                url = m.group(0)
+                break
+    finally:
+        killer.cancel()
+    if url is None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        tail = " | ".join(l for l in _log[-6:] if l.strip()) or "(no output)"
+        raise RuntimeError(
+            "localhost.run did not hand out a URL in time.\n"
+            f"    ssh said: {tail}")
+
     def _drain():
         try:
             for line in p.stdout:
@@ -686,16 +815,34 @@ def launch_webapp(proc, port: int = 8000, tunnel: bool = True,
         return info
 
     _kill_proc(reg.get("tunnel_proc"))  # never stack tunnels on re-runs
-    url, tp, log = None, None, []
-    for attempt, proto in enumerate([None, "http2"], start=1):
+
+    # Each entry: (label, start-fn) — tried in order until one verifies.
+    attempts: List[Tuple[str, Any]] = [
+        ("Cloudflare quick tunnel (default transport)",
+         lambda log: start_tunnel(port, _log=log)),
+        ("Cloudflare quick tunnel (http2 transport)",
+         lambda log: start_tunnel(port, protocol="http2", _log=log)),
+        ("Fallback tunnel via ssh → localhost.run (port 443, no account)",
+         lambda log: start_fallback_tunnel(port, ssh_port=443, _log=log)),
+        ("Fallback tunnel via ssh → localhost.run (port 22, no account)",
+         lambda log: start_fallback_tunnel(port, ssh_port=22, _log=log)),
+    ]
+    url, tp, last_log = None, None, []
+    download_error: Optional[Exception] = None
+    for label, starter in attempts:
         _kill_proc(tp)
-        log = []
+        last_log = []
+        print(f"Starting {label} …")
         try:
-            print(f"Starting tunnel "
-                  f"(attempt {attempt}{', transport http2' if proto else ''}) …")
-            url, tp = start_tunnel(port, protocol=proto, _log=log)
-        except Exception as e:
-            print(f"  tunnel did not start: {e}")
+            url, tp = starter(last_log)
+        except RuntimeError as e:
+            print(f"  ✗ {e}")
+            url = None
+            if "download" in str(e):
+                download_error = e
+            continue
+        except Exception as e:  # noqa: BLE001
+            print(f"  ✗ unexpected: {type(e).__name__}: {e}")
             url = None
             continue
         if not verify:
@@ -703,16 +850,23 @@ def launch_webapp(proc, port: int = 8000, tunnel: bool = True,
         print(f"  got {url} — checking it really serves traffic …")
         ok, err = _verify_public(url)
         if ok:
-            print("  tunnel verified: reachable from the outside.")
+            print("  ✓ tunnel verified: reachable from the outside.")
             break
-        print(f"  not reachable ({err})")
+        print(f"  ✗ not reachable ({err})")
         url = None
     if url is None:
         print()
-        print("The tunnel is not reachable from the outside. "
-              "Last cloudflared log lines:")
-        for line in log[-12:]:
-            print("   |", line)
+        print("None of the tunnels could be verified from the outside. "
+              "The web site therefore won't open for now.")
+        if last_log:
+            print("Last tunnel log lines:")
+            for line in last_log[-8:]:
+                print("   |", line)
+        if download_error is not None:
+            print()
+            print("The cloudflared download itself failed, which usually "
+                  "means this session's network blocked GitHub releases.")
+            print("Try:  !curl -fL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64  # then re-run this cell")
         print()
         print("Things to try, in order:")
         print("  1. Just re-run this cell (fresh tunnel + fresh edge).")
