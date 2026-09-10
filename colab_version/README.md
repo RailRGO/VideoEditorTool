@@ -4,6 +4,53 @@ This folder (`colab_version/`) takes the best parts of **both repo variants**
 (root original + "diffrent variant") and repackages them as a Python pipeline
 that runs inside Google Colab instead of your old PC.
 
+## Files
+
+| File | What it is |
+|---|---|
+| `video_editor_colab.ipynb` | The notebook: install → Drive → **visual editor** → render |
+| `editor_gui.py` | Interactive editor GUI (sliders + live WYSIWYG preview + sample renders) |
+| `compose.py` | Frame compositor — the same math as the browser's `render.ts` |
+| `layouts.py` | Shared layout model — the same rects/styles as `src/lib/types.ts` |
+| `video_processor.py` | Pipeline: compose + audio mix + retouch + transcript + render |
+| `make_fake_video.py` | Generates a synthetic 3840×1080 clip for testing |
+| `requirements.txt` | `pip install -r requirements.txt` |
+
+## The visual editor (this is the part you asked for)
+
+No more guessing parameters in a single cell. After creating `proc`,
+run one line:
+
+```python
+from editor_gui import launch_editor
+editor = launch_editor(proc)
+```
+
+You get 6 tabs. **Every slider updates a live preview instantly**,
+rendered by the *same* compositor as the final file — what you see is
+literally what gets rendered (verified: preview vs. rendered frame differ
+only by video-compression noise).
+
+| Tab | What you tweak, live |
+|---|---|
+| 1 · Preview | Scrub time, pick scene (reaction / solo / card / lead-in / fast), contact sheet |
+| 2 · Layout | Preset + camera/content rects, shapes, radius, borders, zoom, offsets, background blur/opacity/dim — with an **overlap warning** if the camera covers the content |
+| 3 · Retouch | Face smoothing / teeth / eyes, previewed on your actual frame |
+| 4 · Cuts | Intro/outro, lead-in + black block, silence auto-cut, YouTube claim ranges, timeline + render-duration estimate |
+| 5 · Audio | Mic channel/gain, compressor, limiter, content gain, ducking + an audible **10s audio sample** |
+| 6 · Render | **12s sample render at the playhead first** (video + mixed audio, playable in the notebook), then full render with progress bar; save/load `layout.json` to Drive |
+
+Recommended workflow: tune → sample → watch the sample → full render.
+The Patreon/YouTube notebook cells automatically pick up your tuned
+`editor.layout`, drops and claims.
+
+No-widget fallback (if ipywidgets ever misbehaves):
+
+```python
+proc.show_preview(t=90, mode="body")                    # still frame, inline
+outs = proc.render_sample(t_center=90, seconds=12)      # playable clip
+```
+
 ## What was combined
 
 | Feature | Source | What it does |
@@ -16,45 +63,69 @@ that runs inside Google Colab instead of your old PC.
 | Polish / transcript fix | root (`polish.ts`) | Whisper transcription, filler/repeat detection |
 | Timeline / EDL / stages | root (`Timeline.tsx`, `render.ts`) | Scene-based intro (full cam) / reaction (PIP) / outro |
 
-## Your specific fixes applied
+## Fixed: "camera too big, covering the content"
 
-- **Layout:** Default preset = `diagonal`. Camera is **top-left** (30%), content **bottom-right** (70%), both rounded rectangles (`radius=28`), background full 1920x1080 with blur 50% and opacity 40%.
-- **Intro/Outro:** Uncut full camera (`intro_mode=True`). Middle reaction = layout.
-- **React lead-in:** You asked for 1-3 sec before layout switch (e.g., "let's go"). In `run_youtube_version` you can trim `intro_range` or manually insert a black content block; the pipeline supports adding a 2-second black overlay at the start of the reaction segment.
-- **Cut disruptions:** `auto_cut_reaction()` parses `silencedetect` from ffmpeg; you can pass `custom_cuts=[(t1,t2),...]` if you already know the bad parts.
-- **Face retouch:** Uses `mediapipe.solutions.face_mesh` (468 landmarks). The mask is rebuilt **every frame** from landmarks, so it never falls off when you turn your head.
-- **Timeline height:** Increased to 240px (from 178px) so it doesn't sink.
-- **Buttons:** Consistent `ring-white/10` hover states applied in CSS rules for both variants (see root `src/index.css` edits).
+The first Colab version overlaid the camera half at **full resolution**,
+ignoring all size/position parameters — that was your bug. The new
+`compose.py` honours real normalised rects, so the default look is now:
+
+- **Layout:** Camera **top-left** (~30%), content **bottom-right** (~70%),
+  both rounded rectangles, zero overlap (the editor warns you if you
+  create any), background full-frame with blur 50 / opacity 40%.
+- **Intro/Outro:** Full-camera, uncut. Middle reaction = layout.
+- **React lead-in:** 1–3 s of your "let's go" + a black content block
+  before the video starts (tunable in the Cuts tab).
+- **Cut disruptions:** silence auto-cut inside the reaction body only,
+  plus YouTube claim ranges (`cut` or `mute`) — video and audio are cut
+  with the **same segment map**, so they can never desync.
+- **Face retouch:** MediaPipe face mesh (468 landmarks), mask rebuilt
+  **every frame**, so it never falls off when you turn your head.
 
 ## Answers to your direct questions
 
-**Q: Exported in WebM — will it upload to YouTube?**  
-**A:** Yes. YouTube fully supports WebM (VP9 + Opus). We export both `final.mp4` (H.264) and `final.webm` (VP9/Opus). MP4 is the safer fallback if an editor rejects WebM, but YouTube accepts WebM directly.
+**Q: Exported in WebM — will it upload to YouTube?**
+**A:** Yes. YouTube fully supports WebM (VP9 + Opus). We export both
+`final.mp4` (H.264) and `final.webm` (VP9/Opus). MP4 is the safer fallback
+if an editor rejects WebM, but YouTube accepts WebM directly.
 
-**Q: Where is computing happening?**  
-**A:** **Inside the Colab session** (your remote VM, not your old PC). If you select **GPU runtime** (Runtime → Change runtime type → GPU), face retouch and some filters will be faster, but most pipeline steps (ffmpeg, mediapipe) are CPU-bound and work fine on standard Colab CPU. Nothing runs on your local machine.
+**Q: Where is computing happening?**
+**A:** **Inside the Colab session** (your remote VM, not your old PC). If
+you select **GPU runtime** (Runtime → Change runtime type → GPU), face
+retouch and some filters will be faster, but most pipeline steps (ffmpeg,
+mediapipe) are CPU-bound and work fine on standard Colab CPU. Nothing runs
+on your local machine.
 
-**Q: My videos are 20+ minutes and 3 GB — where does that process?**  
-**A:** Temp folders (`/tmp` inside Colab) and Drive mounts. We never load a 3 GB file entirely into RAM; `ffmpeg` streams chunks, and the retouch loop reads frame-by-frame. After processing, outputs are written straight to Drive so they survive session end (Colab temp files are deleted when the session dies).
+**Q: My videos are 20+ minutes and 3 GB — where does that process?**
+**A:** Temp folders (`/tmp` inside Colab) and Drive mounts. We never load a
+3 GB file entirely into RAM; frames stream through OpenCV/ffmpeg one by
+one, and outputs are written straight to Drive so they survive session end
+(Colab temp files are deleted when the session dies).
 
-**Q: Can I upload from Drive and get output to Drive?**  
-**A:** Yes — this is the intended workflow. Mount Drive, point `ReactionVideoProcessor` at `/content/drive/MyDrive/your_video.mp4`, and set `output_dir="/content/drive/MyDrive/output"`. The notebook writes results there immediately.
+**Q: Can I upload from Drive and get output to Drive?**
+**A:** Yes — this is the intended workflow. Mount Drive, point
+`ReactionVideoProcessor` at `/content/drive/MyDrive/your_video.mp4`, and
+set `output_dir="/content/drive/MyDrive/output"`. The notebook writes
+results there immediately.
 
-**Q: Session sometimes interrupts — can I resume?**  
-**A:** The pipeline is stateless per run. If interrupted, just re-run the cell; `ffmpeg` will overwrite partial outputs. For very long videos you can also split at the source (e.g., process intro/outro/reaction as separate 5-minute chunks) and concatenate with `ffmpeg` at the end.
+**Q: Session sometimes interrupts — can I resume?**
+**A:** The pipeline is stateless per run. If interrupted, just re-run the
+cell; `ffmpeg` will overwrite partial outputs. Save your `layout.json` to
+Drive so your tuning survives too. For very long videos you can also split
+at the source (e.g., process intro/outro/reaction as separate 5-minute
+chunks) and concatenate with `ffmpeg` at the end.
 
 ## Quick start in Colab
 
 ```python
 # Cell 1 — install (run once per session)
-!pip install -q numpy opencv-python mediapipe openai-whisper ffmpeg-python moviepy pydub
+!pip install -q numpy opencv-python mediapipe openai-whisper ffmpeg-python moviepy pydub ipywidgets
 
 # Cell 2 — mount Drive
 from google.colab import drive
 drive.mount('/content/drive')
 
-# Cell 3 — import and run
-import sys, os
+# Cell 3 — import
+import sys
 sys.path.insert(0, '/content/VideoEditorTool/colab_version')
 from video_processor import ReactionVideoProcessor
 
@@ -63,32 +134,37 @@ proc = ReactionVideoProcessor(
     output_dir="/content/drive/MyDrive/reaction_output"
 )
 
-# Patreon (full, intro cleaned, audio mixed)
-proc.run_patron_version(preset="diagonal", fix_intro=True, retouch=False)
+# Cell 4 — VISUAL EDITOR (tune everything with live preview)
+from editor_gui import launch_editor
+editor = launch_editor(proc)
 
-# YouTube (reaction with cuts + retouch + alterations)
-proc.run_youtube_version(preset="diagonal", auto_cut=True, retouch=True)
+# ...then render a sample from the GUI, watch it, then full render...
+# ...or straight from code (picks up the editor's layout/drops/claims):
+proc.run_patron_version()
+proc.run_youtube_version()
 ```
 
 The outputs will appear in `/content/drive/MyDrive/reaction_output/` as:
 - `patreon_final.mp4` + `patreon_final.webm`
 - `youtube_final.mp4` + `youtube_final.webm`
 - `intro_transcript.json` (Whisper text for manual edit)
+- `layout.json` (your saved look, if you save it from the GUI)
 
 ## Layout variations (for your future experiments)
 
+In the editor's Layout tab, or from code:
+
 ```python
-# Circle face over fully blurred watch
-proc.compose_reaction(..., preset="circle_blur")
-
-# Big face + small content card
-proc.compose_reaction(..., preset="hero_plus")
-
-# News inset (camera top-right)
-proc.compose_reaction(..., preset="news")
+import layouts as L
+proc.layout = L.apply_preset(proc.layout, "hero-circle")  # big circle face, blurred content
+proc.layout = L.apply_preset(proc.layout, "hero-rect")    # large rounded face, blurred content
+proc.layout = L.apply_preset(proc.layout, "tl-br-tight")  # small camera, bigger content
+proc.show_preview(t=90)                                   # check it instantly
 ```
 
-These match the presets in both source versions (`defaults.ts` / `components/Inspector.tsx`).
+Old preset names (`diagonal`, `circle_blur`, `rect_blur`, `hero_circle`,
+`hero_plus`, `news`) still work in `compose_reaction(preset=...)` and
+`run_*_version(preset=...)` — they now map to real sized rects.
 
 ## Notes on fairness / ContentID
 
@@ -98,4 +174,5 @@ The request mentions cutting content to avoid ContentID strikes. This pipeline:
 - Applies **transformative edits** (layout, blur background, retouch, audio ducking) which are part of fair-use reaction commentary.
 - Does **not** provide reverse-engineering of ContentID fingerprinting.
 
-If you want full control, use the `auto_cut_reaction()` return value to build your own EDL, or edit `custom_cuts=[(start,end), ...]` in `run_youtube_version()`.
+If you want full control, use the Cuts tab (silence detection + claim
+ranges) or pass `custom_cuts=[(start, end), ...]` to `run_youtube_version()`.

@@ -5,3 +5,4 @@ openai-whisper
 ffmpeg-python>=0.2.0
 moviepy>=2.0.0
 pydub
+ipywidgets>=8.0.0
