@@ -24,6 +24,7 @@ import json
 import mimetypes
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -44,6 +45,34 @@ import layouts as L  # noqa: E402
 
 INDEX_HTML = HERE / "index.html"
 CLOUDFLARED = Path.home() / ".local" / "bin" / "cloudflared"
+
+# Live servers in THIS kernel: port -> {"server", "app", "tunnel_proc", "public"}.
+# Lets re-running the launch cell reuse the server (and its state) instead of
+# crashing with "Address already in use".
+_SERVERS: Dict[int, Dict[str, Any]] = {}
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+def _is_ours_alive(port: int) -> bool:
+    """Is OUR editor server currently answering on this port?"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state",
+                                    timeout=4) as r:
+            if r.status != 200:
+                return False
+            d = json.load(r)
+            return isinstance(d, dict) and "layout" in d and "segments" in d
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -117,22 +146,38 @@ def ensure_cloudflared() -> str:
     return str(CLOUDFLARED)
 
 
-def start_tunnel(port: int, timeout: float = 90.0) -> Tuple[str, subprocess.Popen]:
-    """Start a quick tunnel; return (public_url, process)."""
+def start_tunnel(port: int, timeout: float = 90.0,
+                 protocol: Optional[str] = None,
+                 _log: Optional[List[str]] = None) -> Tuple[str, subprocess.Popen]:
+    """Start a quick tunnel; return (public_url, process).
+
+    *protocol* forces cloudflared's transport ("http2" is the fallback when
+    the default QUIC can't get out). cloudflared's recent log lines are
+    appended to *_log* (for diagnostics when the tunnel won't come up).
+    """
     exe = ensure_cloudflared()
-    p = subprocess.Popen([exe, "tunnel", "--url", f"http://127.0.0.1:{port}",
-                          "--no-autoupdate"],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    args = [exe, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"]
+    if protocol:
+        args += ["--protocol", protocol]
+    if _log is None:
+        _log = []
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
     assert p.stdout is not None
     url = None
     pat = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com")
+
+    def _note(line: str):
+        _log.append(line.rstrip())
+        del _log[:-60]
+
     # readline() blocks, so enforce the timeout with a killer timer instead
     killer = threading.Timer(timeout, lambda: p.poll() is None and p.kill())
     killer.daemon = True
     killer.start()
     try:
         for line in p.stdout:
+            _note(line)
             m = pat.search(line)
             if m:
                 url = m.group(0)
@@ -150,12 +195,36 @@ def start_tunnel(port: int, timeout: float = 90.0) -> Tuple[str, subprocess.Pope
     # drain output in background so the pipe never blocks the tunnel
     def _drain():
         try:
-            for _ in p.stdout:
-                pass
+            for line in p.stdout:
+                _note(line)
         except Exception:
             pass
     threading.Thread(target=_drain, daemon=True).start()
     return url, p
+
+
+def _verify_public(url: str, timeout: float = 60.0) -> Tuple[bool, str]:
+    """Poll the PUBLIC url until it serves our API (or give up).
+
+    A printed tunnel URL is not always reachable yet (or at all, on a bad
+    edge) — we only show the user a URL that demonstrably works.
+    """
+    deadline = time.time() + timeout
+    last_err = "no attempt made"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url + "/api/state", timeout=10) as r:
+                if r.status == 200:
+                    d = json.load(r)
+                    if isinstance(d, dict) and "layout" in d:
+                        return True, ""
+                    last_err = "unexpected reply body"
+                else:
+                    last_err = f"HTTP {r.status}"
+        except Exception as e:  # noqa: BLE001 — reported, then retried
+            last_err = f"{type(e).__name__}: {e}".strip()[:160]
+        time.sleep(4)
+    return False, last_err
 
 
 # ---------------------------------------------------------------------------
@@ -532,42 +601,138 @@ def serve_forever(proc, port: int = 8000,
 
     threading.Thread(target=_proxy_worker, daemon=True).start()
 
-    Handler.app = app
+    # per-server Handler subclass so two servers (two videos/ports) never
+    # share one App through the class attribute
+    handler_cls = type(f"Handler{port}", (Handler,), {"app": app})
     # must bind all interfaces so the tunnel can reach it
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"Web editor serving on 0.0.0.0:{port}")
     return httpd, app
 
 
+def stop_webapp(port: int = 8000) -> None:
+    """Shut down a launched server and its tunnel (frees the port)."""
+    reg = _SERVERS.pop(port, None)
+    if reg is None:
+        print(f"No tracked server on port {port}.")
+        return
+    tp = reg.get("tunnel_proc")
+    if tp is not None and tp.poll() is None:
+        try:
+            tp.terminate()
+        except Exception:
+            pass
+    try:
+        reg["server"].shutdown()
+        reg["server"].server_close()
+    except Exception:
+        pass
+    print(f"Stopped web server on port {port}.")
+
+
+def _kill_proc(p) -> None:
+    if p is not None and p.poll() is None:
+        try:
+            p.terminate()
+            p.wait(timeout=5)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
 def launch_webapp(proc, port: int = 8000, tunnel: bool = True,
-                  proxy_width: int = 960) -> Dict[str, Any]:
+                  proxy_width: int = 960, verify: bool = True) -> Dict[str, Any]:
     """Start the server (+ tunnel) and print the URL to open.
+
+    Safe to re-run: a live server on *port* is reused (state kept) and only
+    the tunnel is renewed. The printed URL is verified to serve traffic
+    before it is shown; if the default transport fails, HTTP/2 is tried.
 
     Returns {"local": ..., "public": ..., "server": ..., "app": ...}.
     In Colab, open the *public* URL in a new browser tab.
     """
-    httpd, app = serve_forever(proc, port, proxy_width)
+    if port in _SERVERS and _is_ours_alive(port):
+        old_proc = _SERVERS[port]["app"].proc
+        if str(getattr(old_proc, "input", "")) != str(proc.input):
+            print("Different video than the running server — "
+                  "restarting the server for the new file.")
+            stop_webapp(port)
+        else:
+            print(f"Server already running on port {port} — reusing it "
+                  f"(your layout/cuts/state are kept).")
+    if port not in _SERVERS or not _is_ours_alive(port):
+        _SERVERS.pop(port, None)
+        use_port = port
+        for _ in range(10):
+            if _port_free(use_port):
+                break
+            use_port += 1
+        if use_port != port:
+            print(f"Port {port} is busy (not ours) — using port {use_port}.")
+            port = use_port
+        httpd, app = serve_forever(proc, port, proxy_width)
+        _SERVERS[port] = {"server": httpd, "app": app,
+                          "tunnel_proc": None, "public": None}
+
+    reg = _SERVERS[port]
     info: Dict[str, Any] = {"local": f"http://127.0.0.1:{port}",
-                            "public": None, "server": httpd, "app": app}
-    if tunnel:
-        try:
-            url, tunnel_proc = start_tunnel(port)
-            info["public"] = url
-            info["tunnel_proc"] = tunnel_proc
-            print()
-            print("=" * 64)
-            print("  OPEN THIS URL IN A NEW BROWSER TAB:")
-            print(f"  {url}")
-            print("=" * 64)
-            print("Keep this cell running. The link dies with the session —")
-            print("re-run to get a fresh one. Anyone with the link can view,")
-            print("so don't share it publicly.")
-        except Exception as e:
-            print(f"Tunnel failed ({e}). You can still use the in-cell editor:")
-            print("  from editor_gui import launch_editor; launch_editor(proc)")
-    else:
+                            "public": None, "server": reg["server"],
+                            "app": reg["app"]}
+    if not tunnel:
         print(f"Serving locally: {info['local']}")
+        return info
+
+    _kill_proc(reg.get("tunnel_proc"))  # never stack tunnels on re-runs
+    url, tp, log = None, None, []
+    for attempt, proto in enumerate([None, "http2"], start=1):
+        _kill_proc(tp)
+        log = []
+        try:
+            print(f"Starting tunnel "
+                  f"(attempt {attempt}{', transport http2' if proto else ''}) …")
+            url, tp = start_tunnel(port, protocol=proto, _log=log)
+        except Exception as e:
+            print(f"  tunnel did not start: {e}")
+            url = None
+            continue
+        if not verify:
+            break
+        print(f"  got {url} — checking it really serves traffic …")
+        ok, err = _verify_public(url)
+        if ok:
+            print("  tunnel verified: reachable from the outside.")
+            break
+        print(f"  not reachable ({err})")
+        url = None
+    if url is None:
+        print()
+        print("The tunnel is not reachable from the outside. "
+              "Last cloudflared log lines:")
+        for line in log[-12:]:
+            print("   |", line)
+        print()
+        print("Things to try, in order:")
+        print("  1. Just re-run this cell (fresh tunnel + fresh edge).")
+        print("  2. Runtime → Restart session, then run cells 1→3c again.")
+        print("  3. Use the in-cell editor instead (no tunnel needed):")
+        print("       from editor_gui import launch_editor; launch_editor(proc)")
+        return info
+
+    reg["tunnel_proc"] = tp
+    reg["public"] = url
+    info["public"] = url
+    info["tunnel_proc"] = tp
+    print()
+    print("=" * 64)
+    print("  OPEN THIS URL IN A NEW BROWSER TAB (verified working):")
+    print(f"  {url}")
+    print("=" * 64)
+    print("Re-running this cell is safe: it keeps the server and makes a")
+    print("fresh tunnel. The link dies with the session. Anyone with the")
+    print("link can view, so don't share it publicly.")
     return info
 
 

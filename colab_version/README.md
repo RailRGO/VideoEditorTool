@@ -40,6 +40,21 @@ Notes: keep the cell running while you edit; the link dies with the
 session (re-run for a fresh one); anyone with the link can view, so
 don't share it publicly.
 
+**Troubleshooting the tunnel link.** The printed URL is reachability-
+checked before it's shown, so if you see one, it works. If the launch
+instead reports the tunnel isn't reachable:
+1. Just re-run the cell — you get a fresh tunnel and edge; re-running
+   is safe (the server and your layout/cuts/state are kept).
+2. `Runtime → Restart session`, then run cells 1→3c again.
+3. Fall back to the in-cell editor (no tunnel needed):
+   `from editor_gui import launch_editor; launch_editor(proc)`.
+4. To fully stop the server + tunnel and free the port:
+   `from webapp.server import stop_webapp; stop_webapp()`.
+
+If you previously hit `OSError: [Errno 98] Address already in use` from
+re-running the cell, that can't happen anymore — the second run reuses
+the live server instead of trying to bind the port again.
+
 ## The in-cell visual editor
 
 No more guessing parameters in a single cell. After creating `proc`,
