@@ -382,8 +382,7 @@ class App:
         self.claims: List[Tuple[float, float, str]] = []
         self.proxy_status: Dict[str, Any] = {"ready": False, "progress": 0.0,
                                              "path": None}
-        self.job: Dict[str, Any] = {"state": "idle", "progress": 0.0,
-                                    "files": {}, "error": None, "log": []}
+        self.job: Dict[str, Any] = self._fresh_job("render")
         self._job_lock = threading.Lock()
         self.proxy_width = proxy_width
         self.proxy_gen = 0  # orphaned workers (after a source switch) stand down
@@ -414,9 +413,56 @@ class App:
             "job": self.job_state(),
         }
 
+    @staticmethod
+    def _fresh_job(kind: str, state: str = "idle") -> Dict[str, Any]:
+        return {"kind": kind, "state": state, "progress": 0.0, "files": {},
+                "result": None, "error": None, "log": []}
+
     def job_state(self) -> Dict[str, Any]:
         with self._job_lock:
             return dict(self.job)
+
+    # -- speech-to-text (drives the Polish tab's Transcribe button) -----------
+    def start_transcript(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe speech spans (intro/outro) with word timings.
+
+        Shares the single job slot with renders: returns the running job when
+        busy instead of queueing, so the UI never stacks heavy work.
+        """
+        with self._job_lock:
+            if self.job["state"] == "running":
+                raise ValueError("the server is busy with another job — "
+                                 "wait for it first")
+            self.job = self._fresh_job("transcript", "running")
+
+        def log(msg):
+            with self._job_lock:
+                self.job["log"].append(msg)
+
+        def frac(d, t):
+            with self._job_lock:
+                self.job["progress"] = max(0.0, min(1.0, d / max(1e-6, t)))
+
+        spans = body.get("spans") or []
+        lang = str(body.get("lang", "auto") or "auto")
+
+        def run():
+            try:
+                if not spans:
+                    raise ValueError("no speech spans given")
+                model = str(body.get("model", "small") or "small")
+                res = self.proc.transcribe_spans(spans, lang=lang, model=model,
+                                                 progress_cb=frac)
+                with self._job_lock:
+                    self.job.update(state="done", progress=1.0, result=res)
+                log(f"{len(res['words'])} words ({res['lang']}).")
+            except Exception as e:  # noqa: BLE001 — surfaced to the UI
+                with self._job_lock:
+                    self.job.update(state="error", error=str(e)[:500])
+                log(f"ERROR: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+        return self.job_state()
 
     # -- project render (driven by the hosted React UI) -------------------------
     def start_render_project(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -429,8 +475,7 @@ class App:
         with self._job_lock:
             if self.job["state"] == "running":
                 return dict(self.job)
-            self.job = {"state": "running", "progress": 0.0, "files": {},
-                        "error": None, "log": []}
+            self.job = self._fresh_job("render", "running")
 
         def log(msg):
             with self._job_lock:
@@ -554,8 +599,7 @@ class App:
         self.drops = []
         self.claims = []
         with self._job_lock:
-            self.job = {"state": "idle", "progress": 0.0, "files": {},
-                        "error": None, "log": []}
+            self.job = self._fresh_job("render")
         self.proxy_status.update(ready=False, progress=0.0, path=None)
         self.proxy_gen += 1
         _start_proxy_worker(self, self.proxy_width)
@@ -584,8 +628,7 @@ class App:
         with self._job_lock:
             if self.job["state"] == "running":
                 return dict(self.job)
-            self.job = {"state": "running", "progress": 0.0, "files": {},
-                        "error": None, "log": []}
+            self.job = self._fresh_job("render", "running")
 
         def log(msg):
             with self._job_lock:
@@ -873,6 +916,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(job)
             elif path == "/api/job/render":
                 self._json(app.start_render_project(body))
+            elif path == "/api/job/transcript":
+                try:
+                    self._json(app.start_transcript(body))
+                except ValueError as e:
+                    self._json({"error": str(e)}, 409)
             elif path == "/api/source":
                 try:
                     self._json(app.set_input(str(body.get("name", ""))))

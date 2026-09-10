@@ -31,10 +31,17 @@ export interface RemoteProxy {
   error?: string;
 }
 
+export interface TranscriptResult {
+  words: { start: number; end: number; text: string }[];
+  lang: string;
+}
+
 export interface RemoteJob {
+  kind: "render" | "transcript";
   state: "idle" | "running" | "done" | "error";
   progress: number;
   files: Record<string, string>;
+  result: TranscriptResult | null;
   error: string | null;
   log: string[];
 }
@@ -134,6 +141,16 @@ export class RemoteClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    });
+
+  transcribe = (
+    spans: { start: number; end: number }[],
+    lang: string
+  ): Promise<RemoteJob> =>
+    this.req("/api/job/transcript", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spans, lang }),
     });
 
   job = (): Promise<RemoteJob> => this.req("/api/job");

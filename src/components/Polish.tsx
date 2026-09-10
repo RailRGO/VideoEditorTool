@@ -75,6 +75,13 @@ export default function Polish({
   onStopScan,
   onTranscriptFile,
   onTranscriptText,
+  canTranscribe,
+  trBusy,
+  trProgress,
+  trLang,
+  setTrLang,
+  onTranscribe,
+  trError,
   onApproxAlign,
   onBuildSkeleton,
   onApplyPolish,
@@ -107,6 +114,14 @@ export default function Polish({
   onStopScan: () => void;
   onTranscriptFile: (f: File) => void;
   onTranscriptText: (t: string) => void;
+  /** server speech-to-text (Colab engine): transcribes intro+outro in place */
+  canTranscribe: boolean;
+  trBusy: boolean;
+  trProgress: number;
+  trLang: string;
+  setTrLang: (v: string) => void;
+  onTranscribe: () => void;
+  trError: string;
   onApproxAlign: () => void;
   onBuildSkeleton: () => void;
   onApplyPolish: () => void;
@@ -206,9 +221,49 @@ export default function Polish({
       <Section title="2 · Transcript (optional)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
           Needed for removing <em>um</em>, <em>uh</em>, <em>like</em> and repeated words — pauses
-          and takes are caught from the audio alone. Whisper, or any tool that exports SRT / VTT /
-          JSON with timestamps, works.
+          and takes are caught from the audio alone.
         </p>
+        {canTranscribe ? (
+          <div className="mb-2 rounded-lg border border-emerald-400/25 bg-emerald-500/[0.07] p-2">
+            <div className="flex items-center gap-1.5">
+              <select
+                value={trLang}
+                disabled={trBusy}
+                onChange={(e) => setTrLang(e.target.value)}
+                className="h-7 shrink-0 rounded-lg border border-white/10 bg-black/40 px-1.5 text-[11px] text-slate-200 outline-none focus:border-emerald-400/50 disabled:opacity-50"
+                title="Spoken language"
+              >
+                <option value="auto">Auto</option>
+                <option value="ru">Русский</option>
+                <option value="en">English</option>
+              </select>
+              <Btn
+                variant="primary"
+                className="flex-1"
+                disabled={trBusy || !hasSource}
+                onClick={onTranscribe}
+              >
+                {trBusy
+                  ? `Transcribing… ${Math.round(trProgress * 100)}%`
+                  : "Transcribe intro + outro"}
+              </Btn>
+            </div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+              Runs Whisper on the server against your mic channel — only the intro/outro spans,
+              where fillers matter. Or load a file below instead.
+            </p>
+            {trError && (
+              <p className="mt-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1 text-[10px] leading-relaxed text-rose-200">
+                {trError}
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+            Whisper, or any tool that exports SRT / VTT / JSON with timestamps, works. (Connect
+            the Colab engine and this tab transcribes the intro/outro for you.)
+          </p>
+        )}
         <div className="flex gap-1.5">
           <Btn className="flex-1" onClick={() => fileRef.current?.click()}>
             Load .srt / .vtt / .json

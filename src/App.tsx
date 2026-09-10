@@ -228,6 +228,11 @@ export default function App() {
   const [micEnv, setMicEnv] = useState<Envelope | null>(null);
   const [contentEnv, setContentEnv] = useState<Envelope | null>(null);
   const [transcript, setTranscript] = useState<Transcript | null>(null);
+  const [trBusy, setTrBusy] = useState(false);
+  const [trProgress, setTrProgress] = useState(0);
+  const [trLang, setTrLang] = useState("auto");
+  const [trError, setTrError] = useState("");
+  const trToken = useRef(0);
   const [polish, setPolish] = useState<PolishRules>(defaultPolish);
   const [disruptRules, setDisruptRules] = useState<DisruptRules>(defaultDisrupt);
   const [leadCfg, setLeadCfg] = useState<LeadConfig>(defaultLead);
@@ -956,6 +961,20 @@ export default function App() {
     return () => window.clearInterval(t);
   }, [remote, remoteJob?.state]);
 
+  /* one-click connect: the notebook prints a link with ?backend=<tunnel url> */
+  const autoBackend = useRef(false);
+  useEffect(() => {
+    if (autoBackend.current) return;
+    autoBackend.current = true;
+    const q = new URLSearchParams(window.location.search).get("backend");
+    if (q) {
+      setRemoteDraft(q);
+      switchEngine("remote");
+      window.history.replaceState({}, "", window.location.pathname);
+      void connectRemote(q);
+    }
+  }, [connectRemote, switchEngine]);
+
   /* --------------------------------------------------------------- scan */
   const stopScan = useCallback(() => {
     const v = videoRef.current;
@@ -1039,6 +1058,58 @@ export default function App() {
     },
     [loadTranscript]
   );
+
+  const runTranscript = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client || trBusy) return;
+    const spans = segsRef.current
+      .filter((s) => s.type === "intro" || s.type === "outro")
+      .map((s) => ({ start: s.start, end: s.end }));
+    if (!spans.length) {
+      setTrError("No intro/outro segments on the timeline — nothing to transcribe.");
+      return;
+    }
+    const token = ++trToken.current;
+    setTrBusy(true);
+    setTrError("");
+    setTrProgress(0);
+    try {
+      await client.transcribe(spans, trLang);
+      for (;;) {
+        if (trToken.current !== token) return;
+        await sleep(2000);
+        const j = await client.job();
+        if (trToken.current !== token) return;
+        if (j.kind !== "transcript") continue;
+        setTrProgress(j.progress);
+        if (j.state === "done") {
+          if (j.result && j.result.words.length) {
+            setTranscript({
+              words: j.result.words,
+              timed: true,
+              source: `whisper (${j.result.lang})`,
+            });
+          } else {
+            setTrError("No speech detected in the intro/outro — check the mic channel.");
+          }
+          break;
+        }
+        if (j.state === "error") {
+          setTrError(j.error || "Transcription failed.");
+          break;
+        }
+      }
+    } catch (e) {
+      if (trToken.current === token) {
+        setTrError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (trToken.current === token) {
+        setTrBusy(false);
+        setTrProgress(0);
+      }
+    }
+  }, [trBusy, trLang]);
 
   const doBuildSkeleton = useCallback(() => {
     if (reactionStart === null || !duration) return;
@@ -1131,6 +1202,95 @@ export default function App() {
     a.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
+
+  /* -------------------------------------------------------- project file */
+  const [projectMsg, setProjectMsg] = useState("");
+
+  const saveProject = useCallback(() => {
+    const data = {
+      app: "reaction-studio",
+      version: 1,
+      savedAt: new Date().toISOString(),
+      sourceFile: fileName,
+      sourceDuration: duration,
+      target,
+      segments,
+      claims,
+      layout,
+      audio,
+      retouch,
+      audioCloak,
+      videoCloak,
+      cutOpts,
+      polish,
+      disruptRules,
+      leadCfg,
+      res,
+      fps,
+    };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${(fileName || "reaction").replace(/\.[^.]+$/, "")}.reaction.json`;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+    setProjectMsg(`Saved ${segments.length} segments + all settings.`);
+  }, [
+    fileName, duration, target, segments, claims, layout, audio, retouch,
+    audioCloak, videoCloak, cutOpts, polish, disruptRules, leadCfg, res, fps,
+  ]);
+
+  const loadProjectFile = useCallback(
+    (f: File) => {
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const p = JSON.parse(String(r.result ?? "")) as Record<string, unknown>;
+          if (p.app !== "reaction-studio") throw new Error("Not a Reaction Studio project file.");
+          if (p.target === "patreon" || p.target === "youtube") {
+            switchTarget(p.target as Target);
+          }
+          if (Array.isArray(p.segments) && p.segments.length) {
+            const clean = (p.segments as Segment[]).filter(
+              (s) => s && typeof s.start === "number" && typeof s.end === "number" && s.end > s.start
+            ).map((s) => ({
+              id: typeof s.id === "string" ? s.id : uid(),
+              type: (s.type in SEGMENT_META ? s.type : "body") as Segment["type"],
+              start: s.start,
+              end: s.end,
+            }));
+            setSegments(durRef.current > 0 ? normalize(clean, durRef.current) : clean);
+          }
+          if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
+          if (p.layout) setLayout(p.layout as LayoutState);
+          if (p.audio) setAudio(p.audio as AudioState);
+          if (p.retouch) setRetouch(p.retouch as Retouch);
+          if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
+          if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
+          if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
+          if (p.polish) setPolish(p.polish as PolishRules);
+          if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
+          if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
+          if (p.res === 720 || p.res === 1080) setRes(p.res);
+          if (p.fps === 24 || p.fps === 30 || p.fps === 60) setFps(p.fps);
+          setSelectedId(null);
+          setTranscript(null);
+          const src = typeof p.sourceFile === "string" && p.sourceFile ? p.sourceFile : null;
+          setProjectMsg(
+            src
+              ? `Loaded project for “${src}”.` +
+                (fileName && src !== fileName ? " Current file differs — check the timeline." : "")
+              : "Project loaded."
+          );
+        } catch (e) {
+          setProjectMsg(e instanceof Error ? e.message : "Could not read that file.");
+        }
+      };
+      r.readAsText(f);
+    },
+    [fileName, switchTarget]
+  );
 
   /* -------------------------------------------------------------- render */
   const startExport = async () => {
@@ -1447,6 +1607,13 @@ export default function App() {
                 onStopScan={stopScan}
                 onTranscriptFile={onTranscriptFile}
                 onTranscriptText={loadTranscript}
+                canTranscribe={isRemote && !!remote}
+                trBusy={trBusy}
+                trProgress={trProgress}
+                trLang={trLang}
+                setTrLang={setTrLang}
+                onTranscribe={() => void runTranscript()}
+                trError={trError}
                 onApproxAlign={() =>
                   setTranscript((t) =>
                     t ? approxAlign(t, introOutro, polish.approxWps) : t
@@ -1853,6 +2020,9 @@ export default function App() {
                 removed={removed}
                 duration={duration}
                 mime={mime}
+                onSaveProject={saveProject}
+                onLoadProject={loadProjectFile}
+                projectMsg={projectMsg}
                 remote={
                   isRemote
                     ? {

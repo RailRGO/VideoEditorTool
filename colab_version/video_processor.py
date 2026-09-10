@@ -477,6 +477,60 @@ def _apply_retouch_browser(img: np.ndarray, lm: Optional[np.ndarray],
     return img
 
 
+# ---------------------------------------------------------------------------
+# speech-to-text backends (faster-whisper preferred, openai-whisper fallback)
+# ---------------------------------------------------------------------------
+
+_FW_MODELS: Dict[str, Any] = {}
+
+
+def _pick_stt_backend() -> str:
+    try:
+        import faster_whisper  # noqa: F401
+        return "faster-whisper"
+    except ImportError:
+        pass
+    if whisper is not None:
+        return "openai-whisper"
+    raise ImportError("no speech engine installed "
+                      "(pip install faster-whisper or openai-whisper)")
+
+
+def _fw_model(name: str):
+    if name not in _FW_MODELS:
+        from faster_whisper import WhisperModel
+        try:
+            _FW_MODELS[name] = WhisperModel(name, device="auto")
+        except Exception:
+            _FW_MODELS[name] = WhisperModel(name, device="cpu",
+                                            compute_type="int8")
+    return _FW_MODELS[name]
+
+
+def _stt_words(backend: str, model: str, wav: str,
+               lang_arg: Optional[str]) -> Tuple[List[Tuple[float, float, str]],
+                                                 Optional[str]]:
+    """Transcribe one 16 kHz mono clip -> ([(start, end, text)], lang)."""
+    out: List[Tuple[float, float, str]] = []
+    if backend == "faster-whisper":
+        segments, info = _fw_model(model).transcribe(
+            wav, language=lang_arg, word_timestamps=True)
+        for seg in segments:
+            for w in getattr(seg, "words", None) or []:
+                t = (w.word or "").strip()
+                if t:
+                    out.append((float(w.start), float(w.end), t))
+        return out, getattr(info, "language", None)
+    ow = whisper.load_model(model if model != "small" else "base")
+    res = ow.transcribe(wav, language=lang_arg or None, word_timestamps=True)
+    for seg in res.get("segments", []):
+        for w in seg.get("words", []) or []:
+            t = (w.get("word") or w.get("text") or "").strip()
+            if t and w.get("start") is not None:
+                out.append((float(w["start"]), float(w.get("end", w["start"])), t))
+    return out, res.get("language")
+
+
 # ===========================================================================
 class ReactionVideoProcessor:
     def __init__(self, input_path, work_dir=None, output_dir=None,
@@ -1277,6 +1331,66 @@ class ReactionVideoProcessor:
         return window[0] + first_end
 
     # ------------------------------------------------------------- transcript
+    def transcribe_spans(self, spans: List[Dict[str, Any]], lang: str = "auto",
+                         model: str = "small", bus: str = "mic",
+                         progress_cb=None) -> Dict[str, Any]:
+        """Speech-to-text with word timings over selected spans (intro/outro).
+
+        faster-whisper is preferred (fast on GPU, good Russian), openai-whisper
+        is the fallback. Each span is read from the *bus* (your mic by default,
+        so content audio doesn't pollute the words) as 16 kHz mono. Returns
+        {"words": [{start, end, text}], "lang": ...} with absolute source times.
+        """
+        clean = []
+        for s in spans or []:
+            a = max(0.0, float(s.get("start", 0.0)))
+            b = min(self.duration, float(s.get("end", 0.0)))
+            if b - a > 0.5:
+                clean.append((a, b))
+        if not clean:
+            raise ValueError("no speech spans to transcribe")
+        total = sum(b - a for a, b in clean)
+        if total > 1800:
+            raise ValueError(f"{total / 60:.0f} min of speech is too much — "
+                             "transcribe the intro/outro only")
+        lang_arg = None if str(lang or "auto").lower() in ("auto", "") else str(lang)
+        backend = _pick_stt_backend()
+        print(f"Transcribing {len(clean)} span(s), {total:.0f}s "
+              f"({backend}, lang={lang_arg or 'auto'}) …")
+        words: List[Dict[str, Any]] = []
+        detected = lang_arg
+        done = 0.0
+        for i, (a, b) in enumerate(clean):
+            wav = self.work / f"trx_{i}.wav"
+            try:
+                self._extract_bus(str(self.input), wav, bus, ss=a, t=b - a)
+                # whisper wants 16 kHz mono — resample in place when needed
+                tmp = self.work / f"trx_{i}_16k.wav"
+                self._ff(["ffmpeg", "-y", "-i", str(wav), "-vn", "-ac", "1",
+                          "-ar", "16000", "-c:a", "pcm_s16le", str(tmp)],
+                         "transcript resample")
+                tmp.replace(wav)
+            except RuntimeError:
+                # bus extraction failed (odd audio layout?) — plain mix fallback
+                self._ff(["ffmpeg", "-y", "-ss", f"{a:.2f}", "-t", f"{b - a:.2f}",
+                          "-i", str(self.input), "-vn", "-ac", "1", "-ar", "16000",
+                          "-c:a", "pcm_s16le", str(wav)], "transcript clip")
+            seg_words, seg_lang = _stt_words(backend, model, str(wav), lang_arg)
+            for w in seg_words:
+                words.append({"start": round(w[0] + a, 2),
+                              "end": round(w[1] + a, 2), "text": w[2]})
+            detected = detected or seg_lang
+            done += b - a
+            if progress_cb:
+                progress_cb(done, total)
+            try:
+                wav.unlink()
+            except OSError:
+                pass
+        words.sort(key=lambda w: w["start"])
+        print(f"Transcribed {len(words)} words ({detected or 'unknown lang'}).")
+        return {"words": words, "lang": detected or (lang_arg or "auto")}
+
     def fix_transcript_intro_outro(self, input_path=None,
                                    intro_range=(0, 60), outro_range=(1200, 1260)):
         if whisper is None:

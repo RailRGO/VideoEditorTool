@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Claim, LayerStyle, LayoutState, AudioState, Segment } from "../lib/types";
 import { LAYOUT_PRESETS, SEGMENT_META } from "../lib/types";
 import { fmtTime } from "../lib/timeline";
@@ -729,6 +729,9 @@ export function ExportPanel({
   removed,
   duration,
   mime,
+  onSaveProject,
+  onLoadProject,
+  projectMsg,
   remote = null,
 }: {
   res: 720 | 1080;
@@ -748,6 +751,9 @@ export function ExportPanel({
   removed: number;
   duration: number;
   mime: string;
+  onSaveProject: () => void;
+  onLoadProject: (f: File) => void;
+  projectMsg: string;
   remote?: {
     connected: boolean;
     job: RemoteJob | null;
@@ -758,8 +764,35 @@ export function ExportPanel({
 }) {
   const job = remote?.job ?? null;
   const running = job?.state === "running";
+  const projectRef = useRef<HTMLInputElement>(null);
   return (
     <div className="space-y-2.5">
+      <Section title="Project file">
+        <div className="flex gap-1.5">
+          <Btn className="flex-1" onClick={onSaveProject}>
+            Save project
+          </Btn>
+          <Btn className="flex-1" onClick={() => projectRef.current?.click()}>
+            Load project
+          </Btn>
+          <input
+            ref={projectRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onLoadProject(f);
+              e.target.value = "";
+            }}
+          />
+        </div>
+        <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+          {projectMsg ||
+            "The timeline and every setting as one tiny .json — keep it next to the video, it survives closed tabs and dead sessions."}
+        </p>
+      </Section>
+
       <Section title="Render">
         <div className="space-y-2">
           <Segmented

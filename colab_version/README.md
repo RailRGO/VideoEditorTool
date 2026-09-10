@@ -57,6 +57,13 @@ URL from notebook cell 3d:
   reconnect and the download is waiting in the Render tab.
 - Switch sources without touching the notebook: the header lists every
   video in the source folder (`GET /api/sources`, `POST /api/source`).
+- No copy-paste: set `HOSTED_EDITOR` in cell 3d once and it prints a one-click
+  link that opens the site already connected (`?backend=`).
+- Speech-to-text runs here too: the Polish tab's Transcribe button sends the
+  intro/outro spans (`POST /api/job/transcript`, faster-whisper, word timings)
+  and filler removal just works — no external transcription step.
+- The Render tab's Save/Load project keeps the timeline + all settings as one
+  tiny `.reaction.json`, so the edit survives closed tabs and dead sessions.
 
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
