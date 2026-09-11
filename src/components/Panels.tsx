@@ -734,6 +734,7 @@ export function ExportPanel({
   onSaveProject,
   onLoadProject,
   projectMsg,
+  passthrough = false,
   remote = null,
 }: {
   res: 720 | 1080;
@@ -756,6 +757,8 @@ export function ExportPanel({
   onSaveProject: () => void;
   onLoadProject: (f: File) => void;
   projectMsg: string;
+  /** YouTube: the render is a straight cut of the finished file (no resizing) */
+  passthrough?: boolean;
   remote?: {
     connected: boolean;
     job: RemoteJob | null;
@@ -796,35 +799,44 @@ export function ExportPanel({
       </Section>
 
       <Section title="Render">
-        <div className="space-y-2">
-          <Segmented
-            value={String(res)}
-            onChange={(v) => setRes(Number(v) as 720 | 1080)}
-            options={[
-              { value: "720", label: "1280×720" },
-              { value: "1080", label: "1920×1080" },
-            ]}
-          />
-          <Segmented
-            value={String(fps)}
-            onChange={(v) => setFps(Number(v) as 24 | 30 | 60)}
-            options={[
-              { value: "24", label: "24 fps" },
-              { value: "30", label: "30 fps" },
-              { value: "60", label: "60 fps" },
-            ]}
-          />
-          <Slider
-            label="Video bitrate"
-            value={bitrate}
-            min={2}
-            max={40}
-            step={1}
-            display={`${bitrate} Mbps`}
-            onChange={setBitrate}
-            hint="12–20 Mbps is plenty for 1080p reaction videos"
-          />
-        </div>
+        {remote && passthrough ? (
+          <Note>
+            YouTube renders as a straight cut of your finished Patreon file — the server keeps the
+            source's own resolution and frame rate, so nothing is resized or re-timed. The only
+            geometry change comes from the Frame Cloak's punch-in zoom and cover bars (see the
+            Cloak tab — set zoom to 1 and bars to 0 for a clean frame).
+          </Note>
+        ) : (
+          <div className="space-y-2">
+            <Segmented
+              value={String(res)}
+              onChange={(v) => setRes(Number(v) as 720 | 1080)}
+              options={[
+                { value: "720", label: "1280×720" },
+                { value: "1080", label: "1920×1080" },
+              ]}
+            />
+            <Segmented
+              value={String(fps)}
+              onChange={(v) => setFps(Number(v) as 24 | 30 | 60)}
+              options={[
+                { value: "24", label: "24 fps" },
+                { value: "30", label: "30 fps" },
+                { value: "60", label: "60 fps" },
+              ]}
+            />
+            <Slider
+              label="Video bitrate"
+              value={bitrate}
+              min={2}
+              max={40}
+              step={1}
+              display={`${bitrate} Mbps`}
+              onChange={setBitrate}
+              hint="12–20 Mbps is plenty for 1080p reaction videos"
+            />
+          </div>
+        )}
       </Section>
 
       <Section title="Programme">

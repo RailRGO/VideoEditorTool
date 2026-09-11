@@ -1016,7 +1016,11 @@ class ReactionVideoProcessor:
             "aformat=channel_layouts=stereo[aout]"
         )
         vtail = "[vcat]"
-        if fps:
+        # passthrough: only re-time when the caller asks for a genuinely
+        # different frame rate (a mismatched fps filter drops/duplicates
+        # frames — exactly the "cut/resized frame" symptom)
+        src_fps = float(self.info.get("fps") or 0.0)
+        if fps and (src_fps <= 0 or abs(float(fps) - src_fps) > 0.01):
             chain.append(f"[vcat]fps={float(fps):.3f}[vfps]")
             vtail = "[vfps]"
         if height and int(height) not in (0, H):

@@ -163,6 +163,9 @@ export default function App() {
   const lastFastDb = useRef(0);
   const trackStatusRef = useRef<TrackStatus>("idle");
   const trackFpsRef = useRef(0);
+  /** frame budget: last draw time / signature, so we skip redraws while idle */
+  const lastDrawRef = useRef({ at: 0, t: -1, rev: -1, face: false });
+  const drawRevRef = useRef(0);
 
   const engine = () => (engineRef.current ??= new AudioEngine());
 
@@ -378,6 +381,7 @@ export default function App() {
       force = false
     ) => {
       recordHistory(group, force);
+      drawRevRef.current++;
       switch (key) {
         case "segments": setSegments(next as Segment[]); break;
         case "layout": setLayout(next as LayoutState); break;
@@ -803,16 +807,15 @@ export default function App() {
       const v = videoRef.current;
       const cv = previewRef.current;
       if (!v || !cv || !v.videoWidth || v.readyState < 2) return;
-      if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
-      const scratch = scratchRef.current;
 
       const segs = segsRef.current;
       const lay = layoutRef.current;
       const yt = targetRef.current === "youtube";
       const act = activeSegment(segs, v.currentTime);
 
-      // removed segments are never decoded, shown or exported
-      if (act && act.type === "cut" && v.currentTime < act.end - 0.02) {
+      // removed segments are never decoded, shown or exported — jump past
+      // them while playing (a paused playhead may park inside a cut)
+      if (!v.paused && act && act.type === "cut" && v.currentTime < act.end - 0.02) {
         v.currentTime = Math.min(act.end + 0.002, durRef.current - 0.001);
       }
 
@@ -829,78 +832,134 @@ export default function App() {
         if (v.preservesPitch !== pitch) v.preservesPitch = pitch;
       }
 
-      const halves = sourceHalves(v.videoWidth, v.videoHeight, lay.sourceMode, lay.cameraSide);
+      timeRef.current.src = v.currentTime;
+      timeRef.current.out = srcToOut(segs, v.currentTime, lay.fastSpeed);
 
-      // face tracking runs on the raw video, independent of the layout.
-      // Patreon mode only — the YouTube source has no separate camera layer.
-      if (!yt && retouchRef.current.enabled && !retouchRef.current.manual) {
-        const tr = (trackerRef.current ??= new FaceTracker());
-        const camSrc =
-          lay.sourceMode === "single"
-            ? { x: 0, y: 0, w: 1, h: 1 }
-            : lay.cameraSide === "left"
-            ? { x: 0, y: 0, w: 0.5, h: 1 }
-            : { x: 0.5, y: 0, w: 0.5, h: 1 };
-        faceLmRef.current = tr.update(v, retouchRef.current, camSrc);
-        if (tr.status !== trackStatusRef.current) {
-          trackStatusRef.current = tr.status;
-          setTrackStatus(tr.status);
-          setTrackError(tr.error);
+      // ---- frame budget -----------------------------------------------------
+      // Redraw only when the picture can change (playing / scrub / an edit),
+      // skip entirely while paused-idle, and cap continuous playback at
+      // ~30 fps. This is what keeps the main thread free for keys and clicks.
+      const now = performance.now();
+      const continuous = !v.paused && !v.ended;
+      const timeChanged = Math.abs(v.currentTime - lastDrawRef.current.t) > 1e-4;
+      const editChanged =
+        drawRevRef.current !== lastDrawRef.current.rev ||
+        showFaceBoxRef.current !== lastDrawRef.current.face;
+      const busy = exportingRef.current || scanningRef.current;
+      const throttled =
+        (continuous || busy) && !exportingRef.current && !scanningRef.current &&
+        now - lastDrawRef.current.at < 33;
+
+      if ((continuous || timeChanged || editChanged || busy) && !throttled) {
+        lastDrawRef.current.at = now;
+        lastDrawRef.current.t = v.currentTime;
+        lastDrawRef.current.rev = drawRevRef.current;
+        lastDrawRef.current.face = showFaceBoxRef.current;
+
+        if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
+        const scratch = scratchRef.current;
+
+        const halves = sourceHalves(v.videoWidth, v.videoHeight, lay.sourceMode, lay.cameraSide);
+
+        // face tracking runs on the raw video, independent of the layout.
+        // Patreon mode only — the YouTube source has no separate camera layer.
+        if (!yt && retouchRef.current.enabled && !retouchRef.current.manual) {
+          const tr = (trackerRef.current ??= new FaceTracker());
+          const camSrc =
+            lay.sourceMode === "single"
+              ? { x: 0, y: 0, w: 1, h: 1 }
+              : lay.cameraSide === "left"
+              ? { x: 0, y: 0, w: 0.5, h: 1 }
+              : { x: 0.5, y: 0, w: 0.5, h: 1 };
+          faceLmRef.current = tr.update(v, retouchRef.current, camSrc);
+          if (tr.status !== trackStatusRef.current) {
+            trackStatusRef.current = tr.status;
+            setTrackStatus(tr.status);
+            setTrackError(tr.error);
+          }
+          if (tr.fps !== trackFpsRef.current) {
+            trackFpsRef.current = tr.fps;
+            setTrackFps(tr.fps);
+          }
+        } else {
+          faceLmRef.current = null;
         }
-        if (tr.fps !== trackFpsRef.current) {
-          trackFpsRef.current = tr.fps;
-          setTrackFps(tr.fps);
+
+        const scene = yt
+          ? buildPassthroughScene(
+              segs,
+              v.currentTime,
+              halves.full,
+              lay.fastSpeed,
+              videoCloakRef.current
+            )
+          : buildScene(lay, segs, v.currentTime, halves);
+        const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
+        if (hook) hook.debugPose = poseRef.current;
+
+        const ctx = cv.getContext("2d");
+        if (ctx) {
+          renderScene(
+            ctx,
+            v,
+            scene,
+            lay,
+            cv.width,
+            cv.height,
+            scratch,
+            0.34,
+            hook,
+            showFaceBoxRef.current
+          );
         }
-      } else {
-        faceLmRef.current = null;
-      }
 
-      const scene = yt
-        ? buildPassthroughScene(
-            segs,
-            v.currentTime,
-            halves.full,
-            lay.fastSpeed,
-            videoCloakRef.current
-          )
-        : buildScene(lay, segs, v.currentTime, halves);
-      const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
-      if (hook) hook.debugPose = poseRef.current;
-
-      const ctx = cv.getContext("2d");
-      if (ctx) {
-        renderScene(
-          ctx,
-          v,
-          scene,
-          lay,
-          cv.width,
-          cv.height,
-          scratch,
-          0.34,
-          hook,
-          showFaceBoxRef.current
-        );
-      }
-
-      // quieter content audio while fast-forwarding
-      const fastDb = act?.type === "fast" ? lay.fastGainDb : 0;
-      if (fastDb !== lastFastDb.current) {
-        lastFastDb.current = fastDb;
-        engine().update(audioRef.current, fastDb);
-      }
-
-      if (exportingRef.current) {
-        const ec = exportRef.current;
-        const ectx = ec?.getContext("2d");
-        if (ec && ectx) renderScene(ectx, v, scene, lay, ec.width, ec.height, scratch, 0.4, hook);
-        const total = outDuration(segs, lay.fastSpeed);
-        const p = total > 0 ? clamp(timeRef.current.out / total, 0, 1) : 0;
-        if (Math.abs(p - lastProgress.current) > 0.002) {
-          lastProgress.current = p;
-          setProgress(p);
+        // quieter content audio while fast-forwarding
+        const fastDb = act?.type === "fast" ? lay.fastGainDb : 0;
+        if (fastDb !== lastFastDb.current) {
+          lastFastDb.current = fastDb;
+          engine().update(audioRef.current, fastDb);
         }
-        if (total - timeRef.current.out < 0.08 || v.ended) finish();
+
+        if (exportingRef.current) {
+          const ec = exportRef.current;
+          const ectx = ec?.getContext("2d");
+          if (ec && ectx) renderScene(ectx, v, scene, lay, ec.width, ec.height, scratch, 0.4, hook);
+          const total = outDuration(segs, lay.fastSpeed);
+          const p = total > 0 ? clamp(timeRef.current.out / total, 0, 1) : 0;
+          if (Math.abs(p - lastProgress.current) > 0.002) {
+            lastProgress.current = p;
+            setProgress(p);
+          }
+          if (total - timeRef.current.out < 0.08 || v.ended) finish();
+        }
+
+        // in YouTube mode the file is already mixed, so mute / card silence everything;
+        // intro & outro keep playing (the voice is baked into the mix)
+        const contentMuted = act
+          ? act.type === "cut" ||
+            act.type === "mute" ||
+            act.type === "card" ||
+            (!yt && (act.type === "intro" || act.type === "outro") && lay.muteContentInSolo)
+          : false;
+        engine().tick(audioRef.current, contentMuted);
+        engine().read();
+
+        const nextMode: SceneMode =
+          act && (act.type === "intro" || act.type === "outro")
+            ? "solo"
+            : act && act.type === "cut"
+            ? "cut"
+            : act && act.type === "card"
+            ? "card"
+            : act && act.type === "lead"
+            ? "lead"
+            : act && act.type === "fast"
+            ? "fast"
+            : "body";
+        if (nextMode !== sceneModeRef.current) {
+          sceneModeRef.current = nextMode;
+          setSceneMode(nextMode);
+        }
       }
 
       if (scanningRef.current) {
@@ -909,37 +968,7 @@ export default function App() {
         if (v.ended || v.currentTime >= durRef.current - 0.05) stopScanRef.current();
       }
 
-      // in YouTube mode the file is already mixed, so mute / card silence everything;
-      // intro & outro keep playing (the voice is baked into the mix)
-      const contentMuted = act
-        ? act.type === "cut" ||
-          act.type === "mute" ||
-          act.type === "card" ||
-          (!yt && (act.type === "intro" || act.type === "outro") && lay.muteContentInSolo)
-        : false;
-      engine().tick(audioRef.current, contentMuted);
-      engine().read();
-
-      timeRef.current.src = v.currentTime;
-      timeRef.current.out = srcToOut(segs, v.currentTime, lay.fastSpeed);
       if (v.ended && !exportingRef.current && !scanningRef.current) setPlaying(false);
-
-      const nextMode: SceneMode =
-        act && (act.type === "intro" || act.type === "outro")
-          ? "solo"
-          : act && act.type === "cut"
-          ? "cut"
-          : act && act.type === "card"
-          ? "card"
-          : act && act.type === "lead"
-          ? "lead"
-          : act && act.type === "fast"
-          ? "fast"
-          : "body";
-      if (nextMode !== sceneModeRef.current) {
-        sceneModeRef.current = nextMode;
-        setSceneMode(nextMode);
-      }
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -993,6 +1022,11 @@ export default function App() {
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       if (e.code === "Space") {
         e.preventDefault();
+        if (e.repeat) return;
+        // Space on a focused <button> would also fire that button's native
+        // Space-click on keyup — blur it so the toggle doesn't fire twice
+        const btn = t?.closest?.("button") as HTMLElement | null;
+        if (btn) btn.blur();
         togglePlay();
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
         e.preventDefault();
@@ -1279,6 +1313,10 @@ export default function App() {
     setRemoteError("");
     try {
       const base = (fileName || "reaction").replace(/\.[^.]+$/, "");
+      // YouTube = a straight cut of the already-finished Patreon render, so it
+      // must keep the source's own resolution and frame rate (no scale / fps
+      // conversion). Patreon is a fresh composite, where 1080/720 applies.
+      const passthrough = targetRef.current === "youtube";
       const job = await client.renderProject({
         target: targetRef.current,
         name: `${base}_${targetRef.current}`,
@@ -1295,8 +1333,8 @@ export default function App() {
         videoCloak: videoCloakRef.current,
         crf: 18,
         webm: false,
-        fps,
-        height: res === 1080 ? 1080 : 720,
+        fps: passthrough ? null : fps,
+        height: passthrough ? 0 : res === 1080 ? 1080 : 720,
       });
       setRemoteJob(job);
       setRightTab("export");
@@ -2522,6 +2560,7 @@ export default function App() {
                 onSaveProject={saveProject}
                 onLoadProject={loadProjectFile}
                 projectMsg={projectMsg}
+                passthrough={isYT}
                 remote={
                   isRemote
                     ? {

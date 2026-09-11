@@ -79,6 +79,24 @@ def _is_ours_alive(port: int) -> bool:
 # proxy transcode (cached on Drive, generated once)
 # ---------------------------------------------------------------------------
 
+_ENCODER_CACHE: Dict[str, bool] = {}
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """True when this ffmpeg build can encode with *name* (cached)."""
+    if name in _ENCODER_CACHE:
+        return _ENCODER_CACHE[name]
+    ok = False
+    try:
+        p = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                           capture_output=True, text=True, timeout=30)
+        ok = f" {name} " in (p.stdout or "")
+    except Exception:
+        ok = False
+    _ENCODER_CACHE[name] = ok
+    return ok
+
+
 def proxy_path_for(proc, width: int = 960) -> Path:
     src = Path(proc.input)
     try:
@@ -118,9 +136,15 @@ def ensure_proxy(proc, width: int = 960,
                       "-map", "[v]", "-map", "[a]"]
     else:
         audio_args = ["-vf", f"scale={width}:-2", "-ac", "2"]
+    # The proxy is a throwaway preview: prioritise speed over size. NVENC when
+    # the runtime has a GPU (paid Colab) — else the fastest x264 preset. Both
+    # are far quicker than the old `veryfast` CPU encode.
+    if _ffmpeg_has_encoder("h264_nvenc"):
+        vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", "-b:v", "0"]
+    else:
+        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
     cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
-           *audio_args, "-c:v", "libx264", "-preset", "veryfast",
-           "-crf", "30", "-c:a", "aac", "-b:a", "96k",
+           *audio_args, *vcodec, "-c:a", "aac", "-b:a", "96k",
            "-movflags", "+faststart", str(out)]
     # run with progress parsed from the `time=` field
     dur = max(1.0, float(proc.duration or 1.0))
