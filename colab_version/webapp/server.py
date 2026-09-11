@@ -496,8 +496,6 @@ def _kit_chapters_srt(segments: List[Dict[str, Any]], fast: float,
         rows.insert(0, (0.0, "start"))
     if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
         rows.pop()
-    if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
-        rows.pop()
     lines: List[str] = []
     for i, (st, ty) in enumerate(rows):
         et = rows[i + 1][0] if i + 1 < len(rows) else max(total, st + 1.0)

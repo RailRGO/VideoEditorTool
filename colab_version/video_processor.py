@@ -1059,6 +1059,8 @@ class ReactionVideoProcessor:
             if cancel_check is not None and cancel_check():
                 p.kill()
                 p.wait()
+                # don't leave a half-written file in the output folder
+                out.unlink(missing_ok=True)
                 raise RenderCancelled("render cancelled by user")
             m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
             if m and progress_cb:
@@ -1066,6 +1068,7 @@ class ReactionVideoProcessor:
                 progress_cb(min(t, total), total)
         p.wait()
         if cancel_check is not None and cancel_check():
+            out.unlink(missing_ok=True)
             raise RenderCancelled("render cancelled by user")
         if p.returncode != 0 or not out.exists():
             raise RuntimeError("passthrough render failed:\n" + "".join(tail)[-2000:])

@@ -163,9 +163,17 @@ export default function App() {
   const lastFastDb = useRef(0);
   const trackStatusRef = useRef<TrackStatus>("idle");
   const trackFpsRef = useRef(0);
-  /** frame budget: last draw time / signature, so we skip redraws while idle */
-  const lastDrawRef = useRef({ at: 0, t: -1, rev: -1, face: false });
-  const drawRevRef = useRef(0);
+  /** frame budget: last draw time + references of everything the canvas shows,
+   * so we skip redraws while idle but never miss a paused edit */
+  const lastDrawRef = useRef({
+    at: 0,
+    t: -1,
+    segs: null as Segment[] | null,
+    layout: null as LayoutState | null,
+    cloak: null as VideoCloak | null,
+    retouch: null as Retouch | null,
+    face: false,
+  });
   /** when the proxy transcode made its first measurable progress */
   const proxyStartRef = useRef(0);
 
@@ -384,7 +392,6 @@ export default function App() {
       force = false
     ) => {
       recordHistory(group, force);
-      drawRevRef.current++;
       switch (key) {
         case "segments": setSegments(next as Segment[]); break;
         case "layout": setLayout(next as LayoutState); break;
@@ -845,8 +852,13 @@ export default function App() {
       const now = performance.now();
       const continuous = !v.paused && !v.ended;
       const timeChanged = Math.abs(v.currentTime - lastDrawRef.current.t) > 1e-4;
+      // reference compare: every edit produces a fresh object, so a paused
+      // edit (split / drag / undo / polish / project load) always repaints
       const editChanged =
-        drawRevRef.current !== lastDrawRef.current.rev ||
+        segs !== lastDrawRef.current.segs ||
+        lay !== lastDrawRef.current.layout ||
+        videoCloakRef.current !== lastDrawRef.current.cloak ||
+        retouchRef.current !== lastDrawRef.current.retouch ||
         showFaceBoxRef.current !== lastDrawRef.current.face;
       const busy = exportingRef.current || scanningRef.current;
       const throttled =
@@ -856,7 +868,10 @@ export default function App() {
       if ((continuous || timeChanged || editChanged || busy) && !throttled) {
         lastDrawRef.current.at = now;
         lastDrawRef.current.t = v.currentTime;
-        lastDrawRef.current.rev = drawRevRef.current;
+        lastDrawRef.current.segs = segs;
+        lastDrawRef.current.layout = lay;
+        lastDrawRef.current.cloak = videoCloakRef.current;
+        lastDrawRef.current.retouch = retouchRef.current;
         lastDrawRef.current.face = showFaceBoxRef.current;
 
         if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
