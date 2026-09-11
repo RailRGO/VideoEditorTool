@@ -638,10 +638,12 @@ def render_video(input_path: str, output_path: str,
     src_fps = info["fps"] or fps
     cur_t = -1.0
     frame = None
+    cancelled = False
     try:
         for idx, (st, mode, seg_card) in enumerate(plan):
             if cancel_check is not None and cancel_check():
-                raise RenderCancelled("render cancelled by user")
+                cancelled = True
+                break
             # sequential read: advance until we pass the wanted timestamp
             if st < cur_t - 1e-3:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, st) * 1000.0)
@@ -683,6 +685,14 @@ def render_video(input_path: str, output_path: str,
             writer.wait()
         else:
             writer.release()
+
+    if cancelled:
+        # don't leave a half-written output file behind
+        try:
+            Path(output_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RenderCancelled("render cancelled by user")
 
     out_dur = total / fps
     return {"path": str(output_path), "frames": total, "fps": fps,
