@@ -316,14 +316,21 @@ class ReactionEditor:
         self.rt_on.observe(lambda ch: (rc.__setitem__("enabled", ch["new"]),
                                        self.refresh_soon()), "value")
         self.rt_msg = widgets.HTML()
+        # NOTE: retouch_cfg is initialised with the browser-parity keys
+        # (skin / eyeScale / noseScale / detail / feather), so write THOSE —
+        # the legacy smooth/eyes keys would be ignored by _cam_hook().
         retouch_tab = widgets.VBox([
             self.rt_on,
-            self._slider("Smooth", 0, 100, 1, lambda: rc.get("smooth", 35),
-                         lambda v: rc.__setitem__("smooth", v), fmt="{:.0f}"),
+            self._slider("Smooth (skin)", 0, 100, 1, lambda: rc.get("skin", 55),
+                         lambda v: rc.__setitem__("skin", v), fmt="{:.0f}%"),
+            self._slider("Keep detail", 0, 100, 1, lambda: rc.get("detail", 45),
+                         lambda v: rc.__setitem__("detail", v), fmt="{:.0f}%"),
             self._slider("Teeth", 0, 100, 1, lambda: rc.get("teeth", 40),
-                         lambda v: rc.__setitem__("teeth", v), fmt="{:.0f}"),
-            self._slider("Eyes", 0, 100, 1, lambda: rc.get("eyes", 35),
-                         lambda v: rc.__setitem__("eyes", v), fmt="{:.0f}"),
+                         lambda v: rc.__setitem__("teeth", v), fmt="{:.0f}%"),
+            self._slider("Eye size", -30, 45, 1, lambda: rc.get("eyeScale", 0),
+                         lambda v: rc.__setitem__("eyeScale", v), fmt="{:.0f}%"),
+            self._slider("Nose width", -40, 20, 1, lambda: rc.get("noseScale", 0),
+                         lambda v: rc.__setitem__("noseScale", v), fmt="{:.0f}%"),
             widgets.HTML("<i>Mask is rebuilt from face landmarks every frame, "
                          "so it never slides off. Full-render cost: roughly "
                          "2–4× slower than without retouch.</i>"),
