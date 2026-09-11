@@ -318,7 +318,11 @@ export function smoothSkin(
       const b = data[i + 2];
       if (!isSkin(r, g, b)) continue;
 
-      const bi = ((Math.round(y * sy) * blurW) + Math.round(x * sx)) * 4;
+      // clamp the sample indices — x*sx / y*sy can round up to exactly
+      // blurW/blurH at the box edge, which would read past the blurred buffer
+      const bx = Math.min(blurW - 1, Math.round(x * sx));
+      const by = Math.min(blurH - 1, Math.round(y * sy));
+      const bi = (by * blurW + bx) * 4;
       const br = blurred[bi];
       const bg = blurred[bi + 1];
       const bb = blurred[bi + 2];
