@@ -8,7 +8,8 @@ that runs inside Google Colab instead of your old PC.
 
 | File | What it is |
 |---|---|
-| `video_editor_colab.ipynb` | The notebook: install → Drive → **visual editor** → render |
+| `backend_colab.ipynb` | **The notebook to run** (new, minimal): install → Drive → serve. Compute side only — all editing happens in the browser |
+| `video_editor_colab.ipynb` | The full notebook (kept): in-cell widget editor, manual Patreon/YouTube cells, no-widget fallbacks |
 | `webapp/` | Full web editor: `server.py` (runs on the VM) + `index.html` (the app, no build step) + `tests/` |
 | `editor_gui.py` | In-cell widget editor (sliders + live WYSIWYG preview + sample renders) |
 | `compose.py` | Frame compositor — the same math as the browser's `render.ts` |
@@ -195,6 +196,11 @@ at the source (e.g., process intro/outro/reaction as separate 5-minute
 chunks) and concatenate with `ffmpeg` at the end.
 
 ## Quick start in Colab
+
+Open **`backend_colab.ipynb`** — 4 short cells (install + code → Drive + source →
+serve → status), ending in a one-click link to the editor. The steps below are that
+same path by hand, plus what the full notebook (`video_editor_colab.ipynb`) adds on
+top: the in-cell widget editor, manual Patreon/YouTube renders and the fallbacks.
 
 ```python
 # Cell 1 — install (run once per session)
