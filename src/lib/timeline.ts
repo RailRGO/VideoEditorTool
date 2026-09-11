@@ -11,10 +11,12 @@ export function clamp(v: number, a: number, b: number) {
 
 export function fmtTime(t: number, ms = false): string {
   if (!isFinite(t) || t < 0) t = 0;
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const s = Math.floor(t % 60);
-  const cs = Math.floor((t % 1) * 100);
+  // round to whole ms first so 0.0999… (a 0.1 s segment in float) prints 0.10
+  const totalMs = Math.round(t * 1000);
+  const h = Math.floor(totalMs / 3600000);
+  const m = Math.floor((totalMs % 3600000) / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const cs = Math.floor((totalMs % 1000) / 10);
   const core = `${h > 0 ? `${h}:${String(m).padStart(2, "0")}` : m}:${String(
     s
   ).padStart(2, "0")}`;
@@ -100,6 +102,60 @@ export function splitAt(segs: Segment[], t: number): Segment[] {
 
 export function removeSegment(segs: Segment[], id: string): Segment[] {
   return segs.filter((s) => s.id !== id);
+}
+
+/** minimum length of a usable segment (seconds) */
+export const MIN_SEG = 0.1;
+
+/**
+ * Move one segment's boundaries while the timeline stays a perfect partition
+ * of the source: adjacent segments stretch or shrink to absorb the change.
+ * This is what makes a section *extendable* — dragging the intro's right edge
+ * rightward pushes the reaction's start with it instead of stopping at it.
+ *
+ * *start* / *end* are the requested bounds (pass the unchanged value for the
+ * edge you didn't touch). The segment can never grow past its neighbours'
+ * outer edges or shrink below MIN_SEG.
+ */
+export function reposition(
+  segs: Segment[],
+  id: string,
+  start: number,
+  end: number
+): Segment[] {
+  const list = tidy(segs);
+  const i = list.findIndex((s) => s.id === id);
+  if (i < 0) return list;
+  const s = list[i];
+  const lo = i > 0 ? list[i - 1].start : 0;
+  const hi = i < list.length - 1 ? list[i + 1].end : s.end;
+  const r3 = (v: number) => Math.round(v * 1000) / 1000; // ms precision, clean values
+  const ns = r3(clamp(start, lo, end - MIN_SEG));
+  const ne = r3(clamp(end, ns + MIN_SEG, hi));
+  if (ns === s.start && ne === s.end) return list;
+  const out = list.map((x) => ({ ...x }));
+  if (i > 0) out[i - 1].end = Math.max(out[i - 1].start, ns);
+  out[i] = { ...out[i], start: ns, end: ne };
+  if (i < out.length - 1) out[i + 1].start = Math.min(out[i + 1].end, ne);
+  return tidy(out);
+}
+
+/** Structural equality (order, ids, types, bounds) — used by undo/redo. */
+export const sameSegs = (a: Segment[], b: Segment[]) =>
+  a.length === b.length &&
+  a.every((s, i) => s.id === b[i].id && s.type === b[i].type && s.start === b[i].start && s.end === b[i].end);
+
+/** Parse "90", "1:30", "1:30.5", "1:02:03" or "1:02:03.5" into seconds. */
+export function parseTimecode(text: string): number | null {
+  const t = text.trim().replace(",", ".");
+  if (!t) return null;
+  let m = t.match(/^(\d{1,3}):(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$/);
+  if (m) return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + (m[4] ? parseFloat(`0.${m[4]}`) : 0);
+  m = t.match(/^(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$/);
+  if (m) return Number(m[1]) * 60 + Number(m[2]) + (m[3] ? parseFloat(`0.${m[3]}`) : 0);
+  m = t.match(/^(\d{1,3})(?:\.(\d{1,3}))?$/);
+  if (m) return Number(m[1]) + (m[2] ? parseFloat(`0.${m[2]}`) : 0);
+  return null;
 }
 
 export const outDuration = (segs: Segment[], fastSpeed = 4) =>
@@ -269,4 +325,63 @@ export function buildEDL(
     }
   }
   return lines.join("\n");
+}
+
+const EDL_TYPES: Record<string, SegmentType> = {
+  intro: "intro", lead: "lead", body: "body", cut: "cut",
+  mute: "mute", fast: "fast", card: "card", outro: "outro",
+};
+
+/**
+ * Reverse of buildEDL: re-reads the "## segments" table as the timeline
+ * partition and "## matched material" as claims. Accepts the timecodes
+ * fmtTime writes (1:30, 1:30.50, 1:02:03.4) and plain seconds; the `@4x`
+ * suffix on fast rows is ignored (the speed comes from the layout).
+ * Segments past the end of the current file are dropped. Returns null when
+ * no segment lines are found.
+ */
+export function parseEDL(
+  text: string,
+  duration: number
+): { segments: Segment[]; claims: Claim[] } | null {
+  const segs: Segment[] = [];
+  const claims: Claim[] = [];
+  let section: "" | "segs" | "claims" = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) {
+      const l = line.toLowerCase();
+      if (l.includes("segments")) section = "segs";
+      else if (l.includes("matched")) section = "claims";
+      else section = "";
+      continue;
+    }
+    const m = line.match(
+      /^(\d[\d:.]*)\s*→\s*(\d[\d:.]*)\s+([A-Za-z]+)(?:\s*@\S+)?\s*(.*)$/
+    );
+    if (!m) continue;
+    const a = parseTimecode(m[1]);
+    const b = parseTimecode(m[2]);
+    if (a == null || b == null || b <= a || a >= duration) continue;
+    if (section === "claims") {
+      const act = m[3].toLowerCase();
+      const end = Math.min(b, duration);
+      if (end - a <= 0.05) continue;
+      claims.push({
+        id: uid(),
+        start: a,
+        end,
+        label: m[4].trim() || (act === "unresolved" ? "unresolved" : act),
+        action: act === "cut" ? "cut" : act === "mute" ? "mute" : "none",
+      });
+      continue;
+    }
+    if (section !== "segs") continue;
+    const end = Math.min(b, duration);
+    if (end - a <= 0.05) continue;
+    segs.push({ id: uid(), start: a, end, type: EDL_TYPES[m[3].toLowerCase()] ?? "body" });
+  }
+  if (!segs.length) return null;
+  return { segments: normalize(segs, duration), claims };
 }

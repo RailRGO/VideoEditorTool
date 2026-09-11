@@ -1,0 +1,446 @@
+import { useEffect, useState } from "react";
+import type { LayoutState, Segment, SegmentType } from "../lib/types";
+import { SEGMENT_META } from "../lib/types";
+import {
+  clamp,
+  fmtTime,
+  outDuration,
+  parseTimecode,
+  removedDuration,
+  removeSegment,
+  reposition,
+  segSpeed,
+  tidy,
+} from "../lib/timeline";
+import { Btn, Note, Section, Slider, Toggle } from "./ui";
+import { cn } from "../utils/cn";
+
+const ALL_TYPES = Object.keys(SEGMENT_META) as SegmentType[];
+
+/**
+ * Text field that accepts "90", "1:30", "1:30.5", "1:02:03" — commits on
+ * Enter or blur, reverts to the canonical format when unparseable.
+ */
+function TimeInput({
+  value,
+  onCommit,
+  title,
+}: {
+  value: number;
+  onCommit: (v: number) => void;
+  title?: string;
+}) {
+  const [text, setText] = useState(() => fmtTime(value, true));
+  const [focus, setFocus] = useState(false);
+  useEffect(() => {
+    if (!focus) setText(fmtTime(value, true));
+  }, [value, focus]);
+
+  const commit = () => {
+    setFocus(false);
+    const parsed = parseTimecode(text);
+    if (parsed == null) {
+      setText(fmtTime(value, true));
+      return;
+    }
+    if (parsed !== value) onCommit(clamp(parsed, 0, 1e6));
+  };
+
+  return (
+    <input
+      value={text}
+      title={title}
+      spellCheck={false}
+      onChange={(e) => setText(e.target.value)}
+      onFocus={() => {
+        setFocus(true);
+        setText(fmtTime(value, true));
+      }}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        e.stopPropagation();
+      }}
+      className="w-full rounded-md border border-white/10 bg-black/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-200 outline-none focus:border-sky-400/50"
+    />
+  );
+}
+
+function Row({
+  s,
+  segments,
+  fastSpeed,
+  selected,
+  onSelect,
+  onSeek,
+  onCommit,
+}: {
+  s: Segment;
+  segments: Segment[];
+  fastSpeed: number;
+  selected: string | null;
+  onSelect: (id: string | null) => void;
+  onSeek: (t: number) => void;
+  onCommit: (next: Segment[]) => void;
+}) {
+  const meta = SEGMENT_META[s.type];
+  const len = s.end - s.start;
+  const outLen = s.type === "cut" ? 0 : len / segSpeed(s, fastSpeed);
+  return (
+    <div
+      onClick={() => {
+        onSelect(s.id);
+        onSeek(s.start);
+      }}
+      className={cn(
+        "flex cursor-pointer items-center gap-1 rounded-lg border border-white/10 bg-black/25 px-1.5 py-1 hover:border-white/25",
+        selected === s.id && "border-sky-400/50 bg-sky-500/10"
+      )}
+    >
+      <select
+        value={s.type}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          const type = e.target.value as SegmentType;
+          onCommit(tidy(segments.map((x) => (x.id === s.id ? { ...x, type } : x))));
+        }}
+        className={cn(
+          "w-[64px] shrink-0 rounded-md border px-1 py-0.5 text-[9px] font-bold uppercase tracking-wide outline-none",
+          meta.chip
+        )}
+        style={{ background: "rgba(0,0,0,0.45)" }}
+      >
+        {ALL_TYPES.map((t) => (
+          <option key={t} value={t} style={{ color: "#e2e8f0" }}>
+            {SEGMENT_META[t].short}
+          </option>
+        ))}
+      </select>
+      <TimeInput
+        title="Start (source time)"
+        value={s.start}
+        onCommit={(v) => onCommit(reposition(segments, s.id, v, s.end))}
+      />
+      <span className="text-slate-600">→</span>
+      <TimeInput
+        title="End (source time)"
+        value={s.end}
+        onCommit={(v) => onCommit(reposition(segments, s.id, s.start, v))}
+      />
+      <span
+        className={cn(
+          "w-[52px] shrink-0 text-right font-mono text-[10px] tabular-nums",
+          s.type === "cut" ? "text-rose-300/70" : "text-slate-400"
+        )}
+      >
+        {s.type === "cut" ? "−" + fmtTime(len) : fmtTime(outLen)}
+      </span>
+      <button
+        type="button"
+        title="Remove this segment (its time becomes reaction)"
+        onClick={(e) => {
+          e.stopPropagation();
+          onCommit(removeSegment(segments, s.id));
+        }}
+        className="shrink-0 rounded px-1 text-[11px] text-slate-600 hover:bg-white/10 hover:text-rose-300"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Right-inspector tab with everything that shapes the edit itself: the
+ * selected segment, the full segment list, and the per-segment-type settings
+ * (fast-forward, card). The frame/retouch/audio tabs keep the look & sound.
+ */
+export default function SegmentsPanel({
+  segments,
+  layout,
+  setLayout,
+  selected,
+  onSelect,
+  onSeek,
+  onCommit,
+  onSplit,
+}: {
+  segments: Segment[];
+  layout: LayoutState;
+  setLayout: React.Dispatch<React.SetStateAction<LayoutState>>;
+  selected: Segment | null;
+  onSelect: (id: string | null) => void;
+  onSeek: (t: number) => void;
+  /** commit a new segment list (normalized + undoable) */
+  onCommit: (next: Segment[]) => void;
+  onSplit: () => void;
+}) {
+  /** edit one card's overrides; empty values inherit the global card */
+  const onCardChange = (
+    id: string,
+    patch: { title?: string; sub?: string; accent?: string }
+  ) => {
+    const card: { title?: string; sub?: string; accent?: string } = {};
+    const src = segments.find((s) => s.id === id)?.card ?? {};
+    for (const k of ["title", "sub", "accent"] as const) {
+      const v = patch[k] !== undefined ? patch[k] : src[k];
+      if (v != null && v.trim() !== "") card[k] = v;
+    }
+    onCommit(
+      segments.map((s) =>
+        s.id === id ? { ...s, card: Object.keys(card).length ? card : undefined } : s
+      )
+    );
+  };
+
+  const fastN = segments.filter((s) => s.type === "fast").length;
+  const cardN = segments.filter((s) => s.type === "card").length;
+  const removed = removedDuration(segments);
+  const outDur = outDuration(segments, layout.fastSpeed);
+
+  return (
+    <div className="space-y-2.5">
+      <Section
+        title="Selected segment"
+        right={
+          selected && (
+            <span className="font-mono text-[10px] text-slate-500">
+              {fmtTime(selected.end - selected.start)}
+              {selected.type === "fast" && ` → ${fmtTime((selected.end - selected.start) / layout.fastSpeed)}`}
+            </span>
+          )
+        }
+      >
+        {selected ? (
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-1">
+              {ALL_TYPES.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  title={SEGMENT_META[t].text}
+                  onClick={() =>
+                    onCommit(
+                      tidy(segments.map((x) => (x.id === selected.id ? { ...x, type: t } : x)))
+                    )
+                  }
+                  className={cn(
+                    "rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                    SEGMENT_META[t].chip,
+                    selected.type === t && "ring-2 ring-white/60"
+                  )}
+                >
+                  {SEGMENT_META[t].short}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-1">
+              <TimeInput
+                title="Start (source time)"
+                value={selected.start}
+                onCommit={(v) =>
+                  onCommit(reposition(segments, selected.id, v, selected.end))
+                }
+              />
+              <span className="text-slate-600">→</span>
+              <TimeInput
+                title="End (source time)"
+                value={selected.end}
+                onCommit={(v) =>
+                  onCommit(reposition(segments, selected.id, selected.start, v))
+                }
+              />
+            </div>
+            <p className="font-mono text-[10px] text-slate-500">
+              output {selected.type === "cut" ? fmtTime(0) : fmtTime((selected.end - selected.start) / segSpeed(selected, layout.fastSpeed))}
+              {" · "}{selected.type === "cut" ? "removed entirely" : SEGMENT_META[selected.type].text}
+            </p>
+            {selected.type === "card" && (
+              <div className="space-y-1.5 rounded-lg border border-white/10 bg-black/25 p-2">
+                <p className="text-[10px] uppercase tracking-wider text-slate-400">
+                  This card's text — empty fields inherit the defaults
+                </p>
+                <input
+                  className="w-full rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-slate-200 outline-none focus:border-sky-400/50"
+                  placeholder={`Title (default: “${layout.card.title}”)`}
+                  value={selected.card?.title ?? ""}
+                  onChange={(e) => onCardChange(selected.id, { title: e.target.value })}
+                />
+                <input
+                  className="w-full rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-slate-200 outline-none focus:border-sky-400/50"
+                  placeholder={`Subtitle (default: “${layout.card.sub}”)`}
+                  value={selected.card?.sub ?? ""}
+                  onChange={(e) => onCardChange(selected.id, { sub: e.target.value })}
+                />
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="color"
+                    title="Accent colour"
+                    value={/^#[0-9a-fA-F]{6}$/.test(selected.card?.accent ?? "") ? selected.card!.accent! : layout.card.accent}
+                    className="h-6 w-8 shrink-0 cursor-pointer rounded border border-white/10 bg-transparent"
+                    onChange={(e) => onCardChange(selected.id, { accent: e.target.value })}
+                  />
+                  <input
+                    className="w-full rounded-md border border-white/10 bg-black/30 px-2 py-1 font-mono text-[11px] text-slate-200 outline-none focus:border-sky-400/50"
+                    placeholder={`Accent (default: ${layout.card.accent})`}
+                    value={selected.card?.accent ?? ""}
+                    onChange={(e) => onCardChange(selected.id, { accent: e.target.value })}
+                  />
+                  {(selected.card?.title || selected.card?.sub || selected.card?.accent) && (
+                    <button
+                      type="button"
+                      onClick={() => onCardChange(selected.id, { title: "", sub: "", accent: "" })}
+                      className="shrink-0 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[9px] font-semibold uppercase text-slate-400 hover:bg-white/10"
+                      title="Clear this card's overrides"
+                    >
+                      use defaults
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            <div className="flex gap-1.5">
+              <Btn className="flex-1" onClick={onSplit} title="Split the selected segment at the playhead">
+                Split at playhead (S)
+              </Btn>
+              <Btn
+                variant="danger"
+                className="flex-1"
+                onClick={() => {
+                  onCommit(removeSegment(segments, selected.id));
+                  onSelect(null);
+                }}
+              >
+                Delete (⌫)
+              </Btn>
+            </div>
+          </div>
+        ) : (
+          <p className="text-[11px] leading-relaxed text-slate-500">
+            Click a block in the timeline (or a row below) to edit its type and exact
+            start / end here. Drag a block's edge to extend it — the neighbour gives up
+            the time.
+          </p>
+        )}
+      </Section>
+
+      <Section
+        title={`Fast-forward · ${fastN} segment${fastN === 1 ? "" : "s"}`}
+        right={fastN > 0 ? <span className="text-[10px] font-semibold text-teal-300">active</span> : undefined}
+      >
+        <div className="space-y-2">
+          <Slider
+            label="Speed"
+            value={layout.fastSpeed}
+            min={1.5}
+            max={12}
+            step={0.5}
+            display={`${layout.fastSpeed}×`}
+            onChange={(v) => setLayout((l) => ({ ...l, fastSpeed: v }))}
+          />
+          <Slider
+            label="Content audio while fast"
+            value={layout.fastGainDb}
+            min={-30}
+            max={0}
+            step={1}
+            display={`${layout.fastGainDb} dB`}
+            onChange={(v) => setLayout((l) => ({ ...l, fastGainDb: v }))}
+          />
+          <Toggle
+            label="Let the pitch rise with speed"
+            hint="the classic fast-forward sound"
+            value={layout.chipmunk}
+            onChange={(v) => setLayout((l) => ({ ...l, chipmunk: v }))}
+          />
+        </div>
+      </Section>
+
+      <Section
+        title={`Card · ${cardN} segment${cardN === 1 ? "" : "s"}`}
+        right={cardN > 0 ? <span className="text-[10px] font-semibold text-fuchsia-300">active</span> : undefined}
+      >
+        <div className="space-y-1.5">
+          <input
+            value={layout.card.title}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, title: e.target.value } }))}
+            placeholder="Card headline"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <input
+            value={layout.card.sub}
+            onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, sub: e.target.value } }))}
+            placeholder="Card sub-line"
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={layout.card.accent}
+              onChange={(e) => setLayout((l) => ({ ...l, card: { ...l.card, accent: e.target.value } }))}
+              className="h-7 w-10 cursor-pointer rounded border border-white/10 bg-black/40"
+            />
+            <span className="font-mono text-[10px] text-slate-500">{layout.card.accent}</span>
+          </div>
+        </div>
+      </Section>
+
+      <Section
+        title={`All segments · ${segments.length}`}
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            −{fmtTime(removed)} · out {fmtTime(outDur)}
+          </span>
+        }
+      >
+        {segments.length === 0 ? (
+          <p className="text-[11px] text-slate-500">Load a source to build the timeline.</p>
+        ) : (
+          <div className="max-h-[300px] space-y-1 overflow-y-auto pr-0.5">
+            {segments.map((s) => (
+              <Row
+                key={s.id}
+                s={s}
+                segments={segments}
+                fastSpeed={layout.fastSpeed}
+                selected={selected?.id ?? null}
+                onSelect={onSelect}
+                onSeek={onSeek}
+                onCommit={onCommit}
+              />
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <Note>
+        <strong className="font-semibold">How the timeline works</strong>
+        <br />
+        <br />
+        Every second of the source is exactly one section, so extending one
+        <span className="mx-1 rounded border border-violet-400/30 bg-violet-500/15 px-1 text-[10px] text-violet-200">INTRO</span>
+        shortens the
+        <span className="mx-1 rounded border border-sky-400/30 bg-sky-500/15 px-1 text-[10px] text-sky-200">REACT</span>
+        next to it — drag an edge and the neighbour gives up the time.
+        <br />
+        <br />
+        <span className="ml-1">1.</span> <strong>Cut a part you don't want:</strong> shift+drag on
+        the timeline to mark the range, press <strong>CUT</strong>. Or the +CUT button for a
+        quick 4-second cut at the playhead.
+        <br />
+        <span className="ml-1">2.</span> <strong>Add sections anywhere:</strong> mark a range and
+        press INTRO / OUTRO / REACT / LEAD / FFWD / CARD / MUTE — as many as you like, in any
+        order.
+        <br />
+        <span className="ml-1">3.</span> <strong>Fine-tune:</strong> select the block, then type
+        exact times here or split it at the playhead (S).
+        <br />
+        <br />
+        <span className="font-mono text-[10px] text-slate-400">
+          S split · ⌫ delete · ←/→ frame · Shift+←/→ second · ,/. prev/next boundary ·
+          Ctrl+Z / Ctrl+Shift+Z undo/redo · Esc clears the range
+        </span>
+      </Note>
+    </div>
+  );
+}

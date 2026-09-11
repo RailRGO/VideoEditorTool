@@ -36,19 +36,40 @@ export interface TranscriptResult {
   lang: string;
 }
 
+export interface RemoteLoudness {
+  /** EBU R128 integrated loudness, LUFS */
+  integrated?: number;
+  /** true peak, dBTP */
+  truePeak?: number;
+}
+
 export interface RemoteJob {
   kind: "render" | "transcript";
   state: "idle" | "running" | "done" | "error";
   progress: number;
   files: Record<string, string>;
+  /** upload kit from a finished render: chapters in `files`, thumbs here */
+  thumbs: string[];
+  loudness: RemoteLoudness;
   result: TranscriptResult | null;
   error: string | null;
   log: string[];
 }
 
+export interface BusProxy {
+  ready: boolean;
+  progress: number;
+  path?: string | null;
+  error?: string | null;
+}
+
 export interface RemoteState {
   info: RemoteInfo;
   proxy: RemoteProxy;
+  /** which channel of a 1-stereo-track OBS file holds the mic */
+  mic_channel?: "left" | "right" | string;
+  /** channel-split previews (missing when the source has one audio track) */
+  bus_proxies?: Record<string, BusProxy>;
   job: RemoteJob;
 }
 
@@ -62,7 +83,7 @@ export interface RemoteSource {
 export interface ProjectBody {
   target: Target;
   name: string;
-  segments: Pick<Segment, "type" | "start" | "end">[];
+  segments: Pick<Segment, "type" | "start" | "end" | "card">[];
   layout: LayoutState;
   audio: AudioState;
   retouch: Retouch;
@@ -136,6 +157,15 @@ export class RemoteClient {
       body: JSON.stringify({ name }),
     });
 
+  /** which channel of the stereo track carries the mic (rebuilds the
+      mic/content preview streams in the background) */
+  setMicChannel = (channel: string): Promise<{ ok: boolean }> =>
+    this.req("/api/mic_channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel }),
+    });
+
   renderProject = (body: ProjectBody): Promise<RemoteJob> =>
     this.req("/api/job/render", {
       method: "POST",
@@ -155,7 +185,9 @@ export class RemoteClient {
 
   job = (): Promise<RemoteJob> => this.req("/api/job");
 
-  proxyUrl = (): string => this.url("/api/proxy.mp4");
+  /** bus: "mix" (default), "mic" or "content" */
+  proxyUrl = (bus: "mix" | "mic" | "content" = "mix"): string =>
+    this.url("/api/proxy.mp4" + (bus === "mix" ? "" : `?bus=${bus}`));
 
   fileUrl = (name: string): string => this.url(`/files/${encodeURIComponent(name)}`);
 }

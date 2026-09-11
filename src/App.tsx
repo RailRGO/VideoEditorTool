@@ -5,6 +5,7 @@ import AutoCut from "./components/AutoCut";
 import PolishPanel from "./components/Polish";
 import RetouchPanel from "./components/RetouchPanel";
 import CloakPanel from "./components/Cloak";
+import SegmentsPanel from "./components/Segments";
 import { AudioPanel, ClaimsPanel, ExportPanel, LayoutPanel, VideoPanel } from "./components/Panels";
 import { Btn, LiveText } from "./components/ui";
 import { AudioEngine } from "./lib/audio";
@@ -62,9 +63,11 @@ import {
   outDuration,
   outToSrc,
   parseClaims,
+  parseEDL,
   removedDuration,
   removeSegment,
   savedBySpeed,
+  sameSegs,
   splitAt,
   srcToOut,
   uid,
@@ -132,12 +135,14 @@ const RIGHT_TABS: Record<Target, { id: string; label: string }[]> = {
     { id: "layout", label: "Layout" },
     { id: "retouch", label: "Retouch" },
     { id: "audio", label: "Audio" },
+    { id: "timeline", label: "Timeline" },
     { id: "export", label: "Render" },
   ],
   youtube: [
     { id: "video", label: "Video" },
     { id: "cloak", label: "Cloak" },
     { id: "audio", label: "Audio" },
+    { id: "timeline", label: "Timeline" },
     { id: "export", label: "Render" },
   ],
 };
@@ -207,6 +212,9 @@ export default function App() {
   const [sources, setSources] = useState<RemoteSource[]>([]);
   const [proxyProgress, setProxyProgress] = useState(0);
   const [remoteJob, setRemoteJob] = useState<RemoteJob | null>(null);
+  /** which audio bus the remote preview element is playing */
+  const [previewBus, setPreviewBus] = useState<"mix" | "mic" | "content">("mix");
+  const busSwitchRef = useRef<{ time: number } | null>(null);
   const connectToken = useRef(0);
   const remoteRef = useRef<RemoteClient | null>(null);
   remoteRef.current = remote;
@@ -283,6 +291,214 @@ export default function App() {
   rateRef.current = rate;
   scanSpeedRef.current = scanSpeed;
   playingRef.current = playing;
+
+  /* ---------------------------------------- undo / redo (whole project) */
+  /** Everything the editor can change — one snapshot per undo step. */
+  interface EditState {
+    segments: Segment[];
+    layout: LayoutState;
+    audio: AudioState;
+    retouch: Retouch;
+    audioCloak: AudioCloak;
+    videoCloak: VideoCloak;
+    cutOpts: CutOptions;
+    polish: PolishRules;
+    disruptRules: DisruptRules;
+    leadCfg: LeadConfig;
+    res: 720 | 1080;
+    fps: 24 | 30 | 60;
+  }
+  const snapshotEdit = (s: EditState): EditState => ({
+    ...s,
+    segments: s.segments.map((x) => ({ ...x })),
+  });
+  const editStateEq = (a: EditState, b: EditState) =>
+    sameSegs(a.segments, b.segments) &&
+    a.layout === b.layout &&
+    a.audio === b.audio &&
+    a.retouch === b.retouch &&
+    a.audioCloak === b.audioCloak &&
+    a.videoCloak === b.videoCloak &&
+    a.cutOpts === b.cutOpts &&
+    a.polish === b.polish &&
+    a.disruptRules === b.disruptRules &&
+    a.leadCfg === b.leadCfg &&
+    a.res === b.res &&
+    a.fps === b.fps;
+
+  const editStateRef = useRef<EditState>({
+    segments, layout, audio, retouch, audioCloak, videoCloak,
+    cutOpts, polish, disruptRules, leadCfg, res, fps,
+  });
+  editStateRef.current = {
+    segments, layout, audio, retouch, audioCloak, videoCloak,
+    cutOpts, polish, disruptRules, leadCfg, res, fps,
+  };
+
+  const pastRef = useRef<EditState[]>([]);
+  const futureRef = useRef<EditState[]>([]);
+  const txnRef = useRef<EditState | null>(null);
+  const lastGroupRef = useRef<{ key: string; at: number } | null>(null);
+  const [histTick, setHistTick] = useState(0);
+  const bumpHist = () => setHistTick((v) => v + 1);
+
+  const pushSnap = useCallback((snap: EditState) => {
+    pastRef.current.push(snap);
+    if (pastRef.current.length > 150) pastRef.current.shift();
+    futureRef.current = [];
+    bumpHist();
+  }, []);
+
+  /**
+   * Record the pre-edit state. Continuous controls (sliders, box drags) are
+   * grouped: changes to the same group within 600 ms share one undo step.
+   */
+  const recordHistory = useCallback(
+    (group: string, force = false) => {
+      const now = Date.now();
+      const lg = lastGroupRef.current;
+      if (!force && lg && lg.key === group && now - lg.at < 600) {
+        lg.at = now;
+        return;
+      }
+      lastGroupRef.current = { key: group, at: now };
+      const prev = pastRef.current[pastRef.current.length - 1];
+      if (prev && editStateEq(prev, editStateRef.current)) return;
+      pushSnap(snapshotEdit(editStateRef.current));
+    },
+    [pushSnap]
+  );
+
+  /** Apply one piece of the edit state as a (possibly undoable) update. */
+  const patchState = useCallback(
+    <K extends keyof EditState>(
+      key: K,
+      group: string,
+      next: EditState[K],
+      force = false
+    ) => {
+      recordHistory(group, force);
+      switch (key) {
+        case "segments": setSegments(next as Segment[]); break;
+        case "layout": setLayout(next as LayoutState); break;
+        case "audio": setAudio(next as AudioState); break;
+        case "retouch": setRetouch(next as Retouch); break;
+        case "audioCloak": setAudioCloak(next as AudioCloak); break;
+        case "videoCloak": setVideoCloak(next as VideoCloak); break;
+        case "cutOpts": setCutOpts(next as CutOptions); break;
+        case "polish": setPolish(next as PolishRules); break;
+        case "disruptRules": setDisruptRules(next as DisruptRules); break;
+        case "leadCfg": setLeadCfg(next as LeadConfig); break;
+        case "res": setRes(next as 720 | 1080); break;
+        case "fps": setFps(next as 24 | 30 | 60); break;
+      }
+    },
+    [recordHistory]
+  );
+
+  /**
+   * History-aware setter factories: panels keep using Dispatch-style
+   * setters, every change is grouped + undoable behind the scenes.
+   */
+  const makeSetter = useCallback(
+    <K extends keyof EditState>(
+      key: K,
+      group: string
+    ): React.Dispatch<React.SetStateAction<EditState[K]>> =>
+      (u) => {
+        const cur = editStateRef.current[key];
+        const next =
+          typeof u === "function"
+            ? (u as (p: EditState[K]) => EditState[K])(cur)
+            : u;
+        if (next === cur) return;
+        patchState(key, group, next);
+      },
+    [patchState]
+  );
+  const setLayoutH = useMemo(() => makeSetter("layout", "layout"), [makeSetter]);
+  const setAudioH = useMemo(() => makeSetter("audio", "audio"), [makeSetter]);
+  const setRetouchH = useMemo(() => makeSetter("retouch", "retouch"), [makeSetter]);
+  const setAudioCloakH = useMemo(
+    () => makeSetter("audioCloak", "audioCloak"),
+    [makeSetter]
+  );
+  const setVideoCloakH = useMemo(
+    () => makeSetter("videoCloak", "videoCloak"),
+    [makeSetter]
+  );
+  const setCutOptsH = useMemo(() => makeSetter("cutOpts", "cutOpts"), [makeSetter]);
+  const setPolishH = useMemo(() => makeSetter("polish", "polish"), [makeSetter]);
+  const setDisruptH = useMemo(
+    () => makeSetter("disruptRules", "disruptRules"),
+    [makeSetter]
+  );
+  const setLeadH = useMemo(() => makeSetter("leadCfg", "leadCfg"), [makeSetter]);
+  const setResH = useMemo(() => makeSetter("res", "render"), [makeSetter]);
+  const setFpsH = useMemo(() => makeSetter("fps", "render"), [makeSetter]);
+
+  /** Apply a new segment list as one undoable step (no-op if identical). */
+  const withTxn = useCallback(
+    (next: Segment[]) => {
+      const cur = editStateRef.current;
+      if (sameSegs(cur.segments, next)) return;
+      recordHistory("segments", true);
+      setSegments(next);
+    },
+    [recordHistory]
+  );
+
+  /** Continuous gesture (drag): snapshot once at start, commit at the end. */
+  const editStart = useCallback(() => {
+    txnRef.current = snapshotEdit(editStateRef.current);
+    lastGroupRef.current = null;
+  }, []);
+  const editEnd = useCallback(() => {
+    const before = txnRef.current;
+    txnRef.current = null;
+    if (before && !editStateEq(before, editStateRef.current)) pushSnap(before);
+  }, [pushSnap]);
+
+  const clearHistory = useCallback(() => {
+    pastRef.current = [];
+    futureRef.current = [];
+    txnRef.current = null;
+    lastGroupRef.current = null;
+    bumpHist();
+  }, []);
+
+  const applyEditState = useCallback((st: EditState) => {
+    setSegments(st.segments.map((x) => ({ ...x })));
+    setLayout(st.layout);
+    setAudio(st.audio);
+    setRetouch(st.retouch);
+    setAudioCloak(st.audioCloak);
+    setVideoCloak(st.videoCloak);
+    setCutOpts(st.cutOpts);
+    setPolish(st.polish);
+    setDisruptRules(st.disruptRules);
+    setLeadCfg(st.leadCfg);
+    setRes(st.res);
+    setFps(st.fps);
+  }, []);
+
+  const undo = useCallback(() => {
+    const p = pastRef.current;
+    if (!p.length) return;
+    const prev = p.pop()!;
+    futureRef.current.push(snapshotEdit(editStateRef.current));
+    applyEditState(prev);
+    bumpHist();
+  }, [applyEditState]);
+  const redo = useCallback(() => {
+    const f = futureRef.current;
+    if (!f.length) return;
+    const next = f.pop()!;
+    pastRef.current.push(snapshotEdit(editStateRef.current));
+    applyEditState(next);
+    bumpHist();
+  }, [applyEditState]);
+  void histTick;
 
   /**
    * Renders the camera into a work canvas at layer resolution, then runs the
@@ -378,6 +594,17 @@ export default function App() {
     };
   }, [segments, duration]);
 
+  /** level waveforms for the timeline's audio lanes (after a scan) */
+  const timelineWaves = useMemo(() => {
+    if (target === "youtube") {
+      return env ? [{ lane: "full" as const, env, label: "mixed audio" }] : [];
+    }
+    const w: { lane: "top" | "bottom"; env: Envelope; label: string }[] = [];
+    if (micEnv) w.push({ lane: "top", env: micEnv, label: "mic · comp/limiter" });
+    if (contentEnv) w.push({ lane: "bottom", env: contentEnv, label: "content · auto-duck" });
+    return w;
+  }, [target, env, micEnv, contentEnv]);
+
   const isYT = target === "youtube";
   const aspect = dims.w > 0 && dims.h > 0 ? dims.w / dims.h : 0;
   const mismatchWide = isYT && aspect > 1.9;
@@ -402,9 +629,16 @@ export default function App() {
     return [...findFillers(words, polish), ...findWordRepeats(words)];
   }, [transcript, introOutro, polish]);
 
-  /** Mic repeats: long ones are extra takes (keep the last), short ones are stumbles. */
+  /** per-repeat choice: which occurrence of a repeated take stays ("a" = 1st) */
+  const [takeKeeps, setTakeKeeps] = useState<Record<string, "a" | "b">>({});
+
+  /** Mic repeats: long ones are extra takes (you pick the survivor), short ones are stumbles. */
   const micRepeats = useMemo(() => {
-    if (!micEnv) return { takes: [] as Region[], stutters: [] as Region[] };
+    if (!micEnv)
+      return {
+        takes: [] as { key: string; first: Region; second: Region }[],
+        stutters: [] as Region[],
+      };
     const all = findRepeats(micEnv, {
       minRepeat: polish.minRepeat,
       minSeparation: 0.3,
@@ -414,23 +648,42 @@ export default function App() {
     });
     const inSolo = (r: Region) =>
       introOutro.some((s) => r.start >= s.start - 0.2 && r.end <= s.end + 0.2);
-    const takes = all
-      .filter(
-        (r) =>
-          r.len >= polish.minTake &&
-          r.b - (r.a + r.len) >= polish.takeGap &&
-          inSolo({ start: r.a, end: r.b })
-      )
-      .map((r) => ({ start: r.a, end: r.b }));
+    const takes: { key: string; first: Region; second: Region }[] = [];
+    const seen = new Set<string>();
+    for (const r of all) {
+      if (
+        r.len >= polish.minTake &&
+        r.b - (r.a + r.len) >= polish.takeGap &&
+        inSolo({ start: r.a, end: r.b })
+      ) {
+        const key = `${r.a.toFixed(2)}:${r.b.toFixed(2)}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          takes.push({
+            key,
+            first: { start: r.a, end: r.a + r.len },
+            second: { start: r.b, end: r.b + r.len },
+          });
+        }
+      }
+    }
     const stutters = all
       .filter((r) => r.len < polish.minTake || r.b - (r.a + r.len) < polish.takeGap)
       .map((r) => ({ start: r.a + r.len, end: r.b }))
       .filter(inSolo);
-    return { takes: mergeRegions(takes), stutters: mergeRegions(stutters) };
+    return { takes, stutters: mergeRegions(stutters) };
   }, [micEnv, polish, introOutro]);
 
   const polishDrops = useMemo(() => {
-    const list: Region[] = [...micRepeats.takes, ...micRepeats.stutters];
+    const list: Region[] = [...micRepeats.stutters];
+    for (const t of micRepeats.takes) {
+      // default keeps the LAST take (the usual one); "a" keeps the first
+      list.push(
+        (takeKeeps[t.key] ?? "b") === "b"
+          ? { start: t.first.start, end: t.second.start }
+          : { start: t.second.start, end: t.second.end }
+      );
+    }
     const words = transcript?.words ?? [];
     for (const span of introOutro) {
       list.push(...findLongPauses(words, span, polish));
@@ -443,7 +696,7 @@ export default function App() {
       }
     }
     return mergeRegions(list).filter((r) => r.end - r.start > 0.08);
-  }, [micRepeats, transcript, introOutro, polish, fillers]);
+  }, [micRepeats, takeKeeps, transcript, introOutro, polish, fillers]);
 
   const polishSavings = useMemo(
     () => regionsTotal(polishDrops) + (disruptions?.wasted ?? 0),
@@ -520,13 +773,13 @@ export default function App() {
     if (targetRef.current === t) return;
     targetRef.current = t;
     setTarget(t);
-    setLayout((l) => ({ ...l, sourceMode: t === "patreon" ? "split" : "single" }));
+    setLayoutH((l) => ({ ...l, sourceMode: t === "patreon" ? "split" : "single" }));
     engine().setDirect(t === "youtube" || !!remoteRef.current);
     engine().update(audioRef.current, 0);
     lastFastDb.current = 0;
     setLeftTab(t === "patreon" ? "polish" : "autocut");
     setRightTab(t === "patreon" ? "layout" : "video");
-  }, []);
+  }, [setLayoutH]);
 
   const loadFaceModel = useCallback(() => {
     const tr = (trackerRef.current ??= new FaceTracker());
@@ -694,14 +947,45 @@ export default function App() {
 
   /* ------------------------------------------------------------ keyboard */
   const doSplit = useCallback(() => {
-    setSegments((s) => splitAt(s, timeRef.current.src));
-  }, []);
+    withTxn(normalize(splitAt(segsRef.current, timeRef.current.src), durRef.current));
+  }, [withTxn]);
 
   const doDelete = useCallback(() => {
     if (!selectedId) return;
-    setSegments((s) => removeSegment(s, selectedId));
+    withTxn(normalize(removeSegment(segsRef.current, selectedId), durRef.current));
     setSelectedId(null);
-  }, [selectedId]);
+  }, [selectedId, withTxn]);
+
+  /** Turn a marked timeline range into a segment of `type` (cut / intro / …). */
+  const applyRange = useCallback(
+    (a: number, b: number, type: SegmentType) => {
+      const s0 = Math.min(a, b);
+      const s1 = Math.max(a, b);
+      if (s1 - s0 < 0.05 || !durRef.current) return;
+      const next = normalize(carve(segsRef.current, s0, s1, type), durRef.current);
+      withTxn(next);
+      const mid = (s0 + s1) / 2;
+      const seg = next.find((x) => mid >= x.start && mid < x.end);
+      setSelectedId(seg ? seg.id : null);
+    },
+    [withTxn]
+  );
+
+  /** Jump the playhead to the previous (dir<0) / next (dir>0) segment border. */
+  const jumpBoundary = useCallback(
+    (dir: 1 | -1) => {
+      const t = timeRef.current.src;
+      const bounds = Array.from(
+        new Set(segsRef.current.flatMap((s) => [s.start, s.end]))
+      ).sort((a, b) => a - b);
+      const target =
+        dir > 0
+          ? bounds.find((b) => b > t + 0.02)
+          : [...bounds].reverse().find((b) => b < t - 0.02);
+      if (target != null) seekSrc(target);
+    },
+    [seekSrc]
+  );
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -710,10 +994,23 @@ export default function App() {
       if (e.code === "Space") {
         e.preventDefault();
         togglePlay();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || e.key === "Y")) {
+        e.preventDefault();
+        redo();
       } else if (e.key === "s" || e.key === "S") {
         doSplit();
       } else if (e.key === "Delete" || e.key === "Backspace") {
         doDelete();
+      } else if (e.key === ",") {
+        e.preventDefault();
+        jumpBoundary(-1);
+      } else if (e.key === ".") {
+        e.preventDefault();
+        jumpBoundary(1);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
         seekSrc(timeRef.current.src - (e.shiftKey ? 1 : 1 / 30));
@@ -726,7 +1023,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, doSplit, doDelete, seekSrc]);
+  }, [togglePlay, doSplit, doDelete, seekSrc, jumpBoundary, undo, redo]);
 
   /* ------------------------------------------------------------ file load */
   const loadFile = useCallback((f: File) => {
@@ -756,11 +1053,31 @@ export default function App() {
     durRef.current = d;
     const asp = v.videoWidth / Math.max(1, v.videoHeight);
     if (targetRef.current === "patreon") {
-      setLayout((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
+      setLayoutH((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
     }
     // keep a loaded project (clamped to this file), default only when fresh
     setSegments((s) => (s.length ? normalize(s, d) : defaultSegments(d)));
+    clearHistory();
     setSelectedId(null);
+    // offer to restore an autosaved edit of this exact file
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as Record<string, unknown>;
+        const sameFile =
+          p.app === "reaction-studio" &&
+          fileName !== "" &&
+          p.sourceFile === fileName &&
+          Math.abs(Number(p.sourceDuration ?? NaN) - d) < 1.5;
+        if (sameFile && typeof p.savedAt === "string") {
+          const savedAt = p.savedAt;
+          const sourceFile = String(p.sourceFile);
+          setRestoreOffer((o) => o ?? { savedAt, sourceFile });
+        }
+      }
+    } catch {
+      /* corrupted autosave — ignore */
+    }
     try {
       // the remote preview stream is always a mix, even in Patreon mode
       engine().setDirect(targetRef.current === "youtube" || !!remoteRef.current);
@@ -770,7 +1087,11 @@ export default function App() {
     } catch {
       /* audio graph already bound to this element */
     }
-    seekSrc(0);
+    // a bus swap reloads the same file — restore the playhead instead of top
+    const bs = busSwitchRef.current;
+    busSwitchRef.current = null;
+    if (bs) v.currentTime = bs.time;
+    else seekSrc(0);
   };
 
   /* ------------------------------------------------------------- remote */
@@ -792,6 +1113,7 @@ export default function App() {
           setDetection(null);
           setTranscript(null);
           setPlaying(false);
+          setPreviewBus("mix");
           // cache-bust so a re-transcoded proxy is never served stale
           v.src = `${client.proxyUrl()}?t=${Date.now()}`;
           v.muted = false;
@@ -806,6 +1128,33 @@ export default function App() {
     },
     []
   );
+
+  /** swap the preview element between mix / mic-only / content-only streams */
+  const switchPreviewBus = useCallback(
+    (bus: "mix" | "mic" | "content") => {
+      const v = videoRef.current;
+      const client = remoteRef.current;
+      if (!v || !client || bus === previewBus) return;
+      setPreviewBus(bus);
+      busSwitchRef.current = { time: v.currentTime };
+      v.pause();
+      v.src = `${client.proxyUrl(bus)}?t=${Date.now()}`;
+      v.load();
+    },
+    [previewBus]
+  );
+
+  /* keep the server's mic/channel mapping in sync with the Audio tab —
+     switching it rebuilds the mic/content preview streams on the server */
+  useEffect(() => {
+    const client = remoteRef.current;
+    if (!client) return;
+    const server = remoteInfo?.mic_channel;
+    if (!server || server === audio.mic.channel) return;
+    void client.setMicChannel(audio.mic.channel).catch(() => {
+      /* older server without the route — the mix preview is unaffected */
+    });
+  }, [remote, remoteInfo, audio.mic.channel]);
 
   const connectRemote = useCallback(
     async (raw: string) => {
@@ -937,6 +1286,7 @@ export default function App() {
           type: s.type,
           start: s.start,
           end: s.end,
+          ...(s.card ? { card: s.card } : {}),
         })),
         layout: layoutRef.current,
         audio: audioRef.current,
@@ -1121,21 +1471,21 @@ export default function App() {
 
   const doBuildSkeleton = useCallback(() => {
     if (reactionStart === null || !duration) return;
-    setSegments(buildSkeleton(duration, reactionStart, leadCfg.leadIn, leadCfg.black).segments);
+    withTxn(buildSkeleton(duration, reactionStart, leadCfg.leadIn, leadCfg.black).segments);
     setSelectedId(null);
-  }, [reactionStart, duration, leadCfg]);
+  }, [reactionStart, duration, leadCfg, withTxn]);
 
   const doApplyPolish = useCallback(() => {
     if (!duration) return;
-    setSegments((s) => applyPolish(s, polishDrops, duration));
+    withTxn(applyPolish(segsRef.current, polishDrops, duration));
     setSelectedId(null);
-  }, [polishDrops, duration]);
+  }, [polishDrops, duration, withTxn]);
 
   const doApplyDisrupt = useCallback(() => {
     if (!disruptions || !duration) return;
-    setSegments((s) => applyDisrupt(s, disruptions.drops, duration));
+    withTxn(applyDisrupt(segsRef.current, disruptions.drops, duration));
     setSelectedId(null);
-  }, [disruptions, duration]);
+  }, [disruptions, duration, withTxn]);
 
   const doApplyAllPolish = useCallback(() => {
     if (!duration) return;
@@ -1143,21 +1493,21 @@ export default function App() {
       ? buildSkeleton(duration, reactionStart, leadCfg.leadIn, leadCfg.black).segments
       : defaultSegments(duration);
     const withDrops = applyDisrupt(base, disruptions?.drops ?? [], duration);
-    setSegments(applyPolish(withDrops, polishDrops, duration));
+    withTxn(applyPolish(withDrops, polishDrops, duration));
     setSelectedId(null);
-  }, [duration, reactionStart, leadCfg, disruptions, polishDrops]);
+  }, [duration, reactionStart, leadCfg, disruptions, polishDrops, withTxn]);
 
   const applyCut = useCallback(() => {
     if (!detection || !durRef.current) return;
-    setSegments((s) => buildCut(s, detection.regions, cutRef.current, durRef.current));
+    withTxn(buildCut(segsRef.current, detection.regions, cutRef.current, durRef.current));
     setSelectedId(null);
-  }, [detection]);
+  }, [detection, withTxn]);
 
   const resetTimeline = useCallback(() => {
     const d = durRef.current;
     const intro = Math.min(4, d * 0.12);
     const outro = Math.min(4, d * 0.12);
-    setSegments(
+    withTxn(
       normalize(
         [
           { id: uid(), type: "intro", start: 0, end: intro },
@@ -1168,7 +1518,7 @@ export default function App() {
       )
     );
     setSelectedId(null);
-  }, []);
+  }, [withTxn]);
 
   /* -------------------------------------------------------------- claims */
   const doParse = () => {
@@ -1186,12 +1536,18 @@ export default function App() {
     if (parsed.length) setSelectedClaim(parsed[0].id);
   };
 
-  const applyClaim = useCallback((c: Claim) => {
-    if (c.action === "none") return;
-    setSegments((s) =>
-      carve(s, c.start, c.end, c.action === "cut" ? "cut" : "mute")
-    );
-  }, []);
+  const applyClaim = useCallback(
+    (c: Claim) => {
+      if (c.action === "none") return;
+      withTxn(
+        normalize(
+          carve(segsRef.current, c.start, c.end, c.action === "cut" ? "cut" : "mute"),
+          durRef.current
+        )
+      );
+    },
+    [withTxn]
+  );
 
   const onClaimAction = (id: string, action: Claim["action"]) => {
     const c = claims.find((x) => x.id === id);
@@ -1211,32 +1567,100 @@ export default function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
 
+  /** load a Reaction Studio EDL .txt back in (replaces the timeline — undoable) */
+  const importEDL = useCallback(
+    (f: File): Promise<string> =>
+      new Promise((resolve) => {
+        const r = new FileReader();
+        r.onload = () => {
+          const p = parseEDL(String(r.result ?? ""), durRef.current);
+          if (!p) {
+            resolve("No segment lines found — is this a Reaction Studio EDL?");
+            return;
+          }
+          withTxn(p.segments);
+          if (p.claims.length) setClaims(p.claims);
+          setSelectedId(null);
+          resolve(
+            `Imported ${p.segments.length} segments` +
+              (p.claims.length ? ` and ${p.claims.length} claims.` : ".")
+          );
+        };
+        r.onerror = () => resolve("Could not read that file.");
+        r.readAsText(f);
+      }),
+    [withTxn]
+  );
+
   /* -------------------------------------------------------- project file */
   const [projectMsg, setProjectMsg] = useState("");
+  const [restoreOffer, setRestoreOffer] = useState<{
+    savedAt: string;
+    sourceFile: string;
+  } | null>(null);
+
+  const projectData = () => ({
+    app: "reaction-studio" as const,
+    version: 1,
+    savedAt: new Date().toISOString(),
+    sourceFile: fileName,
+    sourceDuration: duration,
+    target,
+    segments,
+    claims,
+    layout,
+    audio,
+    retouch,
+    audioCloak,
+    videoCloak,
+    cutOpts,
+    polish,
+    disruptRules,
+    leadCfg,
+    res,
+    fps,
+  });
+
+  /** Apply a parsed project object (file load or autosave restore). */
+  const applyProject = useCallback((p: Record<string, unknown>): string | null => {
+    if (p.app !== "reaction-studio") return "Not a Reaction Studio project file.";
+    if (p.target === "patreon" || p.target === "youtube") {
+      switchTarget(p.target as Target);
+    }
+    if (Array.isArray(p.segments) && p.segments.length) {
+      const clean = (p.segments as Segment[]).filter(
+        (s) => s && typeof s.start === "number" && typeof s.end === "number" && s.end > s.start
+      ).map((s) => ({
+        id: typeof s.id === "string" ? s.id : uid(),
+        type: (s.type in SEGMENT_META ? s.type : "body") as Segment["type"],
+        start: s.start,
+        end: s.end,
+        ...(s.card && typeof s.card === "object"
+          ? { card: s.card as Segment["card"] }
+          : {}),
+      }));
+      setSegments(durRef.current > 0 ? normalize(clean, durRef.current) : clean);
+      clearHistory();
+    }
+    if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
+    if (p.layout) setLayout(p.layout as LayoutState);
+    if (p.audio) setAudio(p.audio as AudioState);
+    if (p.retouch) setRetouch(p.retouch as Retouch);
+    if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
+    if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
+    if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
+    if (p.polish) setPolish(p.polish as PolishRules);
+    if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
+    if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
+    if (p.res === 720 || p.res === 1080) setRes(p.res);
+    if (p.fps === 24 || p.fps === 30 || p.fps === 60) setFps(p.fps);
+    setSelectedId(null);
+    setTranscript(null);
+    return null;
+  }, [switchTarget, clearHistory]);
 
   const saveProject = useCallback(() => {
-    const data = {
-      app: "reaction-studio",
-      version: 1,
-      savedAt: new Date().toISOString(),
-      sourceFile: fileName,
-      sourceDuration: duration,
-      target,
-      segments,
-      claims,
-      layout,
-      audio,
-      retouch,
-      audioCloak,
-      videoCloak,
-      cutOpts,
-      polish,
-      disruptRules,
-      leadCfg,
-      res,
-      fps,
-    };
-    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(projectData())], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -1255,35 +1679,11 @@ export default function App() {
       r.onload = () => {
         try {
           const p = JSON.parse(String(r.result ?? "")) as Record<string, unknown>;
-          if (p.app !== "reaction-studio") throw new Error("Not a Reaction Studio project file.");
-          if (p.target === "patreon" || p.target === "youtube") {
-            switchTarget(p.target as Target);
+          const err = applyProject(p);
+          if (err) {
+            setProjectMsg(err);
+            return;
           }
-          if (Array.isArray(p.segments) && p.segments.length) {
-            const clean = (p.segments as Segment[]).filter(
-              (s) => s && typeof s.start === "number" && typeof s.end === "number" && s.end > s.start
-            ).map((s) => ({
-              id: typeof s.id === "string" ? s.id : uid(),
-              type: (s.type in SEGMENT_META ? s.type : "body") as Segment["type"],
-              start: s.start,
-              end: s.end,
-            }));
-            setSegments(durRef.current > 0 ? normalize(clean, durRef.current) : clean);
-          }
-          if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
-          if (p.layout) setLayout(p.layout as LayoutState);
-          if (p.audio) setAudio(p.audio as AudioState);
-          if (p.retouch) setRetouch(p.retouch as Retouch);
-          if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
-          if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
-          if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
-          if (p.polish) setPolish(p.polish as PolishRules);
-          if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
-          if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
-          if (p.res === 720 || p.res === 1080) setRes(p.res);
-          if (p.fps === 24 || p.fps === 30 || p.fps === 60) setFps(p.fps);
-          setSelectedId(null);
-          setTranscript(null);
           const src = typeof p.sourceFile === "string" && p.sourceFile ? p.sourceFile : null;
           setProjectMsg(
             src
@@ -1297,8 +1697,40 @@ export default function App() {
       };
       r.readAsText(f);
     },
-    [fileName, switchTarget]
+    [applyProject, fileName]
   );
+
+  /* ------------------------------------------------------- autosave */
+  const AUTOSAVE_KEY = "reaction-studio:autosave:v1";
+
+  /** Debounced: the whole edit lands in localStorage ~1.5 s after it stops. */
+  useEffect(() => {
+    if (!duration || !segments.length) return;
+    const t = window.setTimeout(() => {
+      try {
+        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(projectData()));
+      } catch {
+        /* storage unavailable — manual save still works */
+      }
+    }, 1500);
+    return () => window.clearTimeout(t);
+  }, [
+    duration, segments, claims, fileName, target, layout, audio, retouch,
+    audioCloak, videoCloak, cutOpts, polish, disruptRules, leadCfg, res, fps,
+  ]);
+
+  const doRestore = () => {
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      if (!raw) throw new Error("empty");
+      const p = JSON.parse(raw) as Record<string, unknown>;
+      const err = applyProject(p);
+      setProjectMsg(err ?? "Restored your autosaved edit.");
+    } catch {
+      setProjectMsg("Could not read the autosaved edit.");
+    }
+    setRestoreOffer(null);
+  };
 
   /* -------------------------------------------------------------- render */
   const startExport = async () => {
@@ -1365,11 +1797,11 @@ export default function App() {
   const addSegment = (type: SegmentType) => {
     const t = timeRef.current.src;
     const len = type === "cut" ? 4 : type === "card" ? 6 : 3;
-    setSegments((s) => carve(s, t, Math.min(t + len, durRef.current), type));
+    withTxn(normalize(carve(segsRef.current, t, Math.min(t + len, durRef.current), type), durRef.current));
   };
 
   const setRect = useCallback((key: "content" | "cam", rect: Rect) => {
-    setLayout((l) => ({ ...l, [key]: rect }));
+    setLayoutH((l) => ({ ...l, [key]: rect }));
   }, []);
 
   const getLevels = useCallback(() => {
@@ -1482,6 +1914,34 @@ export default function App() {
               {dims.w}×{dims.h}
             </span>
           </span>
+        )}
+
+        {remote && !isYT && Object.keys(remoteInfo?.bus_proxies ?? {}).length > 0 && (
+          <div
+            className="flex shrink-0 items-center gap-0.5 rounded-lg border border-white/10 bg-black/30 p-0.5"
+            title="Preview audio bus — the render always mixes both. Mic-only / content-only exist for files with two audio tracks."
+          >
+            {(["mix", "mic", "content"] as const).map((b) => {
+              const st = b === "mix" ? { ready: true, progress: 1 } : remoteInfo?.bus_proxies?.[b];
+              return (
+                <button
+                  key={b}
+                  type="button"
+                  disabled={!st?.ready}
+                  onClick={() => switchPreviewBus(b)}
+                  className={cn(
+                    "rounded px-1.5 py-0.5 text-[10px] font-medium",
+                    previewBus === b
+                      ? "bg-sky-500/30 text-sky-100"
+                      : "text-slate-500 hover:bg-white/10 hover:text-slate-300",
+                    !st?.ready && "cursor-wait opacity-50"
+                  )}
+                >
+                  {st?.ready || b === "mix" ? b : `${b} · ${Math.round((st?.progress ?? 0) * 100)}%`}
+                </button>
+              );
+            })}
+          </div>
         )}
 
         <div className="ml-auto flex items-center gap-2">
@@ -1603,13 +2063,17 @@ export default function App() {
                 fillers={fillers}
                 pauses={polishDrops}
                 takes={micRepeats.takes}
+                takeKeeps={takeKeeps}
+                onTakeKeep={(key, keep) =>
+                  setTakeKeeps((m) => ({ ...m, [key]: keep }))
+                }
                 stutters={micRepeats.stutters}
                 rules={polish}
-                setRules={setPolish}
+                setRules={setPolishH}
                 disruptRules={disruptRules}
-                setDisruptRules={setDisruptRules}
+                setDisruptRules={setDisruptH}
                 lead={leadCfg}
-                setLead={setLeadCfg}
+                setLead={setLeadH}
                 reactionStart={reactionStart}
                 onScan={(ch) => void startScan(ch)}
                 onStopScan={stopScan}
@@ -1644,9 +2108,9 @@ export default function App() {
                 env={env}
                 detection={detection}
                 opts={cutOpts}
-                setOpts={setCutOpts}
+                setOpts={setCutOptsH}
                 layout={layout}
-                setLayout={setLayout}
+                setLayout={setLayoutH}
                 scanSpeed={scanSpeed}
                 setScanSpeed={setScanSpeed}
                 onScan={() => void startScan()}
@@ -1673,6 +2137,7 @@ export default function App() {
                 onClear={() => setClaims([])}
                 onCopyEDL={() => void navigator.clipboard?.writeText(edl())}
                 onDownloadEDL={downloadEDL}
+                onImportEDL={importEDL}
                 segments={segments}
               />
             )}
@@ -1707,6 +2172,24 @@ export default function App() {
             <div className="mb-2 shrink-0 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400">
               16:9 file in Patreon mode — camera and content share the full frame. For the usual
               side-by-side capture, load the raw 3840×1080 recording.
+            </div>
+          )}
+
+          {restoreOffer && (
+            <div className="mb-2 flex shrink-0 items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-[11px] text-emerald-100">
+              <span>
+                An autosaved edit of this file from{" "}
+                <span className="font-mono text-emerald-200">
+                  {new Date(restoreOffer.savedAt).toLocaleString()}
+                </span>{" "}
+                is available.
+              </span>
+              <Btn variant="primary" className="ml-auto shrink-0" onClick={doRestore}>
+                Restore
+              </Btn>
+              <Btn className="shrink-0" onClick={() => setRestoreOffer(null)}>
+                Discard
+              </Btn>
             </div>
           )}
 
@@ -1963,23 +2446,19 @@ export default function App() {
             {rightTab === "layout" && !isYT && (
               <LayoutPanel
                 layout={layout}
-                setLayout={setLayout}
+                setLayout={setLayoutH}
                 editLayer={editLayer}
                 setEditLayer={setEditLayer}
                 dims={dims}
                 fileName={fileName || "no source loaded"}
                 showGuides={showGuides}
                 setShowGuides={setShowGuides}
-                selected={selected}
-                onSegmentType={(t) =>
-                  setSegments((s) => s.map((x) => (x.id === selectedId ? { ...x, type: t } : x)))
-                }
               />
             )}
             {rightTab === "retouch" && !isYT && (
               <RetouchPanel
                 cfg={retouch}
-                setCfg={setRetouch}
+                setCfg={setRetouchH}
                 status={trackStatus}
                 statusText={trackError}
                 fps={trackFps}
@@ -1987,7 +2466,7 @@ export default function App() {
                 showFaceBox={showFaceBox}
                 setShowFaceBox={setShowFaceBox}
                 manualBox={retouch.manualRect}
-                setManualBox={(b) => setRetouch((c) => ({ ...c, manualRect: { ...b } }))}
+                setManualBox={(b) => setRetouchH((c) => ({ ...c, manualRect: { ...b } }))}
               />
             )}
             {rightTab === "video" && isYT && (
@@ -1995,26 +2474,38 @@ export default function App() {
                 fileName={fileName || "no source loaded"}
                 dims={dims}
                 layout={layout}
-                setLayout={setLayout}
+                setLayout={setLayoutH}
               />
             )}
             {rightTab === "cloak" && isYT && (
               <CloakPanel
                 audio={audioCloak}
-                setAudio={setAudioCloak}
+                setAudio={setAudioCloakH}
                 video={videoCloak}
-                setVideo={setVideoCloak}
+                setVideo={setVideoCloakH}
+              />
+            )}
+            {rightTab === "timeline" && (
+              <SegmentsPanel
+                segments={segments}
+                layout={layout}
+                setLayout={setLayoutH}
+                selected={selected}
+                onSelect={setSelectedId}
+                onSeek={seekSrc}
+                onCommit={(next) => withTxn(normalize(next, duration))}
+                onSplit={doSplit}
               />
             )}
             {rightTab === "audio" && (
-              <AudioPanel audio={audio} setAudio={setAudio} getLevels={getLevels} direct={isYT} />
+              <AudioPanel audio={audio} setAudio={setAudioH} getLevels={getLevels} direct={isYT} />
             )}
             {rightTab === "export" && (
               <ExportPanel
                 res={res}
-                setRes={setRes}
+                setRes={setResH}
                 fps={fps}
-                setFps={setFps}
+                setFps={setFpsH}
                 bitrate={bitrate}
                 setBitrate={setBitrate}
                 exporting={exporting}
@@ -2060,13 +2551,22 @@ export default function App() {
           fastSpeed={fast}
           playing={isPlaying}
           getSrcTime={getSrcTime}
+          waves={timelineWaves}
+          transcript={transcript}
           onSelect={setSelectedId}
           onSelectClaim={setSelectedClaim}
           onChange={(s) => setSegments(normalize(s, duration))}
+          onEditStart={editStart}
+          onEditEnd={editEnd}
           onSeek={seekSrc}
           onSplit={doSplit}
           onAddSegment={addSegment}
           onDelete={doDelete}
+          onApplyRange={applyRange}
+          canUndo={pastRef.current.length > 0}
+          canRedo={futureRef.current.length > 0}
+          onUndo={undo}
+          onRedo={redo}
         />
       </div>
 

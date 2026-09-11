@@ -247,9 +247,17 @@ def _fit_text(text: str, max_w: int, font: int, start: float, thick: int):
     return scale
 
 
-def draw_card(canvas: np.ndarray, layout: LayoutState) -> None:
+def draw_card(canvas: np.ndarray, layout: LayoutState,
+              card: Optional[Dict[str, Any]] = None) -> None:
     H, W = canvas.shape[:2]
     k = H / 1080.0
+    # per-segment override; empty fields inherit the global card
+    def pick(v) -> Optional[str]:
+        s = str(v).strip() if v is not None else ""
+        return s or None
+    title = pick(card.get("title")) or layout.card.title
+    sub = pick(card.get("sub")) or layout.card.sub
+    accent = pick(card.get("accent")) or layout.card.accent
     x, y, w, h = (int(round(v)) for v in layout.content.px(W, H))
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
@@ -270,7 +278,7 @@ def draw_card(canvas: np.ndarray, layout: LayoutState) -> None:
     roi = canvas[y0:y1, x0:x1].astype(np.float32)
     canvas[y0:y1, x0:x1] = (roi * (1 - a) + grad.astype(np.float32) * a).astype(np.uint8)
 
-    accent = hex_to_bgr(layout.card.accent)
+    accent = hex_to_bgr(accent)
     # accent bar
     bx, by = int(x0 + fw * 0.16), int(y0 + fh * 0.34)
     cv2.rectangle(canvas, (bx, by),
@@ -278,16 +286,15 @@ def draw_card(canvas: np.ndarray, layout: LayoutState) -> None:
     # title + sub, centered
     font = cv2.FONT_HERSHEY_DUPLEX
     size = max(0.4, min(2.2 * k, (fw * 0.072) / 20.0))
-    size = _fit_text(layout.card.title, int(fw * 0.88), font, size, 2)
-    (tw, th), _ = cv2.getTextSize(layout.card.title, font, size, 2)
-    cv2.putText(canvas, layout.card.title,
+    size = _fit_text(title, int(fw * 0.88), font, size, 2)
+    (tw, th), _ = cv2.getTextSize(title, font, size, 2)
+    cv2.putText(canvas, title,
                 (int(x0 + (fw - tw) / 2), int(y0 + fh * 0.47 + th / 2)),
                 font, size, (241, 245, 249), 2, cv2.LINE_AA)
-    s2 = _fit_text(layout.card.sub, int(fw * 0.88),
+    s2 = _fit_text(sub, int(fw * 0.88),
                    cv2.FONT_HERSHEY_SIMPLEX, size * 0.62, 1)
-    (tw2, th2), _ = cv2.getTextSize(layout.card.sub,
-                                    cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
-    cv2.putText(canvas, layout.card.sub,
+    (tw2, th2), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
+    cv2.putText(canvas, sub,
                 (int(x0 + (fw - tw2) / 2), int(y0 + fh * 0.58 + th2 / 2)),
                 cv2.FONT_HERSHEY_SIMPLEX, s2, (200, 210, 225), 1, cv2.LINE_AA)
     # accent ring
@@ -295,8 +302,8 @@ def draw_card(canvas: np.ndarray, layout: LayoutState) -> None:
     inner = np.zeros_like(outer)
     b = max(1, int(round(2 * k)))
     if fw - 2 * b > 2 and fh - 2 * b > 2:
-        sub = shape_mask(fw - 2 * b, fh - 2 * b, "rounded", max(0.0, radius - b))
-        inner[b:b + fh - 2 * b, b:b + fw - 2 * b] = sub
+        ring_in = shape_mask(fw - 2 * b, fh - 2 * b, "rounded", max(0.0, radius - b))
+        inner[b:b + fh - 2 * b, b:b + fw - 2 * b] = ring_in
     ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
     roi = canvas[y0:y1, x0:x1].astype(np.float32)
     canvas[y0:y1, x0:x1] = (
@@ -357,8 +364,8 @@ def split_sources(frame: np.ndarray, layout: LayoutState):
 
 def compose_frame(frame: np.ndarray, layout: LayoutState,
                   mode: str = "body", W: int = 1920, H: int = 1080,
-                  cam_hook: Optional[Callable[[np.ndarray], np.ndarray]] = None
-                  ) -> np.ndarray:
+                  cam_hook: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                  card: Optional[Dict[str, Any]] = None) -> np.ndarray:
     """Compose one output frame. *mode* is solo|body|cut|fast|card|lead."""
     canvas = np.zeros((H, W, 3), np.uint8)
     canvas[:] = BASE_COLOR
@@ -377,7 +384,7 @@ def compose_frame(frame: np.ndarray, layout: LayoutState,
         draw_layer(canvas, cam, Rect(0, 0, 1, 1), layout.soloStyle)
     elif mode == "card":
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
-        draw_card(canvas, layout)
+        draw_card(canvas, layout, card)
     elif mode == "lead":
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
         draw_lead_block(canvas, layout)
@@ -598,8 +605,8 @@ def render_video(input_path: str, output_path: str,
         segments = [{"type": "body", "start": 0.0, "end": duration}]
     segments = sorted(segments, key=lambda s: s["start"])
 
-    # output frame -> (source time, mode)
-    plan: List[Tuple[float, str]] = []
+    # output frame -> (source time, mode, per-segment card text)
+    plan: List[Tuple[float, str, Optional[Dict[str, Any]]]] = []
     for s in segments:
         typ = s.get("type", "body")
         if typ == "cut":
@@ -607,8 +614,9 @@ def render_video(input_path: str, output_path: str,
         factor = layout.fastSpeed if typ == "fast" else 1.0
         n = max(1, int(round((s["end"] - s["start"]) * fps / factor)))
         mode = {"intro": "solo", "outro": "solo", "mute": "body"}.get(typ, typ)
+        seg_card = s.get("card") if typ == "card" else None
         for i in range(n):
-            plan.append((s["start"] + (i + 0.5) * factor / fps, mode))
+            plan.append((s["start"] + (i + 0.5) * factor / fps, mode, seg_card))
     total = len(plan)
     if total == 0:
         raise ValueError("nothing to render — all segments are cut?")
@@ -623,7 +631,7 @@ def render_video(input_path: str, output_path: str,
     cur_t = -1.0
     frame = None
     try:
-        for idx, (st, mode) in enumerate(plan):
+        for idx, (st, mode, seg_card) in enumerate(plan):
             # sequential read: advance until we pass the wanted timestamp
             if st < cur_t - 1e-3:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, st) * 1000.0)
@@ -645,7 +653,7 @@ def render_video(input_path: str, output_path: str,
             if frame is None:
                 break
             out = compose_frame(frame, layout, mode=mode, W=W, H=H,
-                                cam_hook=cam_hook)
+                                cam_hook=cam_hook, card=seg_card)
             if kind == "pipe":
                 try:
                     writer.stdin.write(out.tobytes())

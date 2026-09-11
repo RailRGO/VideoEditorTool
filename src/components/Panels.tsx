@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import type { Claim, LayerStyle, LayoutState, AudioState, Segment } from "../lib/types";
-import { LAYOUT_PRESETS, SEGMENT_META } from "../lib/types";
+import { LAYOUT_PRESETS } from "../lib/types";
 import { fmtTime } from "../lib/timeline";
 import type { Levels } from "../lib/audio";
 import type { RemoteJob } from "../lib/remote";
@@ -18,8 +18,6 @@ export function LayoutPanel({
   fileName,
   showGuides,
   setShowGuides,
-  selected,
-  onSegmentType,
 }: {
   layout: LayoutState;
   setLayout: React.Dispatch<React.SetStateAction<LayoutState>>;
@@ -29,8 +27,6 @@ export function LayoutPanel({
   fileName: string;
   showGuides: boolean;
   setShowGuides: (v: boolean) => void;
-  selected: Segment | null;
-  onSegmentType: (t: Segment["type"]) => void;
 }) {
   const isContent = editLayer === "content";
   const rect = isContent ? layout.content : layout.cam;
@@ -273,29 +269,9 @@ export function LayoutPanel({
             value={layout.muteContentInSolo}
             onChange={(v) => setLayout((l) => ({ ...l, muteContentInSolo: v }))}
           />
-          {selected && (
-            <div className="mt-1 rounded-lg border border-white/10 bg-black/20 p-2">
-              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-slate-500">
-                Selected segment · {fmtTime(selected.end - selected.start)}
-              </p>
-              <div className="flex flex-wrap gap-1">
-                {(Object.keys(SEGMENT_META) as Segment["type"][]).map((t) => (
-                  <button
-                    key={t}
-                    type="button"
-                    onClick={() => onSegmentType(t)}
-                    className={cn(
-                      "rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-                      SEGMENT_META[t].chip,
-                      selected.type === t && "ring-2 ring-white/60"
-                    )}
-                  >
-                    {SEGMENT_META[t].short}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+          <p className="text-[10px] text-slate-500">
+            Segment type and exact in / out live in the Timeline tab on the right.
+          </p>
         </div>
       </Section>
     </div>
@@ -539,6 +515,7 @@ export function ClaimsPanel({
   onClear,
   onCopyEDL,
   onDownloadEDL,
+  onImportEDL,
   segments,
 }: {
   raw: string;
@@ -552,9 +529,13 @@ export function ClaimsPanel({
   onClear: () => void;
   onCopyEDL: () => void;
   onDownloadEDL: () => void;
+  /** load an EDL .txt back in — replaces the timeline (undoable) */
+  onImportEDL: (f: File) => Promise<string>;
   segments: Segment[];
 }) {
   const [copied, setCopied] = useState(false);
+  const [importMsg, setImportMsg] = useState("");
+  const edlImportRef = useRef<HTMLInputElement>(null);
   const unresolved = claims.filter((c) => c.action === "none").length;
 
   return (
@@ -671,10 +652,31 @@ export function ClaimsPanel({
           <Btn className="flex-1" onClick={onDownloadEDL}>
             Download .txt
           </Btn>
+          <Btn className="flex-1" onClick={() => edlImportRef.current?.click()}>
+            Import .txt
+          </Btn>
+          <input
+            ref={edlImportRef}
+            type="file"
+            accept=".txt,text/plain"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onImportEDL(f).then(setImportMsg);
+              e.target.value = "";
+            }}
+          />
         </div>
         <p className="mt-2 font-mono text-[10px] text-slate-500">
           {segments.filter((s) => s.type === "cut").length} removed ·{" "}
           {segments.filter((s) => s.type === "mute").length} muted
+        </p>
+        {importMsg && (
+          <p className="mt-1.5 text-[10px] leading-relaxed text-emerald-300/90">{importMsg}</p>
+        )}
+        <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+          Import reads a Reaction Studio EDL (load the same source file first) — the whole edit
+          lands on the timeline in one step. Undo (Ctrl+Z) takes it back.
         </p>
       </Section>
 
@@ -929,6 +931,80 @@ export function ExportPanel({
                 H.264 + AAC in MP4 — uploads to YouTube and Patreon directly. The file also stays
                 in the notebook’s output folder.
               </p>
+              {(job.loudness?.integrated != null || job.loudness?.truePeak != null) && (
+                <div className="mt-2 grid grid-cols-2 gap-1.5">
+                  <div className="rounded-lg border border-white/10 bg-black/25 p-1.5">
+                    <p className="text-[9px] uppercase tracking-wider text-slate-500">
+                      loudness · EBU R128
+                    </p>
+                    <p
+                      className={
+                        "font-mono text-[12px] " +
+                        (job.loudness?.integrated != null &&
+                        job.loudness.integrated >= -16 &&
+                        job.loudness.integrated <= -11
+                          ? "text-emerald-300"
+                          : "text-amber-300")
+                      }
+                    >
+                      {job.loudness?.integrated != null
+                        ? `${job.loudness.integrated.toFixed(1)} LUFS`
+                        : "—"}
+                    </p>
+                    <p className="text-[9px] text-slate-500">target ≈ −16…−11</p>
+                  </div>
+                  <div className="rounded-lg border border-white/10 bg-black/25 p-1.5">
+                    <p className="text-[9px] uppercase tracking-wider text-slate-500">
+                      true peak
+                    </p>
+                    <p
+                      className={
+                        "font-mono text-[12px] " +
+                        (job.loudness?.truePeak != null && job.loudness.truePeak > -1
+                          ? "text-rose-300"
+                          : "text-emerald-300")
+                      }
+                    >
+                      {job.loudness?.truePeak != null
+                        ? `${job.loudness.truePeak.toFixed(1)} dBTP`
+                        : "—"}
+                    </p>
+                    <p className="text-[9px] text-slate-500">keep ≤ −1.0</p>
+                  </div>
+                </div>
+              )}
+              {((job.thumbs && job.thumbs.length > 0) || job.files.chapters) && (
+                <div className="mt-2">
+                  <p className="mb-1 text-[9px] uppercase tracking-wider text-slate-500">
+                    upload kit
+                  </p>
+                  {job.thumbs && job.thumbs.length > 0 && (
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {job.thumbs.map((t) => (
+                        <a key={t} href={remote.fileUrl(t)} download={t} title={t}>
+                          <img
+                            src={remote.fileUrl(t)}
+                            alt={t}
+                            className="w-full rounded border border-white/10"
+                          />
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                  {job.files.chapters && (
+                    <a
+                      href={remote.fileUrl(job.files.chapters)}
+                      download={job.files.chapters}
+                      className="mt-1.5 block rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-center text-[10px] text-slate-300 hover:bg-white/10"
+                    >
+                      ↓ {job.files.chapters} — paste into YouTube’s “Chapters” description box
+                    </a>
+                  )}
+                  <p className="mt-1 text-[9px] leading-relaxed text-slate-500">
+                    Pick your favourite still for the thumbnail (1280×720, click to download).
+                  </p>
+                </div>
+              )}
             </div>
           )}
           {remote && job && job.log.length > 0 && (

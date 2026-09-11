@@ -18,6 +18,8 @@ export interface Segment {
   type: SegmentType;
   start: number;
   end: number;
+  /** per-card override — empty fields inherit the global card (layout.card) */
+  card?: { title?: string; sub?: string; accent?: string };
 }
 
 export interface Claim {

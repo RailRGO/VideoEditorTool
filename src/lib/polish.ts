@@ -1,6 +1,6 @@
 import type { PolishRules, Segment } from "./types";
 import type { Envelope, Region } from "./analyze";
-import { clamp, uid } from "./timeline";
+import { clamp, tidy, uid } from "./timeline";
 
 export interface Word {
   start: number;
@@ -297,11 +297,14 @@ export function applyPolish(
       if (s.end <= d.start || s.start >= d.end) return [s];
       const parts: Segment[] = [];
       if (s.start < d.start - 0.05) parts.push({ ...s, end: d.start });
+      // explicit cut (not a gap) so browser and server render it the same way
+      if (Math.min(s.end, d.end) - Math.max(s.start, d.start) > 0.05)
+        parts.push({ id: uid(), type: "cut", start: Math.max(s.start, d.start), end: Math.min(s.end, d.end) });
       if (s.end > d.end + 0.05) parts.push({ ...s, id: uid(), start: d.end });
       return parts;
     });
   }
-  return out.filter((s) => s.end - s.start > 0.12 && s.end <= duration + 0.05);
+  return tidy(out).filter((s) => s.end - s.start > 0.12 && s.end <= duration + 0.05);
 }
 
 /** Remove dead air from the reaction part without touching any real content. */
@@ -317,11 +320,14 @@ export function applyDisrupt(
       if (s.end <= d.start || s.start >= d.end) return [s];
       const parts: Segment[] = [];
       if (s.start < d.start - 0.05) parts.push({ ...s, end: d.start });
+      // explicit cut (not a gap) so browser and server render it the same way
+      if (Math.min(s.end, d.end) - Math.max(s.start, d.start) > 0.05)
+        parts.push({ id: uid(), type: "cut", start: Math.max(s.start, d.start), end: Math.min(s.end, d.end) });
       if (s.end > d.end + 0.05) parts.push({ ...s, id: uid(), start: d.end });
       return parts;
     });
   }
-  return out.filter((s) => s.end - s.start > 0.12 && s.end <= duration + 0.05);
+  return tidy(out).filter((s) => s.end - s.start > 0.12 && s.end <= duration + 0.05);
 }
 
 /** Build the intro → lead-in → reaction → outro skeleton around the content start. */
