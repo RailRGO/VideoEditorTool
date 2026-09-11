@@ -33,7 +33,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 HERE = Path(__file__).resolve().parent          # .../colab_version/webapp
 COLAB_DIR = HERE.parent                          # .../colab_version
@@ -137,6 +137,61 @@ def ensure_proxy(proc, width: int = 960,
     p.wait()
     if p.returncode != 0 or not tmp.exists():
         raise RuntimeError("proxy transcode failed (see ffmpeg output above)")
+    tmp.replace(out)
+    if status is not None:
+        status.update(ready=True, progress=1.0, path=str(out))
+    return out
+
+
+def bus_proxy_path_for(proc, bus: str, width: int = 960) -> Path:
+    # the mic-channel setting is part of the cache key: switching it means
+    # the mic/content mapping changes, so a different file is built
+    src = Path(proc.input)
+    try:
+        st = src.stat()
+        key = (f"{src.stem}_{st.st_size}_{int(st.st_mtime)}_{width}_{bus}_"
+               f"{proc.audio_cfg.get('mic_channel', 'left')}")
+    except OSError:
+        key = f"{src.stem}_{width}_{bus}"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+    d = Path(proc.out) / "proxy"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{safe}.mp4"
+
+
+def ensure_bus_proxy(proc, bus: str, mix_path: Path, width: int = 960,
+                     status: Optional[Dict[str, Any]] = None) -> Path:
+    """Channel-split preview: the mix proxy's VIDEO (stream copy, instant)
+    plus one bus' audio, decoded from the full-resolution source."""
+    out = bus_proxy_path_for(proc, bus, width)
+    if out.exists() and out.stat().st_size > 1_000_000:
+        if status is not None:
+            status.update(ready=True, progress=1.0, path=str(out))
+        return out
+    if status is not None:
+        status.update(ready=False, progress=0.0, path=str(out))
+    kind, idx = proc._resolve_bus(str(proc.input), bus)
+    a_args = (["-map", f"1:a:{idx}", "-ac", "1"] if kind == "stream"
+              else ["-map", "1:a:0", "-af", f"pan=mono|c0=c{idx}", "-ac", "1"])
+    dur = max(1.0, float(proc.duration or 1.0))
+    tmp = out.with_suffix(".tmp.mp4")
+    cmd = ["ffmpeg", "-y", "-v", "info",
+           "-i", str(mix_path), "-i", str(proc.input),
+           "-map", "0:v:0", *a_args,
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+           "-movflags", "+faststart", str(tmp)]
+    p = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
+                         text=True, bufsize=1)
+    assert p.stdout is not None
+    for line in p.stdout:
+        m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+        if m and status is not None:
+            t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            status["progress"] = max(0.0, min(0.99, t / dur))
+    p.wait()
+    if p.returncode != 0 or not tmp.exists():
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"{bus} proxy build failed")
     tmp.replace(out)
     if status is not None:
         status.update(ready=True, progress=1.0, path=str(out))
@@ -372,6 +427,128 @@ def _verify_public(url: str, timeout: float = 60.0) -> Tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Upload kit: chapters .srt + thumbnail candidates + EBU R128 loudness QC
+# ---------------------------------------------------------------------------
+
+_KIT_LABELS = {
+    "body": "Watching", "intro": "Intro", "outro": "Outro",
+    "fast": "Speed ramp", "mute": "No audio", "cut": "Cut",
+    "card": "Card", "lead": "Lead-in", "start": "Start",
+}
+
+
+def _srt_ts(t: float) -> str:
+    ms = max(0, int(round(t * 1000)))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _kit_chapters_srt(segments: List[Dict[str, Any]], fast: float,
+                      total: float) -> str:
+    """Chapter rows at structural boundaries (type changes), in OUTPUT time.
+
+    YouTube needs a chapter starting at 0:00, so the first row is always
+    emitted at t=0; rows closer than 1 s are merged (YouTube requirement).
+    """
+    # each chapter is labeled by the segment type STARTING at that moment
+    rows: List[Tuple[float, str]] = []
+    t = 0.0
+    prev_label: Optional[str] = None
+    for s in segments:
+        ty = str(s.get("type", "body"))
+        if ty == "cut":
+            continue
+        if prev_label is None or ty != prev_label:
+            if not rows or t - rows[-1][0] >= 1.0:
+                rows.append((t, ty))
+        prev_label = ty
+        ln = s["end"] - s["start"]
+        t += ln / max(0.1, fast) if ty == "fast" else ln
+    if not rows or rows[0][0] > 0.0:
+        rows.insert(0, (0.0, "start"))
+    if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
+        rows.pop()
+    if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
+        rows.pop()
+    lines: List[str] = []
+    for i, (st, ty) in enumerate(rows):
+        et = rows[i + 1][0] if i + 1 < len(rows) else max(total, st + 1.0)
+        lines += [str(i + 1), f"{_srt_ts(st)} --> {_srt_ts(et)}",
+                  _KIT_LABELS.get(ty, "Section"), ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _kit_thumbs(final: Path, name: str, out_dir: Path, total: float,
+                log) -> List[str]:
+    """Five 1280×720 stills at 8/30/50/70/90 % of the finished video."""
+    if total < 8:
+        log("video too short for thumbnail candidates")
+        return []
+    names = []
+    for i, frac in enumerate((0.08, 0.30, 0.50, 0.70, 0.90), 1):
+        t = min(total - 0.5, total * frac)
+        p = out_dir / f"{name}_thumb_{i}.jpg"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(final),
+             "-frames:v", "1", "-vf", "scale=1280:720", str(p)],
+            capture_output=True, text=True)
+        if r.returncode == 0 and p.exists():
+            names.append(p.name)
+    return names
+
+
+def _kit_loudness(final: Path, log) -> Dict[str, float]:
+    """EBU R128 integrated loudness + true peak of the finished file (audio only)."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(final),
+             "-vn", "-af", "ebur128", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=900)
+    except Exception as e:  # noqa: BLE001 — QC must never fail the render
+        log(f"loudness check failed: {e}")
+        return {}
+    text = r.stderr or ""
+    integ = re.findall(r"I:\s+(-?\d+\.?\d*)\s+LUFS", text)
+    tpeak = re.findall(r"Peak true:\s+(-?\d+\.?\d*)\s*dBTP", text) or \
+        re.findall(r"Peak:\s+(-?\d+\.?\d*)\s*dBTP", text)
+    out: Dict[str, float] = {}
+    if integ:
+        out["integrated"] = float(integ[-1])
+    if tpeak:
+        out["truePeak"] = float(tpeak[-1])
+    if out:
+        log(f"loudness: I {out.get('integrated')} LUFS · "
+            f"true peak {out.get('truePeak')} dBTP (target ≈ −14…−16 LUFS, peak ≤ −1)")
+    else:
+        log("loudness: could not parse ebur128 output")
+    return out
+
+
+def _build_upload_kit(final: Path, name: str, segments: List[Dict[str, Any]],
+                      fast: float, out_dir: Path, log) -> Dict[str, Any]:
+    """Chapters + thumbs + loudness for the finished file. Never raises."""
+    kit: Dict[str, Any] = {"chapters": None, "thumbs": [], "loudness": {}}
+    if not final.exists():
+        return kit
+    try:
+        total = C.render_duration(segments, fast)
+        srt = _kit_chapters_srt(segments, fast, total)
+        srt_path = out_dir / f"{name}_chapters.srt"
+        srt_path.write_text(srt, encoding="utf-8")
+        kit["chapters"] = srt_path.name
+        log(f"chapters: {srt_path.name}")
+        kit["thumbs"] = _kit_thumbs(final, name, out_dir, total, log)
+        if kit["thumbs"]:
+            log(f"thumbnails: {len(kit['thumbs'])} candidates")
+        kit["loudness"] = _kit_loudness(final, log)
+    except Exception as e:  # noqa: BLE001 — the render itself already succeeded
+        log(f"upload kit: {e}")
+    return kit
+
+
+# ---------------------------------------------------------------------------
 # HTTP app
 # ---------------------------------------------------------------------------
 
@@ -382,6 +559,11 @@ class App:
         self.claims: List[Tuple[float, float, str]] = []
         self.proxy_status: Dict[str, Any] = {"ready": False, "progress": 0.0,
                                              "path": None}
+        # which physical channel of a 1-stereo-track OBS file holds the mic
+        self.mic_channel = "left"
+        # channel-split preview streams ("mic" / "content"), built in the
+        # background after the mix proxy; {} when the source is mono
+        self.bus_proxies: Dict[str, Dict[str, Any]] = {}
         self.job: Dict[str, Any] = self._fresh_job("render")
         self._job_lock = threading.Lock()
         self.proxy_width = proxy_width
@@ -410,13 +592,16 @@ class App:
             "segments": segs,
             "render_duration": C.render_duration(segs, self.proc.layout.fastSpeed),
             "proxy": self.proxy_status,
+            "mic_channel": self.mic_channel,
+            "bus_proxies": self.bus_proxies,
             "job": self.job_state(),
         }
 
     @staticmethod
     def _fresh_job(kind: str, state: str = "idle") -> Dict[str, Any]:
         return {"kind": kind, "state": state, "progress": 0.0, "files": {},
-                "result": None, "error": None, "log": []}
+                "thumbs": [], "loudness": {}, "result": None, "error": None,
+                "log": []}
 
     def job_state(self) -> Dict[str, Any]:
         with self._job_lock:
@@ -488,10 +673,22 @@ class App:
         target = str(body.get("target", "patreon"))
         name = str(body.get("name", "youtube_final" if target == "youtube" else "render"))
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "render"
+        def _clean_card(s: Dict[str, Any]) -> Optional[Dict[str, str]]:
+            c = s.get("card")
+            if not isinstance(c, dict):
+                return None
+            out = {}
+            for k in ("title", "sub", "accent"):
+                v = c.get(k)
+                if isinstance(v, str) and v.strip():
+                    out[k] = v.strip()
+            return out or None
+
         raw_segs = body.get("segments") or []
         segments = [
             {"type": str(s.get("type", "body")),
-             "start": float(s.get("start", 0)), "end": float(s.get("end", 0))}
+             "start": float(s.get("start", 0)), "end": float(s.get("end", 0)),
+             "card": _clean_card(s)}
             for s in raw_segs
             if float(s.get("end", 0)) > float(s.get("start", 0))
         ]
@@ -545,9 +742,16 @@ class App:
                     outs = self.proc.mux(video_nc, audio,
                                          self.proc.out / f"{name}.mp4",
                                          webm=bool(body.get("webm", False)))
+                log("building upload kit (chapters · thumbnails · loudness) …")
+                kit = _build_upload_kit(Path(outs.get("mp4") or
+                                              next(iter(outs.values()))),
+                                        name, segments, fast, self.proc.out, log)
+                files = {k: Path(v).name for k, v in outs.items()}
+                if kit["chapters"]:
+                    files["chapters"] = kit["chapters"]
                 with self._job_lock:
-                    self.job.update(state="done", progress=1.0,
-                                    files={k: Path(v).name for k, v in outs.items()})
+                    self.job.update(state="done", progress=1.0, files=files,
+                                    thumbs=kit["thumbs"], loudness=kit["loudness"])
                 log("done.")
             except Exception as e:  # noqa: BLE001 — surfaced to the UI
                 with self._job_lock:
@@ -601,6 +805,8 @@ class App:
         with self._job_lock:
             self.job = self._fresh_job("render")
         self.proxy_status.update(ready=False, progress=0.0, path=None)
+        self.bus_proxies = {}
+        self.mic_channel = str(old.audio_cfg.get("mic_channel", "left"))
         self.proxy_gen += 1
         _start_proxy_worker(self, self.proxy_width)
         return self.state()
@@ -801,6 +1007,18 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/proxy_status":
                 self._json(app.proxy_status)
             elif path == "/api/proxy.mp4":
+                q = parse_qs(url.query)
+                bus = (q.get("bus") or ["mix"])[0]
+                if bus in ("mic", "content"):
+                    st = app.bus_proxies.get(bus) or {}
+                    p = Path(st.get("path") or "")
+                    if not st.get("ready") or not p.exists():
+                        self._json(
+                            {"error": st.get("error") or "preview not ready yet"},
+                            503)
+                        return
+                    self._send_file(p, "video/mp4")
+                    return
                 p = Path(app.proxy_status.get("path") or "")
                 if not app.proxy_status.get("ready") or not p.exists():
                     self._json({"error": "proxy not ready yet"}, 503)
@@ -926,6 +1144,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(app.set_input(str(body.get("name", ""))))
                 except ValueError as e:
                     self._json({"error": str(e)}, 400)
+            elif path == "/api/mic_channel":
+                ch = str(body.get("channel", "left"))
+                if ch not in ("left", "right"):
+                    self._json({"error": "channel must be left or right"}, 400)
+                    return
+                proc.audio_cfg["mic_channel"] = ch
+                app.mic_channel = ch
+                # the mic/content mapping changed — rebuild the split previews
+                mix = Path(app.proxy_status.get("path") or "")
+                if app.proxy_status.get("ready") and mix.exists():
+                    for bus in ("mic", "content"):
+                        app.bus_proxies[bus] = {"ready": False,
+                                                "progress": 0.0, "path": None,
+                                                "error": None}
+                    _start_bus_worker(app, app.proxy_width)
+                self._json({"ok": True})
             elif path == "/api/save_layout":
                 # always a basename inside the output dir (no traversal)
                 name = Path(str(body.get("path") or "layout.json")).name
@@ -964,6 +1198,16 @@ def _start_proxy_worker(app: App, proxy_width: int) -> None:
                 print("Proxy worker orphaned by a source switch — standing down.")
                 return
             print(f"Proxy ready: {app.proxy_status['path']}")
+            # channel-split previews for OBS files that carry two audio buses
+            try:
+                n_audio = len(proc._probe_audio(str(proc.input)))
+            except Exception:
+                n_audio = 1
+            if n_audio >= 2 and gen == app.proxy_gen:
+                for bus in ("mic", "content"):
+                    app.bus_proxies[bus] = {"ready": False, "progress": 0.0,
+                                            "path": None, "error": None}
+                _start_bus_worker(app, proxy_width)
         except Exception as e:
             if gen != app.proxy_gen:
                 return
@@ -971,6 +1215,37 @@ def _start_proxy_worker(app: App, proxy_width: int) -> None:
             print(f"Proxy failed: {e} — exact stills still work.")
 
     threading.Thread(target=_proxy_worker, daemon=True).start()
+
+
+def _start_bus_worker(app: "App", proxy_width: int) -> None:
+    """Build the mic-only / content-only preview streams in the background.
+
+    The video is a stream copy of the mix proxy (instant); only the audio
+    comes from the full-resolution source, so this is far cheaper than a
+    fresh transcode.
+    """
+    gen = app.proxy_gen
+    proc = app.proc
+
+    def _bus_worker():
+        try:
+            mix = Path(app.proxy_status.get("path") or "")
+            if not mix.exists():
+                return
+            for bus in ("mic", "content"):
+                if gen != app.proxy_gen:
+                    return
+                ensure_bus_proxy(proc, bus, mix, proxy_width,
+                                 app.bus_proxies[bus])
+            print("Bus proxies ready (mic / content).")
+        except Exception as e:
+            if gen != app.proxy_gen:
+                return
+            print(f"Bus proxy failed: {e} — the mix preview still works.")
+            for bus in ("mic", "content"):
+                app.bus_proxies[bus].update(ready=False, error=str(e)[:200])
+
+    threading.Thread(target=_bus_worker, daemon=True).start()
 
 
 def serve_forever(proc, port: int = 8000,

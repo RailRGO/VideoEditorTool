@@ -7,6 +7,13 @@ import { fmtTime } from "../lib/timeline";
 import { Btn, Note, Section, Slider, Toggle } from "./ui";
 import { cn } from "../utils/cn";
 
+/** one repeated take: two occurrences of the same phrasing — you pick the survivor */
+export interface TakeOption {
+  key: string;
+  first: { start: number; end: number };
+  second: { start: number; end: number };
+}
+
 function DropList({
   title,
   items,
@@ -63,6 +70,8 @@ export default function Polish({
   fillers,
   pauses,
   takes,
+  takeKeeps,
+  onTakeKeep,
   stutters,
   rules,
   setRules,
@@ -101,7 +110,9 @@ export default function Polish({
   transcript: Transcript | null;
   fillers: FillerHit[];
   pauses: { start: number; end: number }[];
-  takes: { start: number; end: number }[];
+  takes: TakeOption[];
+  takeKeeps: Record<string, "a" | "b">;
+  onTakeKeep: (key: string, keep: "a" | "b") => void;
   stutters: { start: number; end: number }[];
   rules: PolishRules;
   setRules: React.Dispatch<React.SetStateAction<PolishRules>>;
@@ -397,7 +408,7 @@ export default function Polish({
             max={15}
             step={0.5}
             display={`${rules.minTake.toFixed(1)} s`}
-            hint="keeps the LAST take, which is the one you like"
+            hint="pick which occurrence stays, below (default: the last)"
             onChange={(v) => setRules((r) => ({ ...r, minTake: v }))}
           />
           <Slider
@@ -410,13 +421,56 @@ export default function Polish({
             onChange={(v) => setRules((r) => ({ ...r, takeGap: v }))}
           />
         </div>
-        {ready && totalDrops.length > 0 && (
+        {ready && (takes.length > 0 ? (
+          <div className="mt-2 rounded-lg border border-white/10 bg-black/25 p-2">
+            <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-400">
+              Repeated takes · {takes.length} — pick the survivor
+            </p>
+            <ul className="max-h-44 space-y-1 overflow-y-auto">
+              {takes.slice(0, 200).map((t) => {
+                const keep = takeKeeps[t.key] ?? "b";
+                return (
+                  <li key={t.key} className="flex items-center gap-1.5 text-[10px]">
+                    <span className="whitespace-nowrap font-mono text-slate-400">
+                      {fmtTime(t.first.start, true)} → {fmtTime(t.first.end, true)}
+                    </span>
+                    <span className="text-slate-600">vs</span>
+                    <span className="whitespace-nowrap font-mono text-slate-400">
+                      {fmtTime(t.second.start, true)} → {fmtTime(t.second.end, true)}
+                    </span>
+                    <span className="ml-auto flex shrink-0 gap-0.5">
+                      {(["a", "b"] as const).map((k) => (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => onTakeKeep(t.key, k)}
+                          className={cn(
+                            "rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase",
+                            keep === k
+                              ? k === "a"
+                                ? "border-emerald-400/50 bg-emerald-500/25 text-emerald-100"
+                                : "border-sky-400/50 bg-sky-500/25 text-sky-100"
+                              : "border-white/10 bg-white/5 text-slate-500 hover:bg-white/10"
+                          )}
+                        >
+                          keep {k === "a" ? "1st" : "2nd"}
+                        </button>
+                      ))}
+                    </span>
+                  </li>
+                );
+              })}
+              {takes.length > 200 && (
+                <li className="text-[10px] text-slate-600">… {takes.length - 200} more</li>
+              )}
+            </ul>
+          </div>
+        ) : totalDrops.length > 0 && (
           <div className="mt-2 space-y-1.5">
-            <DropList title="Repeated takes (keeping the last)" items={takes} format={(r) => `${fmtTime(r.start, true)} → ${fmtTime(r.end, true)}`} />
             <DropList title="Stumbles" items={stutters} format={(r) => `${fmtTime(r.start, true)} → ${fmtTime(r.end, true)}`} />
             <DropList title="Long pauses" items={pauses} format={(r) => `${fmtTime(r.start, true)} → ${fmtTime(r.end, true)}`} />
           </div>
-        )}
+        ))}
       </Section>
 
       <Section title="5 · Reaction start &amp; lead-in">

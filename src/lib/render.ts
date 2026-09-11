@@ -31,6 +31,8 @@ export interface Scene {
   speed: number;
   /** overrides layout.content for the placeholder card (full-frame card in passthrough) */
   cardRect?: Rect;
+  /** per-segment card text; empty fields fall back to layout.card */
+  cardText?: { title?: string; sub?: string; accent?: string };
   /** anti-fingerprint frame treatment (YouTube passthrough only) */
   cloak?: VideoCloak | null;
 }
@@ -105,7 +107,7 @@ export function buildScene(
 
   // Placeholder card: camera stays in its corner, the content area becomes the card
   if (type === "card") {
-    return { bg: bgOf(), layers: [camLayer()], mode: "card", speed: 1 };
+    return { bg: bgOf(), layers: [camLayer()], mode: "card", speed: 1, cardText: active?.card };
   }
 
   // lead-in: reaction layout, but the content block is still black
@@ -154,6 +156,7 @@ export function buildPassthroughScene(
       mode: "card",
       speed: 1,
       cardRect: { x: 0.06, y: 0.16, w: 0.88, h: 0.68 },
+      cardText: active?.card,
     };
   }
   const layer: SceneLayer = {
@@ -282,10 +285,16 @@ function drawCard(
   layout: LayoutState,
   W: number,
   H: number,
-  rect?: Rect
+  rect?: Rect,
+  cardText?: { title?: string; sub?: string; accent?: string }
 ) {
   const k = H / 1080;
   const r = rect ?? layout.content;
+  // per-segment override; empty fields inherit the global card
+  const pick = (v: string | undefined) => (v && v.trim() ? v : undefined);
+  const title = pick(cardText?.title) ?? layout.card.title;
+  const sub = pick(cardText?.sub) ?? layout.card.sub;
+  const accent = pick(cardText?.accent) ?? layout.card.accent;
   const x = r.x * W;
   const y = r.y * H;
   const w = r.w * W;
@@ -303,7 +312,7 @@ function drawCard(
   ctx.fillRect(x, y, w, h);
 
   // accent bar
-  ctx.fillStyle = layout.card.accent;
+  ctx.fillStyle = accent;
   ctx.fillRect(x + w * 0.16, y + h * 0.34, w * 0.68, 4 * k);
 
   ctx.textAlign = "center";
@@ -311,13 +320,13 @@ function drawCard(
   ctx.fillStyle = "#f1f5f9";
   const size = Math.max(11, Math.min(58 * k, (w * 0.072) | 0));
   ctx.font = `700 ${size}px ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif`;
-  ctx.fillText(layout.card.title, x + w / 2, y + h * 0.47, w * 0.88);
+  ctx.fillText(title, x + w / 2, y + h * 0.47, w * 0.88);
 
   ctx.fillStyle = "rgba(226,232,240,0.72)";
   ctx.font = `400 ${(size * 0.62) | 0}px ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif`;
-  ctx.fillText(layout.card.sub, x + w / 2, y + h * 0.58, w * 0.88);
+  ctx.fillText(sub, x + w / 2, y + h * 0.58, w * 0.88);
 
-  ctx.strokeStyle = layout.card.accent;
+  ctx.strokeStyle = accent;
   ctx.globalAlpha = 0.5;
   ctx.lineWidth = 2 * k;
   shapePath(ctx, "rounded", x + 1, y + 1, w - 2, h - 2, radius);

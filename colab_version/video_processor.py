@@ -991,8 +991,10 @@ class ReactionVideoProcessor:
             if typ in ("mute", "card"):
                 af += ",volume=0"
             if typ == "card":
+                # per-segment override; empty fields inherit the global card
                 vf += "," + ",".join(
-                    self._card_draws(card or {}, W, H, suffix=f"_{i}")
+                    self._card_draws({**(card or {}), **(s.get("card") or {})},
+                                     W, H, suffix=f"_{i}")
                 )
             elif cloak_vf:
                 vf += "," + ",".join(cloak_vf)
