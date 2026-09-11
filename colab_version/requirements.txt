@@ -1,3 +1,6 @@
+# Full set (used by the in-cell widget editor + the legacy notebook).
+# backend_colab.ipynb installs only what's missing — see DEPS in
+# colab_launch.py (numpy, opencv, mediapipe, faster-whisper).
 numpy
 opencv-python
 mediapipe
