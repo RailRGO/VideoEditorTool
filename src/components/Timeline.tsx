@@ -69,8 +69,11 @@ function Playhead({
   const el = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let raf = 0;
-    const loop = () => {
+    let last = 0;
+    const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
+      if (t - last < 33) return; // ~30 fps is plenty for the playhead
+      last = t;
       const node = el.current;
       if (!node || duration <= 0) return;
       const p = clamp(getSrcTime() / duration, 0, 1);

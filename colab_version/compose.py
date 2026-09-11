@@ -48,6 +48,10 @@ except ImportError:  # package-style import
 BASE_COLOR = (12, 6, 4)  # #04060c in BGR — the app background plate
 
 
+class RenderCancelled(Exception):
+    """Raised to abort a render when the user cancels the running job."""
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -590,12 +594,16 @@ def render_video(input_path: str, output_path: str,
                  crf: int = 18, preset: str = "fast",
                  width: int = 1920, height: int = 1080,
                  progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cancel_check: Optional[Callable[[], bool]] = None,
                  cam_hook=None) -> Dict[str, Any]:
     """Render the full programme through compose_frame().
 
     Returns {path, frames, fps, duration}. Audio is NOT included here —
     mux it afterwards (see video_processor.mix_and_mux) so the same
     segment map can conform both streams.
+
+    *cancel_check* is polled per frame; when it returns True the render
+    aborts by raising RenderCancelled (the writer is closed first).
     """
     layout = layout or default_layout()
     info = probe_video(input_path)
@@ -630,8 +638,12 @@ def render_video(input_path: str, output_path: str,
     src_fps = info["fps"] or fps
     cur_t = -1.0
     frame = None
+    cancelled = False
     try:
         for idx, (st, mode, seg_card) in enumerate(plan):
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                break
             # sequential read: advance until we pass the wanted timestamp
             if st < cur_t - 1e-3:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, st) * 1000.0)
@@ -673,6 +685,14 @@ def render_video(input_path: str, output_path: str,
             writer.wait()
         else:
             writer.release()
+
+    if cancelled:
+        # don't leave a half-written output file behind
+        try:
+            Path(output_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RenderCancelled("render cancelled by user")
 
     out_dur = total / fps
     return {"path": str(output_path), "frames": total, "fps": fps,

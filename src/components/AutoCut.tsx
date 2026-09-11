@@ -85,11 +85,15 @@ function EnvelopeChart({
 
   useEffect(() => {
     let raf = 0;
-    const loop = () => {
+    let last = 0;
+    const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
+      if (t - last < 33) return; // ~30 fps playhead — same budget as the timeline
+      last = t;
       const node = head.current;
       if (!node || !env.duration) return;
-      node.style.left = `${Math.min(100, (getSrcTime() / env.duration) * 100)}%`;
+      const pct = `${Math.min(100, (getSrcTime() / env.duration) * 100)}%`;
+      if (node.style.left !== pct) node.style.left = pct;
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);

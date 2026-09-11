@@ -43,6 +43,8 @@ if str(COLAB_DIR) not in sys.path:
 import compose as C  # noqa: E402
 import layouts as L  # noqa: E402
 
+RenderCancelled = C.RenderCancelled
+
 INDEX_HTML = HERE / "index.html"
 CLOUDFLARED = Path.home() / ".local" / "bin" / "cloudflared"
 
@@ -78,6 +80,24 @@ def _is_ours_alive(port: int) -> bool:
 # ---------------------------------------------------------------------------
 # proxy transcode (cached on Drive, generated once)
 # ---------------------------------------------------------------------------
+
+_ENCODER_CACHE: Dict[str, bool] = {}
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """True when this ffmpeg build can encode with *name* (cached)."""
+    if name in _ENCODER_CACHE:
+        return _ENCODER_CACHE[name]
+    ok = False
+    try:
+        p = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                           capture_output=True, text=True, timeout=30)
+        ok = f" {name} " in (p.stdout or "")
+    except Exception:
+        ok = False
+    _ENCODER_CACHE[name] = ok
+    return ok
+
 
 def proxy_path_for(proc, width: int = 960) -> Path:
     src = Path(proc.input)
@@ -118,9 +138,15 @@ def ensure_proxy(proc, width: int = 960,
                       "-map", "[v]", "-map", "[a]"]
     else:
         audio_args = ["-vf", f"scale={width}:-2", "-ac", "2"]
+    # The proxy is a throwaway preview: prioritise speed over size. NVENC when
+    # the runtime has a GPU (paid Colab) — else the fastest x264 preset. Both
+    # are far quicker than the old `veryfast` CPU encode.
+    if _ffmpeg_has_encoder("h264_nvenc"):
+        vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", "-b:v", "0"]
+    else:
+        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
     cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
-           *audio_args, "-c:v", "libx264", "-preset", "veryfast",
-           "-crf", "30", "-c:a", "aac", "-b:a", "96k",
+           *audio_args, *vcodec, "-c:a", "aac", "-b:a", "96k",
            "-movflags", "+faststart", str(out)]
     # run with progress parsed from the `time=` field
     dur = max(1.0, float(proc.duration or 1.0))
@@ -470,8 +496,6 @@ def _kit_chapters_srt(segments: List[Dict[str, Any]], fast: float,
         rows.insert(0, (0.0, "start"))
     if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
         rows.pop()
-    if rows[-1][0] > total - 1.5:  # keep the last chapter meaningful
-        rows.pop()
     lines: List[str] = []
     for i, (st, ty) in enumerate(rows):
         et = rows[i + 1][0] if i + 1 < len(rows) else max(total, st + 1.0)
@@ -568,6 +592,8 @@ class App:
         self._job_lock = threading.Lock()
         self.proxy_width = proxy_width
         self.proxy_gen = 0  # orphaned workers (after a source switch) stand down
+        # set by /api/job/cancel; polled by the running render/transcript worker
+        self.cancel_requested = False
 
     # -- state ---------------------------------------------------------------
     def segments(self) -> List[Dict[str, Any]]:
@@ -607,6 +633,15 @@ class App:
         with self._job_lock:
             return dict(self.job)
 
+    def cancel_job(self) -> Dict[str, Any]:
+        """Ask the running render/transcript worker to stop at its next
+        checkpoint. The worker sets the final state ('cancelled') itself."""
+        with self._job_lock:
+            if self.job["state"] == "running":
+                self.cancel_requested = True
+                self.job["log"].append("cancelling…")
+        return self.job_state()
+
     # -- speech-to-text (drives the Polish tab's Transcribe button) -----------
     def start_transcript(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Transcribe speech spans (intro/outro) with word timings.
@@ -619,6 +654,7 @@ class App:
                 raise ValueError("the server is busy with another job — "
                                  "wait for it first")
             self.job = self._fresh_job("transcript", "running")
+            self.cancel_requested = False
 
         def log(msg):
             with self._job_lock:
@@ -637,10 +673,15 @@ class App:
                     raise ValueError("no speech spans given")
                 model = str(body.get("model", "small") or "small")
                 res = self.proc.transcribe_spans(spans, lang=lang, model=model,
-                                                 progress_cb=frac)
+                                                 progress_cb=frac,
+                                                 cancel_check=lambda: self.cancel_requested)
                 with self._job_lock:
                     self.job.update(state="done", progress=1.0, result=res)
                 log(f"{len(res['words'])} words ({res['lang']}).")
+            except RenderCancelled:
+                with self._job_lock:
+                    self.job.update(state="cancelled", error=None)
+                log("transcription cancelled by user.")
             except Exception as e:  # noqa: BLE001 — surfaced to the UI
                 with self._job_lock:
                     self.job.update(state="error", error=str(e)[:500])
@@ -661,6 +702,7 @@ class App:
             if self.job["state"] == "running":
                 return dict(self.job)
             self.job = self._fresh_job("render", "running")
+            self.cancel_requested = False
 
         def log(msg):
             with self._job_lock:
@@ -715,6 +757,7 @@ class App:
                         height=int(body.get("height", 0) or 0),
                         name=name, webm=bool(body.get("webm", False)),
                         progress_cb=lambda d, t: frac(0.05 + 0.9 * d / max(1, t)),
+                        cancel_check=lambda: self.cancel_requested,
                     )
                 else:
                     self.proc.layout = L.LayoutState.from_dict(layout_d)
@@ -731,14 +774,16 @@ class App:
                         segments=segments, crf=int(body.get("crf", 18)),
                         fps=body.get("fps") or None,
                         width=1920 if not h or h >= 1080 else 1280,
-                        height=h or 1080)
+                        height=h or 1080,
+                        cancel_check=lambda: self.cancel_requested)
                     frac(0.85)
                     log("video done — mixing audio …")
                     audio = self.proc.mix_audio(
                         output_path=str(self.proc.work / f"{name}_mix.wav"),
                         segments=segments, fast_speed=fast,
                         mute_solo=bool(self.proc.layout.muteContentInSolo),
-                        master_gain_db=master)
+                        master_gain_db=master,
+                        cancel_check=lambda: self.cancel_requested)
                     outs = self.proc.mux(video_nc, audio,
                                          self.proc.out / f"{name}.mp4",
                                          webm=bool(body.get("webm", False)))
@@ -753,6 +798,10 @@ class App:
                     self.job.update(state="done", progress=1.0, files=files,
                                     thumbs=kit["thumbs"], loudness=kit["loudness"])
                 log("done.")
+            except RenderCancelled:
+                with self._job_lock:
+                    self.job.update(state="cancelled", error=None)
+                log("render cancelled by user.")
             except Exception as e:  # noqa: BLE001 — surfaced to the UI
                 with self._job_lock:
                     self.job.update(state="error", error=str(e))
@@ -1139,6 +1188,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(app.start_transcript(body))
                 except ValueError as e:
                     self._json({"error": str(e)}, 409)
+            elif path == "/api/job/cancel":
+                self._json(app.cancel_job())
             elif path == "/api/source":
                 try:
                     self._json(app.set_input(str(body.get("name", ""))))

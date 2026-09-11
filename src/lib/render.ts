@@ -1,5 +1,5 @@
 import type { LayerStyle, LayoutState, Rect, Segment, Shape, VideoCloak } from "./types";
-import type { FacePose } from "./retouch";
+import { fitRect, type FacePose } from "./retouch";
 
 export type SrcRect = { x: number; y: number; w: number; h: number };
 
@@ -215,51 +215,20 @@ export function drawInto(
   style: LayerStyle
 ) {
   if (dw <= 0.5 || dh <= 0.5 || src.w <= 0 || src.h <= 0) return;
-  const sAsp = src.w / src.h;
-  const dAsp = dw / dh;
-  let sx = src.x;
-  let sy = src.y;
-  let sw = src.w;
-  let sh = src.h;
-
-  if (style.fit === "cover") {
-    if (sAsp > dAsp) {
-      const nw = src.h * dAsp;
-      sx = src.x + (src.w - nw) / 2;
-      sw = nw;
-    } else {
-      const nh = src.w / dAsp;
-      sy = src.y + (src.h - nh) / 2;
-      sh = nh;
-    }
-  } else {
-    let w = dw;
-    let h = dh;
-    if (sAsp > dAsp) h = dw / sAsp;
-    else w = dh * sAsp;
-    dx += (dw - w) / 2;
-    dy += (dh - h) / 2;
-    dw = w;
-    dh = h;
-  }
-
-  const zw = dw * style.zoom;
-  const zh = dh * style.zoom;
-  const zx = dx + (dw - zw) / 2 + style.offsetX * dw;
-  const zy = dy + (dh - zh) / 2 + style.offsetY * dh;
+  const t = fitRect(src, dx, dy, dw, dh, style);
 
   ctx.save();
   ctx.globalAlpha *= style.opacity;
   if (style.mirror) {
-    ctx.translate(zx * 2 + zw, 0);
+    ctx.translate(t.zx * 2 + t.zw, 0);
     ctx.scale(-1, 1);
   }
   if (style.shape !== "rect" || style.radius > 0) {
-    shapePath(ctx, style.shape, zx, zy, zw, zh, style.radius);
+    shapePath(ctx, style.shape, t.zx, t.zy, t.zw, t.zh, style.radius);
     ctx.clip();
   }
   try {
-    ctx.drawImage(image, sx, sy, sw, sh, zx, zy, zw, zh);
+    ctx.drawImage(image, t.sx, t.sy, t.sw, t.sh, t.zx, t.zy, t.zw, t.zh);
   } catch {
     /* frame not ready yet */
   }
@@ -269,10 +238,10 @@ export function drawInto(
     shapePath(
       ctx,
       style.shape,
-      zx + style.border / 2,
-      zy + style.border / 2,
-      Math.max(1, zw - style.border),
-      Math.max(1, zh - style.border),
+      t.zx + style.border / 2,
+      t.zy + style.border / 2,
+      Math.max(1, t.zw - style.border),
+      Math.max(1, t.zh - style.border),
       Math.max(0, style.radius - style.border / 2)
     );
     ctx.stroke();
@@ -551,6 +520,8 @@ export function renderScene(
 
     // the camera goes through the beauty pipeline first
     let image: CanvasImageSource = video;
+    let imageSrc = l.src;
+    let imageStyle = style;
     if (l.isCam && retouch) {
       const prepared = retouch.prepare(
         video,
@@ -559,18 +530,24 @@ export function renderScene(
         Math.max(2, Math.round(l.rect.h * H)),
         l.style
       );
-      if (prepared) image = prepared;
+      if (prepared) {
+        // the work canvas already holds the fitted / zoomed / offset camera,
+        // so blit it 1:1 instead of applying the transform a second time
+        image = prepared;
+        imageSrc = { x: 0, y: 0, w: prepared.width, h: prepared.height };
+        imageStyle = { ...style, fit: "cover", zoom: 1, offsetX: 0, offsetY: 0 };
+      }
     }
 
     drawInto(
       ctx,
       image,
-      l.src,
+      imageSrc,
       l.rect.x * W,
       l.rect.y * H,
       l.rect.w * W,
       l.rect.h * H,
-      style
+      imageStyle
     );
 
     if (l.isCam && retouch?.debugPose && showFaceBox) {

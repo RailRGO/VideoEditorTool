@@ -5,6 +5,82 @@ export interface Pt {
   y: number;
 }
 
+/** A source rectangle in image pixels (same shape as render.ts's SrcRect). */
+export interface SrcRectLike {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** The subset of LayerStyle that the fit maths needs. */
+export interface FitStyle {
+  fit: "cover" | "contain";
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+/** Where a source rect lands after fit / zoom / offset. */
+export interface DrawTransform {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  zx: number;
+  zy: number;
+  zw: number;
+  zh: number;
+}
+
+/**
+ * The exact fit maths used by drawInto: crop (cover) or letterbox (contain)
+ * the source into the destination, then apply zoom and offset. `sx/sy/sw/sh`
+ * is the visible source sub-rect (image pixels); `zx/zy/zw/zh` is where it is
+ * drawn (destination pixels). Kept in one place so the retouch pose mapping
+ * can't drift from what actually gets drawn.
+ */
+export function fitRect(
+  src: SrcRectLike,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  style: FitStyle
+): DrawTransform {
+  const sAsp = src.w / src.h;
+  const dAsp = dw / dh;
+  let sx = src.x;
+  let sy = src.y;
+  let sw = src.w;
+  let sh = src.h;
+  if (style.fit === "cover") {
+    if (sAsp > dAsp) {
+      const nw = src.h * dAsp;
+      sx = src.x + (src.w - nw) / 2;
+      sw = nw;
+    } else {
+      const nh = src.w / dAsp;
+      sy = src.y + (src.h - nh) / 2;
+      sh = nh;
+    }
+  } else {
+    let w = dw;
+    let h = dh;
+    if (sAsp > dAsp) h = dw / sAsp;
+    else w = dh * sAsp;
+    dx += (dw - w) / 2;
+    dy += (dh - h) / 2;
+    dw = w;
+    dh = h;
+  }
+  const zw = dw * style.zoom;
+  const zh = dh * style.zoom;
+  const zx = dx + (dw - zw) / 2 + style.offsetX * dw;
+  const zy = dy + (dh - zh) / 2 + style.offsetY * dh;
+  return { sx, sy, sw, sh, zx, zy, zw, zh };
+}
+
 /** Landmark indices from the MediaPipe face mesh (478 points, irises included). */
 export const FACE_OVAL = [
   10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
@@ -57,41 +133,19 @@ function centroid(pts: Pt[]): Pt {
 
 /**
  * Convert normalised landmarks (0..1 over the camera half of the source) into
- * layer pixels for a layer drawn with `fit` / zoom / offset.
+ * layer pixels. `src` is the camera source rect (image pixels) and `t` is the
+ * same fitRect() transform that drew the camera into the work canvas, so the
+ * pose lines up with the pixels exactly — for cover, contain, zoom and offset
+ * alike.
  */
 export function poseFromLandmarks(
   lm: { x: number; y: number }[],
-  layer: { x: number; y: number; w: number; h: number },
-  fit: "cover" | "contain",
-  zoom: number,
-  offsetX: number,
-  offsetY: number
+  src: SrcRectLike,
+  t: DrawTransform
 ): FacePose {
-  // replicate the fit maths used by drawInto so the pose lines up exactly
-  const sAsp = layer.w / layer.h;
-  let dw = layer.w;
-  let dh = layer.h;
-  let ox = layer.x;
-  let oy = layer.y;
-  if (fit === "contain") {
-    if (sAsp > 1) {
-      dh = layer.w / sAsp;
-      dw = layer.w;
-    } else {
-      dw = layer.h * sAsp;
-      dh = layer.h;
-    }
-    ox = layer.x + (layer.w - dw) / 2;
-    oy = layer.y + (layer.h - dh) / 2;
-  }
-  const zw = dw * zoom;
-  const zh = dh * zoom;
-  const zx = ox + (dw - zw) / 2 + offsetX * dw;
-  const zy = oy + (dh - zh) / 2 + offsetY * dh;
-
   const map = (i: number): Pt => ({
-    x: zx + lm[i].x * zw,
-    y: zy + lm[i].y * zh,
+    x: t.zx + ((src.x + lm[i].x * src.w - t.sx) / t.sw) * t.zw,
+    y: t.zy + ((src.y + lm[i].y * src.h - t.sy) / t.sh) * t.zh,
   });
 
   const oval = FACE_OVAL.map(map);
@@ -264,7 +318,11 @@ export function smoothSkin(
       const b = data[i + 2];
       if (!isSkin(r, g, b)) continue;
 
-      const bi = ((Math.round(y * sy) * blurW) + Math.round(x * sx)) * 4;
+      // clamp the sample indices — x*sx / y*sy can round up to exactly
+      // blurW/blurH at the box edge, which would read past the blurred buffer
+      const bx = Math.min(blurW - 1, Math.round(x * sx));
+      const by = Math.min(blurH - 1, Math.round(y * sy));
+      const bi = (by * blurW + bx) * 4;
       const br = blurred[bi];
       const bg = blurred[bi + 1];
       const bb = blurred[bi + 2];

@@ -45,7 +45,7 @@ export interface RemoteLoudness {
 
 export interface RemoteJob {
   kind: "render" | "transcript";
-  state: "idle" | "running" | "done" | "error";
+  state: "idle" | "running" | "done" | "error" | "cancelled";
   progress: number;
   files: Record<string, string>;
   /** upload kit from a finished render: chapters in `files`, thumbs here */
@@ -184,6 +184,13 @@ export class RemoteClient {
     });
 
   job = (): Promise<RemoteJob> => this.req("/api/job");
+
+  cancelJob = (): Promise<RemoteJob> =>
+    this.req("/api/job/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
 
   /** bus: "mix" (default), "mic" or "content" */
   proxyUrl = (bus: "mix" | "mic" | "content" = "mix"): string =>

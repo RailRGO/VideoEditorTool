@@ -208,16 +208,20 @@ export function Meter({
   const txt = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     let raf = 0;
-    const loop = () => {
+    let last = 0;
+    const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
+      // ~15 fps is plenty for a meter; touching the DOM every frame is what
+      // keeps the main thread busy and makes the editor feel laggy
+      if (t - last < 66) return;
+      last = t;
       const v = get();
-      const pct = Math.max(0, Math.min(1, (v + 60) / 60)) * 100;
-      if (bar.current) bar.current.style.width = `${pct}%`;
-      if (bar.current) {
-        bar.current.style.background =
-          v > -0.5 ? "#f43f5e" : v > warn ? "#fbbf24" : "#34d399";
-      }
-      if (txt.current) txt.current.textContent = v <= -59.5 ? "-∞" : v.toFixed(1);
+      const pct = `${(Math.max(0, Math.min(1, (v + 60) / 60)) * 100).toFixed(1)}%`;
+      if (bar.current && bar.current.style.width !== pct) bar.current.style.width = pct;
+      const bg = v > -0.5 ? "#f43f5e" : v > warn ? "#fbbf24" : "#34d399";
+      if (bar.current && bar.current.style.background !== bg) bar.current.style.background = bg;
+      const text = v <= -59.5 ? "-∞" : v.toFixed(1);
+      if (txt.current && txt.current.textContent !== text) txt.current.textContent = text;
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -244,9 +248,15 @@ export function LiveText({ get, className }: { get: () => string; className?: st
   const el = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     let raf = 0;
-    const loop = () => {
+    let last = 0;
+    const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
-      if (el.current) el.current.textContent = get();
+      // throttled + change-only: writing textContent at 60fps forces layout
+      if (t - last < 66) return;
+      last = t;
+      if (!el.current) return;
+      const s = get();
+      if (el.current.textContent !== s) el.current.textContent = s;
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
