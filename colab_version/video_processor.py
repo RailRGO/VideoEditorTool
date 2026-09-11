@@ -44,6 +44,8 @@ except ImportError:  # package-style import
     from . import layouts as L
     from . import compose as C
 
+RenderCancelled = C.RenderCancelled
+
 try:
     import whisper
 except ImportError:
@@ -659,7 +661,8 @@ class ReactionVideoProcessor:
                          layout: Optional[L.LayoutState] = None,
                          segments: Optional[List[Dict[str, Any]]] = None,
                          crf: int = 18, fps: Optional[float] = None,
-                         width: int = 1920, height: int = 1080) -> str:
+                         width: int = 1920, height: int = 1080,
+                         cancel_check=None) -> str:
         """Render composited VIDEO (no audio) through the WYSIWYG compositor.
 
         Backward-compatible signature: old calls with preset= / intro_mode=
@@ -682,6 +685,7 @@ class ReactionVideoProcessor:
 
         res = C.render_video(str(self.input), str(out), layout=layout,
                              segments=segments, crf=crf, progress_cb=cb,
+                             cancel_check=cancel_check,
                              cam_hook=hook, fps=fps, width=width, height=height)
         print(f"Composed {res['frames']} frames -> {out}")
         return str(out)
@@ -803,7 +807,8 @@ class ReactionVideoProcessor:
                   output_path=None, compressor=True, limiter=True, duck=True,
                   segments: Optional[List[Dict[str, Any]]] = None,
                   fast_speed: float = 4.0, mute_solo: bool = True,
-                  master_gain_db: float = 0.0) -> str:
+                  master_gain_db: float = 0.0,
+                  cancel_check=None) -> str:
         """Mix mic + content buses, conformed to the same segment map as video.
 
         *segments*: cut spans are dropped, fast spans get atempo, mute/card
@@ -823,6 +828,8 @@ class ReactionVideoProcessor:
         mic_wav = self.work / "mic.wav"
         content_wav = self.work / "content.wav"
         self._extract_bus(src, mic_wav, "mic", mic_channel)
+        if cancel_check is not None and cancel_check():
+            raise RenderCancelled("render cancelled by user")
         self._extract_bus(src, content_wav, "content", content_channel)
 
         mic_proc = self.work / "mic_proc.wav"
@@ -865,10 +872,11 @@ class ReactionVideoProcessor:
             tmp.replace(content_proc)
 
         mic_final = self._conform_bus(mic_proc, segments, fast_speed, mute_to_zero=False,
-                                      tag="mic")
+                                      tag="mic", cancel_check=cancel_check)
         content_final = self._conform_bus(content_proc, segments, fast_speed,
                                           mute_to_zero=True, tag="content",
-                                          mute_solo=mute_solo)
+                                          mute_solo=mute_solo,
+                                          cancel_check=cancel_check)
         self._ff(["ffmpeg", "-y", "-i", str(mic_final), "-i", str(content_final),
                   "-filter_complex",
                   "amix=inputs=2:duration=longest:dropout_transition=0.2[m];"
@@ -880,7 +888,7 @@ class ReactionVideoProcessor:
         return str(dst)
 
     def _conform_bus(self, wav: Path, segments, fast_speed, mute_to_zero, tag,
-                     mute_solo: bool = False) -> Path:
+                     mute_solo: bool = False, cancel_check=None) -> Path:
         """Cut/drop/speed one audio bus identically to the video timeline."""
         if not segments:
             return wav
@@ -895,10 +903,14 @@ class ReactionVideoProcessor:
         outs, chain = [], []
         chain.append(f"[0:a]asplit={n}" + "".join(f"[s{i}]" for i in range(n)))
         for i, s in enumerate(kept):
+            if cancel_check is not None and cancel_check():
+                raise RenderCancelled("render cancelled by user")
             f = [f"atrim=start={s['start']:.3f}:end={s['end']:.3f}",
                  "asetpts=PTS-STARTPTS"]
             if s.get("type") == "fast":
-                f.append(f"atempo={float(fast_speed):.3f}")
+                # atempo only spans 0.5..2.0 — chain it (the default 4x speed
+                # would otherwise fail the whole Patreon audio conform)
+                f.extend(_atempo_chain(float(fast_speed)))
             if mute_to_zero and s.get("type") in mute_types:
                 f.append("volume=0")
             outs.append(f"[b{i}]")
@@ -944,6 +956,7 @@ class ReactionVideoProcessor:
         name: str = "youtube_final",
         webm: bool = False,
         progress_cb=None,
+        cancel_check=None,
     ) -> Dict[str, str]:
         """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
 
@@ -1043,11 +1056,17 @@ class ReactionVideoProcessor:
             tail.append(line)
             if len(tail) > 60:
                 tail.pop(0)
+            if cancel_check is not None and cancel_check():
+                p.kill()
+                p.wait()
+                raise RenderCancelled("render cancelled by user")
             m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
             if m and progress_cb:
                 t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
                 progress_cb(min(t, total), total)
         p.wait()
+        if cancel_check is not None and cancel_check():
+            raise RenderCancelled("render cancelled by user")
         if p.returncode != 0 or not out.exists():
             raise RuntimeError("passthrough render failed:\n" + "".join(tail)[-2000:])
         if progress_cb:
@@ -1339,7 +1358,7 @@ class ReactionVideoProcessor:
     # ------------------------------------------------------------- transcript
     def transcribe_spans(self, spans: List[Dict[str, Any]], lang: str = "auto",
                          model: str = "small", bus: str = "mic",
-                         progress_cb=None) -> Dict[str, Any]:
+                         progress_cb=None, cancel_check=None) -> Dict[str, Any]:
         """Speech-to-text with word timings over selected spans (intro/outro).
 
         faster-whisper is preferred (fast on GPU, good Russian), openai-whisper
@@ -1367,6 +1386,8 @@ class ReactionVideoProcessor:
         detected = lang_arg
         done = 0.0
         for i, (a, b) in enumerate(clean):
+            if cancel_check is not None and cancel_check():
+                raise RenderCancelled("transcription cancelled by user")
             wav = self.work / f"trx_{i}.wav"
             try:
                 self._extract_bus(str(self.input), wav, bus, ss=a, t=b - a)

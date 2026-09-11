@@ -166,6 +166,8 @@ export default function App() {
   /** frame budget: last draw time / signature, so we skip redraws while idle */
   const lastDrawRef = useRef({ at: 0, t: -1, rev: -1, face: false });
   const drawRevRef = useRef(0);
+  /** when the proxy transcode made its first measurable progress */
+  const proxyStartRef = useRef(0);
 
   const engine = () => (engineRef.current ??= new AudioEngine());
 
@@ -214,6 +216,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [sources, setSources] = useState<RemoteSource[]>([]);
   const [proxyProgress, setProxyProgress] = useState(0);
+  const [proxyEta, setProxyEta] = useState(0);
   const [remoteJob, setRemoteJob] = useState<RemoteJob | null>(null);
   /** which audio bus the remote preview element is playing */
   const [previewBus, setPreviewBus] = useState<"mix" | "mic" | "content">("mix");
@@ -1028,6 +1031,15 @@ export default function App() {
         const btn = t?.closest?.("button") as HTMLElement | null;
         if (btn) btn.blur();
         togglePlay();
+      } else if (e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === "j" || e.key === "J") {
+        e.preventDefault();
+        seekSrc(timeRef.current.src - 10);
+      } else if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        seekSrc(timeRef.current.src + 10);
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
         e.preventDefault();
         if (e.shiftKey) redo();
@@ -1141,6 +1153,7 @@ export default function App() {
         if (st.proxy.ready) {
           const v = videoRef.current;
           if (!v) return;
+          setProxyEta(0);
           setFileName(st.info.path);
           setResult(null);
           setEnv(null);
@@ -1156,7 +1169,13 @@ export default function App() {
           v.load();
           return;
         }
-        setProxyProgress(st.proxy.progress);
+        const p = st.proxy.progress;
+        setProxyProgress(p);
+        if (p > 0.01 && p < 0.99) {
+          if (!proxyStartRef.current) proxyStartRef.current = performance.now();
+          const elapsed = (performance.now() - proxyStartRef.current) / 1000;
+          setProxyEta((elapsed / p) * (1 - p));
+        }
         await sleep(2000);
       }
     },
@@ -1196,6 +1215,8 @@ export default function App() {
       setConnecting(true);
       setRemoteError("");
       setProxyProgress(0);
+      setProxyEta(0);
+      proxyStartRef.current = 0;
       try {
         const client = new RemoteClient(raw);
         if (!client.base) throw new Error("Paste the tunnel URL from the notebook cell.");
@@ -1240,6 +1261,8 @@ export default function App() {
       setConnecting(true);
       setRemoteError("");
       setProxyProgress(0);
+      setProxyEta(0);
+      proxyStartRef.current = 0;
       try {
         await client.setSource(name);
         if (connectToken.current !== token) return;
@@ -1342,6 +1365,16 @@ export default function App() {
       setRemoteError(e instanceof Error ? e.message : String(e));
     }
   }, [duration, fileName, fps, res, remoteJob?.state]);
+
+  const cancelRemoteExport = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client) return;
+    try {
+      setRemoteJob(await client.cancelJob());
+    } catch {
+      /* tunnel hiccup — the next job poll will pick up the state */
+    }
+  }, []);
 
   /* poll a running remote render until it lands */
   useEffect(() => {
@@ -1492,6 +1525,10 @@ export default function App() {
         }
         if (j.state === "error") {
           setTrError(j.error || "Transcription failed.");
+          break;
+        }
+        if (j.state === "cancelled") {
+          setTrError("Transcription cancelled.");
           break;
         }
       }
@@ -1778,8 +1815,15 @@ export default function App() {
     setResult(null);
     setProgress(0);
     lastProgress.current = 0;
-    cv.width = res === 1080 ? 1920 : 1280;
-    cv.height = res === 1080 ? 1080 : 720;
+    // YouTube: render at the source's own size — no resizing. Patreon: a
+    // fresh composite, so the chosen 1080/720 resolution applies.
+    if (targetRef.current === "youtube") {
+      cv.width = v.videoWidth || 1920;
+      cv.height = v.videoHeight || 1080;
+    } else {
+      cv.width = res === 1080 ? 1920 : 1280;
+      cv.height = res === 1080 ? 1080 : 720;
+    }
 
     const stream = cv.captureStream(fps);
     const eng = engine();
@@ -2303,6 +2347,11 @@ export default function App() {
                           />
                         </div>
                       )}
+                      {!remoteInfo?.proxy.ready && proxyEta > 1 && (
+                        <p className="mx-auto mt-2 font-mono text-[10px] text-slate-500">
+                          about {fmtTime(proxyEta)} left
+                        </p>
+                      )}
                       {remoteError && (
                         <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
                           {remoteError}
@@ -2568,6 +2617,7 @@ export default function App() {
                         job: remoteJob,
                         error: remoteError,
                         onExport: () => void startRemoteExport(),
+                        onCancel: () => void cancelRemoteExport(),
                         fileUrl: (n) => remote?.fileUrl(n) ?? "#",
                       }
                     : null
