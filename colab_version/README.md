@@ -8,7 +8,9 @@ that runs inside Google Colab instead of your old PC.
 
 | File | What it is |
 |---|---|
-| `video_editor_colab.ipynb` | The notebook: install → Drive → **visual editor** → render |
+| `backend_colab.ipynb` | **The notebook to run**: a settings *form* (video, output, editor link) + a tools dropdown. No code to edit, compute side only |
+| `colab_launch.py` | Everything the form triggers: deps → checkout → Drive → source → serve → link (+ `tools()` for status/tunnel/stop) |
+| `video_editor_colab.ipynb` | The full notebook (kept as-is): in-cell widget editor, manual Patreon/YouTube cells, no-widget fallbacks |
 | `webapp/` | Full web editor: `server.py` (runs on the VM) + `index.html` (the app, no build step) + `tests/` |
 | `editor_gui.py` | In-cell widget editor (sliders + live WYSIWYG preview + sample renders) |
 | `compose.py` | Frame compositor — the same math as the browser's `render.ts` |
@@ -195,6 +197,21 @@ at the source (e.g., process intro/outro/reaction as separate 5-minute
 chunks) and concatenate with `ffmpeg` at the end.
 
 ## Quick start in Colab
+
+Open **`backend_colab.ipynb`**. It is two collapsed *form* cells, not code:
+
+1. **Settings** — `VIDEO` (a folder → newest clip, or one clip file), `OUTPUT`,
+   `EDITOR` (your hosted UI), `BRANCH`, `UPDATE_CODE`. Run it once; the output is
+   the link to open. Change only the fields, never the cells — the fields also
+   remember what you typed (they are saved with the notebook copy in Drive).
+2. **Tools** — one dropdown: reprint the link + status (proxy/render progress,
+   where the files are), renew a dead tunnel, stop the server, or fall back to
+   the in-cell editor if Colab blocks every tunnel.
+
+Defaults live in `colab_launch.py` (`DEFAULTS`), so the notebook itself never has
+to change when your Drive layout does. The steps below are that same path by hand,
+plus what `video_editor_colab.ipynb` adds: the in-cell widget editor, manual
+Patreon/YouTube renders and the fallbacks.
 
 ```python
 # Cell 1 — install (run once per session)

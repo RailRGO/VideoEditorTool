@@ -85,5 +85,8 @@ npm run build    # static bundle in dist/
 
 `colab_version/` holds the Python pipeline: WYSIWYG compositor (`compose.py`),
 shared layout model (`layouts.py`), render/audio/retouch pipeline
-(`video_processor.py`), the HTTP server + tunnel (`webapp/server.py`), and the
-notebook (`video_editor_colab.ipynb`). See `colab_version/README.md`.
+(`video_processor.py`), the HTTP server + tunnel (`webapp/server.py`), and two
+notebooks: `backend_colab.ipynb` (the one to run — just a settings form: your
+clip, output folder and editor URL; the logic is folded away in
+`colab_launch.py`) and `video_editor_colab.ipynb` (same, plus the in-cell editor
+GUI and manual render cells). See `colab_version/README.md`.
