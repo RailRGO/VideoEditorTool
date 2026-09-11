@@ -19,6 +19,7 @@ import {
 } from "./lib/remote";
 import {
   applyRetouch,
+  fitRect,
   poseFromBox,
   poseFromLandmarks,
   type FacePose,
@@ -543,19 +544,9 @@ export default function App() {
         ctx.fillStyle = "#04060c";
         ctx.fillRect(0, 0, w, h);
         // draw the camera half, applying the layer's own fit / zoom / offset
-        const sAsp = src.w / src.h;
-        let dw = w;
-        let dh = h;
-        if (style.fit === "contain") {
-          if (sAsp > 1) dh = w / sAsp;
-          else dw = h * sAsp;
-        }
-        const zw = dw * style.zoom;
-        const zh = dh * style.zoom;
-        const zx = (w - zw) / 2 + style.offsetX * dw;
-        const zy = (h - zh) / 2 + style.offsetY * dh;
+        const t = fitRect(src, 0, 0, w, h, style);
         try {
-          ctx.drawImage(video, src.x, src.y, src.w, src.h, zx, zy, zw, zh);
+          ctx.drawImage(video, t.sx, t.sy, t.sw, t.sh, t.zx, t.zy, t.zw, t.zh);
         } catch {
           return null;
         }
@@ -565,14 +556,7 @@ export default function App() {
         if (cfg.manual) {
           pose = poseFromBox(cfg.manualRect, { w, h });
         } else if (lm && lm.length > 400) {
-          pose = poseFromLandmarks(
-            lm,
-            { x: 0, y: 0, w, h },
-            style.fit,
-            style.zoom,
-            style.offsetX,
-            style.offsetY
-          );
+          pose = poseFromLandmarks(lm, src, t);
         }
         poseRef.current = pose;
         if (!pose) return cv;
