@@ -736,6 +736,10 @@ export function ExportPanel({
   projectMsg,
   passthrough = false,
   remote = null,
+  partTarget = 0,
+  setPartTarget,
+  stems = true,
+  setStems,
 }: {
   res: 720 | 1080;
   setRes: (v: 720 | 1080) => void;
@@ -765,8 +769,16 @@ export function ExportPanel({
     error: string;
     onExport: () => void;
     onCancel: () => void;
+    /** finish a stopped render from the parts already on the server */
+    onResume: (key: string) => void;
     fileUrl: (name: string) => string;
   } | null;
+  /** seconds of programme per server part; 0 = automatic */
+  partTarget?: number;
+  setPartTarget?: (v: number) => void;
+  /** Patreon master: publish content-only + mic-only tracks behind the mix */
+  stems?: boolean;
+  setStems?: (v: boolean) => void;
 }) {
   const job = remote?.job ?? null;
   const running = job?.state === "running";
@@ -865,6 +877,43 @@ export function ExportPanel({
         )}
       </Section>
 
+      {remote && (
+        <Section title="Long renders">
+          <div className="space-y-2">
+            {setPartTarget && (
+              <div>
+                <Segmented
+                  value={String(partTarget)}
+                  onChange={(v) => setPartTarget(Number(v))}
+                  options={[
+                    { value: "0", label: "Auto" },
+                    { value: "120", label: "2 min" },
+                    { value: "240", label: "4 min" },
+                  ]}
+                />
+                <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+                  The server renders in parts and journals each one to Drive, so a
+                  reclaimed runtime costs one part instead of the whole render —
+                  reconnect and press Resume. Anything under 5 min renders in a
+                  single pass either way.
+                </p>
+              </div>
+            )}
+            {!passthrough && setStems && (
+              <Toggle
+                label="Also write content &amp; mic tracks"
+                value={stems}
+                onChange={setStems}
+                hint="Track 1 is the full mix (what players and Patreon use);
+                      tracks 2 and 3 are the isolated content and mic. The
+                      YouTube cut reads those instead of the mix, so a mute or
+                      card span silences the programme and keeps your voice."
+              />
+            )}
+          </div>
+        </Section>
+      )}
+
       <Section title="Programme">
         <div className="grid grid-cols-2 gap-2 text-[11px]">
           <div className="rounded-lg border border-white/10 bg-black/25 p-2">
@@ -900,8 +949,22 @@ export function ExportPanel({
                   />
                 </div>
                 <p className="font-mono text-[11px] text-emerald-300">
-                  {((job?.progress ?? 0) * 100).toFixed(1)}% · rendering on the server
+                  {((job?.progress ?? 0) * 100).toFixed(1)}%
+                  {(job?.parts ?? 1) > 1
+                    ? ` · part ${job?.part ?? 0} of ${job?.parts}`
+                    : " · rendering on the server"}
+                  {job?.step ? ` · ${job.step}` : ""}
+                  {(job?.eta_s ?? 0) > 30
+                    ? ` · ~${Math.ceil((job?.eta_s ?? 0) / 60)} min left`
+                    : ""}
                 </p>
+                {(job?.age_s ?? 0) > 60 && (
+                  <p className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-amber-200">
+                    The encoder has said nothing for {Math.round((job?.age_s ?? 0) / 60)} min.
+                    Colab throttles an idle VM — move the mouse over the notebook tab to keep it
+                    awake. Parts already written are safe.
+                  </p>
+                )}
                 <p className="text-[10px] leading-relaxed text-slate-500">
                   This tab only watches — the render keeps going if you close it. Reconnect later
                   and the download will be waiting here.
@@ -910,6 +973,31 @@ export function ExportPanel({
                   Cancel render
                 </Btn>
               </>
+            ) : job && (job.resume?.saved ?? 0) > 0 && job.state !== "done" ? (
+              <div className="space-y-2">
+                <p className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-amber-100">
+                  {job.error ??
+                    (job.state === "cancelled"
+                      ? "Render cancelled. Nothing finished was written to the output folder."
+                      : "The render stopped before it finished.")}
+                </p>
+                <p className="text-[10px] leading-relaxed text-slate-400">
+                  {job.resume?.saved ?? 0} of {job.resume?.parts ?? 0} parts are already on the
+                  server, so resuming renders only what is missing — nothing is encoded twice.
+                </p>
+                <div className="flex gap-1.5">
+                  <Btn
+                    variant="primary"
+                    className="flex-1"
+                    onClick={() => remote.onResume(job.resume?.key ?? "")}
+                  >
+                    Resume render
+                  </Btn>
+                  <Btn className="flex-1" onClick={remote.onExport}>
+                    Start over
+                  </Btn>
+                </div>
+              </div>
             ) : (
               <>
                 {job?.state === "cancelled" && (
