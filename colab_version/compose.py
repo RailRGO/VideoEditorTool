@@ -255,6 +255,7 @@ def draw_card(canvas: np.ndarray, layout: LayoutState,
               card: Optional[Dict[str, Any]] = None) -> None:
     H, W = canvas.shape[:2]
     k = H / 1080.0
+    card = card or {}   # a card span with no text of its own is normal
     # per-segment override; empty fields inherit the global card
     def pick(v) -> Optional[str]:
         s = str(v).strip() if v is not None else ""

@@ -79,6 +79,14 @@ render the same map.
 npm ci
 npm run dev      # local UI on :5173
 npm run build    # static bundle in dist/
+npx tsc --noEmit # type check
+```
+
+Pipeline tests (needs ffmpeg, numpy, opencv):
+
+```bash
+cd colab_version
+python3 webapp/tests/test_render_parts.py    # chunked/resumable renders, stems, cards
 ```
 
 ## Colab backend
@@ -90,3 +98,10 @@ notebooks: `backend_colab.ipynb` (the one to run — just a settings form: your
 clip, output folder and editor URL; the logic is folded away in
 `colab_launch.py`) and `video_editor_colab.ipynb` (same, plus the in-cell editor
 GUI and manual render cells). See `colab_version/README.md`.
+
+Server renders are chunked and journaled, so a runtime that gets reclaimed
+mid-render costs one part instead of the whole encode — the editor's Export
+tab (or `tools("resume the unfinished render")`) finishes it from the parts
+on Drive. Patreon masters carry the content and mic buses as audio tracks 2
+and 3 behind the mix, which is what lets the YouTube cut silence the
+programme and keep your voice.

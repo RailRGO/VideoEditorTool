@@ -12,7 +12,8 @@ From a cell:
     start("/content/drive/MyDrive/raw", "/content/drive/MyDrive/reaction_output",
           "https://reaction-studio.onrender.com")
     tools("link + status")      # also: "renew the tunnel link", "stop the server",
-                                #       "in-cell editor (no tunnel)"
+                                #       "in-cell editor (no tunnel)",
+                                #       "resume the unfinished render"
 
 Re-runnable: deps are installed only when missing, the checkout is fast-
 forwarded instead of re-cloned, and a live server is reused (your edit/state
@@ -214,12 +215,62 @@ def status() -> None:
     else:
         print(f"proxy   {proxy.get('progress', 0):.0%} — stills work meanwhile")
     if job.get("state") == "running":
-        print(f"render  {job.get('progress', 0):.0%} — keep the tab open")
+        where = f" part {job.get('part')}/{job.get('parts')}" \
+            if (job.get("parts") or 1) > 1 else ""
+        eta = job.get("eta_s") or 0
+        print(f"render  {job.get('progress', 0):.0%}{where} "
+              f"{job.get('step') or ''}"
+              + (f" — about {eta / 60:.0f} min left" if eta > 30 else "")
+              + " — keep the tab open")
+    elif job.get("state") in ("lost", "paused"):
+        print(f"render  STOPPED: {job.get('error')}")
+        r = job.get("resume") or {}
+        print(f"        {r.get('saved')}/{r.get('parts')} parts are on disk — "
+              f"tools('resume the unfinished render') finishes it")
     elif job.get("error"):
         print(f"render  FAILED: {job['error']}")
     elif job.get("files"):
         print(f"render  done: {', '.join(sorted(job['files']))} in {a.proc.out}")
+    for r in unfinished():
+        if job.get("state") not in ("lost", "paused"):
+            print(f"parts   unfinished '{r['name']}': {r['saved']}/{r['parts']} "
+                  f"on disk — tools('resume the unfinished render')")
     show_link()
+
+
+def unfinished() -> List[Dict[str, Any]]:
+    """Renders with parts on disk but no finished file (newest first)."""
+    from webapp.server import unfinished_renders
+    return unfinished_renders(app().proc.out)
+
+
+def resume(key: str = "") -> Any:
+    """Finish a stopped render from the parts already on disk.
+
+    A reclaimed runtime kills the process but not the parts: each one is
+    journalled as it lands, so resuming re-renders only what is missing.
+    """
+    pending = unfinished()
+    if not pending:
+        print("Nothing to resume — no render has parts waiting on disk.")
+        return None
+    if key:
+        pick = next((r for r in pending if r["key"] == key), None)
+        if pick is None:
+            raise SystemExit(f"no unfinished render called {key!r} — "
+                             f"have: {', '.join(r['key'] for r in pending)}")
+    else:
+        pick = pending[0]
+        if len(pending) > 1:
+            print("Resuming the most recent one; others still waiting: "
+                  + ", ".join(r["key"] for r in pending[1:]))
+    mins = int(pick["silent_s"] // 60)
+    print(f"Resuming '{pick['name']}': {pick['saved']}/{pick['parts']} parts are "
+          f"already on disk (stopped {mins} min ago) — only the rest is rendered.")
+    job = app().resume_render(pick["key"])
+    print(f"job state: {job.get('state')} — tools('link + status') shows progress, "
+          "and the editor's Export tab has a Resume button too.")
+    return job
 
 
 def stop() -> None:
@@ -246,6 +297,7 @@ def in_cell_editor() -> Any:
 TOOLS = {
     "link + status": status,
     "renew the tunnel link": lambda: show_link(renew=True),
+    "resume the unfinished render": resume,
     "stop the server": stop,
     "in-cell editor (no tunnel)": in_cell_editor,
 }

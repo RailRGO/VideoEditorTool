@@ -43,9 +43,26 @@ export interface RemoteLoudness {
   truePeak?: number;
 }
 
+/** A chunked render that stopped with parts on disk and can be finished. */
+export interface RemoteResume {
+  key: string;
+  target: string;
+  name: string;
+  /** parts already on disk */
+  saved: number;
+  parts: number;
+  /** how long the render has been silent, seconds */
+  silent_s?: number;
+  body?: Record<string, unknown>;
+}
+
 export interface RemoteJob {
   kind: "render" | "transcript";
-  state: "idle" | "running" | "done" | "error" | "cancelled";
+  /**
+   * lost = a render this server never owned (the runtime was reclaimed);
+   * paused = a time budget stopped it between parts. Both are resumable.
+   */
+  state: "idle" | "running" | "done" | "error" | "cancelled" | "lost" | "paused";
   progress: number;
   files: Record<string, string>;
   /** upload kit from a finished render: chapters in `files`, thumbs here */
@@ -54,6 +71,18 @@ export interface RemoteJob {
   result: TranscriptResult | null;
   error: string | null;
   log: string[];
+  /** where the render actually is: compositing / encoding / audio / joining */
+  step?: string;
+  part?: number;
+  parts?: number;
+  eta_s?: number;
+  elapsed_s?: number;
+  /** seconds since the encoder last said anything — a stall shows up here */
+  age_s?: number;
+  bytes?: number;
+  updated?: number;
+  /** present when a stopped render can be picked back up */
+  resume?: RemoteResume | null;
 }
 
 export interface BusProxy {
@@ -78,6 +107,8 @@ export interface RemoteSource {
   size: number;
   mtime: number;
   current: boolean;
+  /** "input" = the raw folder, "output" = finished renders (Patreon masters) */
+  folder?: "input" | "output";
 }
 
 export interface ProjectBody {
@@ -93,6 +124,14 @@ export interface ProjectBody {
   webm: boolean;
   fps: number | null;
   height: number;
+  /** seconds of programme per part; 0 = automatic (short renders stay 1 pass) */
+  partTarget?: number;
+  /** stop the encoder when it goes quiet for this many minutes (0 = never) */
+  stallMin?: number;
+  /** stop politely at the next part after this many minutes (0 = no budget) */
+  budgetMin?: number;
+  /** Patreon master: also publish content-only and mic-only audio tracks */
+  stems?: boolean;
 }
 
 const UNREACHABLE =
@@ -150,11 +189,11 @@ export class RemoteClient {
   sources = (): Promise<{ sources: RemoteSource[]; current: string }> =>
     this.req("/api/sources");
 
-  setSource = (name: string): Promise<RemoteState> =>
+  setSource = (name: string, folder: "input" | "output" = "input"): Promise<RemoteState> =>
     this.req("/api/source", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, folder }),
     });
 
   /** which channel of the stereo track carries the mic (rebuilds the
@@ -184,6 +223,14 @@ export class RemoteClient {
     });
 
   job = (): Promise<RemoteJob> => this.req("/api/job");
+
+  /** finish a stopped render from the parts already on disk */
+  resume = (key: string): Promise<RemoteJob> =>
+    this.req("/api/job/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    });
 
   cancelJob = (): Promise<RemoteJob> =>
     this.req("/api/job/cancel", {

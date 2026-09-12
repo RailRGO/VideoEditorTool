@@ -26,14 +26,16 @@ Interactive visual editing (recommended):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -283,6 +285,222 @@ def _drawtext_font(bold: bool = True) -> Optional[str]:
             for p in Path(root).rglob(f"{name}.ttf"):
                 return str(p)
     return None
+
+
+# ---------------------------------------------------------------------------
+# chunked / resumable renders
+#
+# A 3840x1080 Patreon render on Colab's 2 vCPUs runs at roughly 1.5-3 output
+# frames per second, i.e. hours — longer than the ~90 min idle reclaim, so a
+# single-pass render of a long capture can never finish. Rendering the
+# timeline in parts fixes that: every finished part is journalled to disk, so
+# a reclaimed runtime costs one part instead of the whole render.
+# ---------------------------------------------------------------------------
+
+PARTS_DIRNAME = "_parts"
+MANIFEST_NAME = "manifest.json"
+# a part whose picture probes outside this tolerance of its planned length is
+# treated as half-written (reclaimed mid-encode) and rebuilt
+PART_TOL_S = 0.5
+
+
+def prog_len(segments: List[Dict[str, Any]], fast_speed: float = 4.0) -> float:
+    """Programme (output) seconds covered by *segments*."""
+    return C.render_duration(segments, float(fast_speed))
+
+
+def plan_parts(kept: List[Dict[str, Any]], fast_speed: float,
+               part_target: float, min_part: float = 20.0
+               ) -> List[List[Dict[str, Any]]]:
+    """Split a segment list into parts of ~*part_target* programme seconds.
+
+    Splits always land on frame boundaries of the *programme*, and a segment
+    is sliced rather than padded, so concatenating the parts reproduces the
+    unchunked plan exactly: trim/atrim ranges tile [start, end) with no gap
+    and no overlap. A trailing part shorter than *min_part* is folded back
+    into the previous one (tiny tails are pure overhead).
+    """
+    if part_target <= 0:
+        raise ValueError("part_target must be > 0")
+    parts: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    cur_len = 0.0
+
+    def close() -> None:
+        nonlocal cur, cur_len
+        if cur:
+            parts.append(cur)
+            cur, cur_len = [], 0.0
+
+    for s in kept:
+        typ = str(s.get("type", "body"))
+        a, b = float(s["start"]), float(s["end"])
+        # programme seconds per source second — a fast span's programme time
+        # is its source time DIVIDED by the speed
+        rate = 1.0 / float(fast_speed) if typ == "fast" else 1.0
+        base = {k: s[k] for k in ("type", "card") if k in s}
+        while b - a > 1e-6:
+            take = b - a
+            room = part_target - cur_len
+            if take * rate > room and room > 1e-6:
+                take = room / rate
+            piece = dict(base)
+            piece["start"], piece["end"] = a, a + take
+            cur.append(piece)
+            cur_len += take * rate
+            a += take
+            if cur_len >= part_target - 1e-6:
+                close()
+    close()
+    if len(parts) > 1 and prog_len(parts[-1], fast_speed) < min_part:
+        parts[-2].extend(parts[-1])
+        parts.pop()
+    return [p for p in parts if p]
+
+
+def auto_part_target(total_prog: float, lo: float = 90.0, hi: float = 240.0,
+                     min_parts: int = 1) -> float:
+    """Pick a part length: short renders stay one pass, long ones chunk.
+
+    Nothing under 5 min of programme is chunked at all — one pass is both
+    faster and simpler, and those renders fit inside a runtime easily.
+    """
+    if total_prog <= 300.0:
+        return max(1.0, total_prog)
+    target = max(lo, min(hi, total_prog / max(min_parts, 1)))
+    return min(target, max(lo, total_prog / 2.0))
+
+
+def parts_dir(out_dir: Path, key: str) -> Path:
+    return Path(out_dir) / PARTS_DIRNAME / key
+
+
+def read_manifest(out_dir: Path, key: str) -> Optional[Dict[str, Any]]:
+    p = parts_dir(out_dir, key) / MANIFEST_NAME
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_manifest(out_dir: Path, key: str, man: Dict[str, Any]) -> None:
+    d = parts_dir(out_dir, key)
+    d.mkdir(parents=True, exist_ok=True)
+    man["updated"] = time.time()
+    tmp = d / (MANIFEST_NAME + ".tmp")
+    tmp.write_text(json.dumps(man, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    tmp.replace(d / MANIFEST_NAME)
+
+
+def list_journals(out_dir: Path) -> List[Dict[str, Any]]:
+    """Every render journal on disk, newest first (drives Resume)."""
+    root = Path(out_dir) / PARTS_DIRNAME
+    out: List[Dict[str, Any]] = []
+    try:
+        for d in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime,
+                        reverse=True):
+            man = read_manifest(out_dir, d.name)
+            if man:
+                man.setdefault("key", d.name)
+                out.append(man)
+    except OSError:
+        return []
+    return out
+
+
+class StallTimeout(RuntimeError):
+    """An encoder went quiet for longer than the stall budget."""
+
+
+class RenderPaused(RuntimeError):
+    """A time budget stopped the render between parts — resumable."""
+
+
+class _EncoderRun:
+    """Run ffmpeg while reporting progress and killing stalls.
+
+    ffmpeg only writes progress lines to stderr, so a render that hangs on a
+    Drive hiccup looks exactly like a slow render. Anything that stops
+    emitting a `time=` line for *stall_min* minutes is killed with a clear
+    message instead of holding the job slot forever.
+    """
+
+    def __init__(self, cmd: List[str], total: float, what: str,
+                 progress_cb=None, cancel_check=None, stall_min: float = 15.0,
+                 out_path: Optional[Path] = None,
+                 heartbeat: Optional[Callable[[], None]] = None):
+        self.cmd = cmd
+        self.total = max(1e-6, float(total))
+        self.what = what
+        self.progress_cb = progress_cb
+        self.cancel_check = cancel_check
+        self.stall_min = float(stall_min)
+        self.out_path = out_path
+        self.heartbeat = heartbeat
+        self.last = time.time()
+        self.last_t = 0.0
+        self.tail: List[str] = []
+
+    def run(self) -> None:
+        p = subprocess.Popen(self.cmd, stderr=subprocess.STDOUT,
+                             stdout=subprocess.PIPE, text=True, bufsize=1)
+        assert p.stdout is not None
+        try:
+            for line in p.stdout:
+                self.tail.append(line)
+                if len(self.tail) > 60:
+                    self.tail.pop(0)
+                self.last = time.time()
+                m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+                if m:
+                    t = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                         + float(m.group(3)))
+                    self.last_t = max(self.last_t, t)
+                    if self.progress_cb:
+                        self.progress_cb(min(t, self.total), self.total)
+                if self.cancel_check is not None and self.cancel_check():
+                    _kill_proc(p)
+                    self._discard()
+                    raise RenderCancelled("render cancelled by user")
+                if (self.stall_min > 0 and
+                        time.time() - self.last > self.stall_min * 60.0):
+                    _kill_proc(p)
+                    self._discard()
+                    raise StallTimeout(
+                        f"{self.what}: ffmpeg produced no output for "
+                        f"{self.stall_min:.0f} min — stopped at "
+                        f"{self.last_t:.0f}s of {self.total:.0f}s. "
+                        "Usually the Drive mount went away or the runtime ran "
+                        "out of CPU; the finished parts are kept, so resume "
+                        "to continue.")
+                if self.heartbeat is not None:
+                    self.heartbeat()
+        finally:
+            p.wait()
+        if self.cancel_check is not None and self.cancel_check():
+            self._discard()
+            raise RenderCancelled("render cancelled by user")
+        if p.returncode != 0:
+            raise RuntimeError(f"{self.what} failed:\n" + "".join(self.tail)[-2000:])
+
+    def _discard(self) -> None:
+        if self.out_path is not None:
+            try:
+                Path(self.out_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _kill_proc(p: "subprocess.Popen") -> None:
+    try:
+        p.kill()
+    except OSError:
+        pass
+    try:
+        p.wait(timeout=15)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +775,10 @@ class ReactionVideoProcessor:
         self.content_path = self.work / "content.mp4"
         self._mesh = None  # lazy mediapipe FaceMesh
         self._audio_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # processed (not conformed) buses, shared between chunked-render parts
+        self._bus_cache: Dict[str, Any] = {}
+        # set by mix_audio(stems=True): {"mix","content","mic"} wav paths
+        self.last_stems: Dict[str, str] = {}
 
         print(f"Loaded: {self.input.name}  "
               f"{self.info['width']}x{self.info['height']} @ "
@@ -803,28 +1025,35 @@ class ReactionVideoProcessor:
             raise RuntimeError(f"{what} failed:\n{tail}")
         return (p.stdout or "") + (p.stderr or "")
 
-    def mix_audio(self, input_path=None, mic_channel=None, content_channel=None,
-                  output_path=None, compressor=True, limiter=True, duck=True,
-                  segments: Optional[List[Dict[str, Any]]] = None,
-                  fast_speed: float = 4.0, mute_solo: bool = True,
-                  master_gain_db: float = 0.0,
-                  cancel_check=None) -> str:
-        """Mix mic + content buses, conformed to the same segment map as video.
+    def _bus_signature(self, src: str, mic_channel=None,
+                       content_channel=None) -> str:
+        """Identity of the processed buses (so parts can share one pass).
 
-        *segments*: cut spans are dropped, fast spans get atempo, mute/card
-        spans silence the CONTENT bus only (your mic stays). When None, the
-        whole file is mixed (legacy behaviour). *mute_solo* also silences the
-        content bus during intro/outro (browser parity: muteContentInSolo).
-
-        Works with both OBS audio layouts (2 tracks or 1 stereo track) and
-        with ffmpeg 7+, where the old `-map_channel` option no longer exists.
+        Only the knobs that actually reach the bus wavs are hashed; a part
+        render reuses them, a changed gain/duck/channel does not.
         """
-        if not _has("ffmpeg"):
-            raise RuntimeError("ffmpeg not found (needed for mix_audio)")
-        src = str(input_path or self.input)
-        dst = Path(output_path) if output_path else self.out / "mixed_audio.wav"
         cfg = self.audio_cfg
+        keys = ("mic_channel", "mic_gain_db", "comp_on", "comp_threshold",
+                "comp_ratio", "comp_makeup", "limiter_db", "duck_on",
+                "duck_threshold", "duck_depth", "content_gain_db")
+        raw = (src + "|" + "|".join(f"{k}={cfg.get(k)}" for k in keys)
+               + f"|ov={mic_channel}/{content_channel}")
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
+    def _prepare_buses(self, src: str, compressor: bool, limiter: bool,
+                       duck: bool, cancel_check=None,
+                       reuse: bool = False, mic_channel=None,
+                       content_channel=None) -> Tuple[Path, Path]:
+        """mic + content bus wavs, processed but NOT conformed to segments."""
+        sig = self._bus_signature(src, mic_channel, content_channel) \
+            if reuse else ""
+        cached = getattr(self, "_bus_cache", None)
+        if reuse and cached and cached.get("sig") == sig:
+            mic_proc, content_proc = cached["mic"], cached["content"]
+            if mic_proc.exists() and content_proc.exists():
+                return mic_proc, content_proc
+
+        cfg = self.audio_cfg
         mic_wav = self.work / "mic.wav"
         content_wav = self.work / "content.wav"
         self._extract_bus(src, mic_wav, "mic", mic_channel)
@@ -855,11 +1084,17 @@ class ReactionVideoProcessor:
             # ratio (12 dB -> 4:1, 30 dB -> 10:1).
             depth = float(cfg.get("duck_depth", 12))
             ratio = min(20.0, max(1.5, depth / 3.0))
+            # sidechaincompress stops ~1 s before the end of a long bus (it
+            # waits on the sidechain), which silently truncated the ducked
+            # programme — pad back to the length of the longest bus.
+            pad = max(self._media_duration(str(content_wav)),
+                      self._media_duration(str(mic_proc)))
+            tail = f",apad=whole_dur={pad:.3f}" if pad > 0 else ""
             self._ff(["ffmpeg", "-y", "-i", str(content_wav), "-i", str(mic_proc),
                       "-filter_complex",
                       f"[0:a][1:a]sidechaincompress="
                       f"threshold={cfg.get('duck_threshold', -32)}dB:ratio={ratio:.1f}:"
-                      f"attack=0.06:release=0.42[aout]",
+                      f"attack=0.06:release=0.42{tail}[aout]",
                       "-map", "[aout]", "-c:a", "pcm_s16le", str(content_proc)],
                      "content ducking")
         else:
@@ -870,6 +1105,44 @@ class ReactionVideoProcessor:
                       f"volume={float(cfg['content_gain_db']):.1f}dB", str(tmp)],
                      "content gain")
             tmp.replace(content_proc)
+        if reuse:
+            self._bus_cache = {"sig": sig, "mic": mic_proc,
+                               "content": content_proc}
+        return mic_proc, content_proc
+
+    def mix_audio(self, input_path=None, mic_channel=None, content_channel=None,
+                  output_path=None, compressor=True, limiter=True, duck=True,
+                  segments: Optional[List[Dict[str, Any]]] = None,
+                  fast_speed: float = 4.0, mute_solo: bool = True,
+                  master_gain_db: float = 0.0,
+                  cancel_check=None, stems: bool = False,
+                  reuse_buses: bool = False) -> str:
+        """Mix mic + content buses, conformed to the same segment map as video.
+
+        *segments*: cut spans are dropped, fast spans get atempo, mute/card
+        spans silence the CONTENT bus only (your mic stays). When None, the
+        whole file is mixed (legacy behaviour). *mute_solo* also silences the
+        content bus during intro/outro (browser parity: muteContentInSolo).
+
+        *stems* additionally writes the content-only and mic-only buses next
+        to the mix (see self.last_stems) so the mux can publish them as extra
+        audio tracks. *reuse_buses* shares the bus extraction/processing
+        between the parts of a chunked render.
+
+        Works with both OBS audio layouts (2 tracks or 1 stereo track) and
+        with ffmpeg 7+, where the old `-map_channel` option no longer exists.
+        """
+        if not _has("ffmpeg"):
+            raise RuntimeError("ffmpeg not found (needed for mix_audio)")
+        src = str(input_path or self.input)
+        dst = Path(output_path) if output_path else self.out / "mixed_audio.wav"
+        cfg = self.audio_cfg
+        self.last_stems = {}
+
+        mic_proc, content_proc = self._prepare_buses(
+            src, compressor, limiter, duck, cancel_check=cancel_check,
+            reuse=reuse_buses, mic_channel=mic_channel,
+            content_channel=content_channel)
 
         mic_final = self._conform_bus(mic_proc, segments, fast_speed, mute_to_zero=False,
                                       tag="mic", cancel_check=cancel_check)
@@ -877,14 +1150,29 @@ class ReactionVideoProcessor:
                                           mute_to_zero=True, tag="content",
                                           mute_solo=mute_solo,
                                           cancel_check=cancel_check)
+        tail = (f"aformat=channel_layouts=stereo,"
+                f"volume={float(master_gain_db):.1f}dB,"
+                "alimiter=limit=-1.5dB:attack=5:release=50")
         self._ff(["ffmpeg", "-y", "-i", str(mic_final), "-i", str(content_final),
                   "-filter_complex",
                   "amix=inputs=2:duration=longest:dropout_transition=0.2[m];"
-                  f"[m]aformat=channel_layouts=stereo,"
-                  f"volume={float(master_gain_db):.1f}dB,"
-                  "alimiter=limit=-1.5dB:attack=5:release=50[out]",
+                  f"[m]{tail}[out]",
                   "-map", "[out]", "-c:a", "pcm_s16le", str(dst)], "final mix")
-        print(f"Mixed audio -> {dst}")
+        if stems:
+            # tracks 2 + 3 of the Patreon master: the same conformed buses,
+            # gain/limited like the mix, so a later YouTube cut can silence
+            # the content and keep the voice without re-rendering Patreon.
+            for tag, wav in (("content", content_final), ("mic", mic_final)):
+                out = dst.with_name(f"{dst.stem}_{tag}.wav")
+                self._ff(["ffmpeg", "-y", "-i", str(wav), "-af",
+                          f"aformat=channel_layouts=stereo,"
+                          f"volume={float(master_gain_db):.1f}dB,"
+                          "alimiter=limit=-1.5dB:attack=5:release=50",
+                          "-c:a", "pcm_s16le", str(out)], f"{tag} stem")
+                self.last_stems[tag] = str(out)
+            self.last_stems["mix"] = str(dst)
+        print(f"Mixed audio -> {dst}"
+              + (f" (+{len(self.last_stems) - 1} stems)" if stems else ""))
         return str(dst)
 
     def _conform_bus(self, wav: Path, segments, fast_speed, mute_to_zero, tag,
@@ -923,15 +1211,53 @@ class ReactionVideoProcessor:
         return out
 
     # ------------------------------------------------------------ mux/export
-    def mux(self, video_path, audio_path, out_mp4, webm=True) -> Dict[str, str]:
+    def mux(self, video_path, audio_path, out_mp4, webm=True,
+            stems: Optional[Dict[str, str]] = None,
+            video_dur: Optional[float] = None) -> Dict[str, str]:
+        """Mux picture + mix into the deliverable.
+
+        *stems* ({"content": wav, "mic": wav}) publishes the two buses as
+        extra audio tracks behind the mix: track 1 is the full programme
+        (what every player picks up), tracks 2/3 are the isolated content and
+        mic so the Patreon -> YouTube step can silence one without a
+        re-render. The mux stops on the *picture* duration — the old
+        `-shortest` truncated the video by however much the ducked bus ended
+        up short.
+        """
         if not _has("ffmpeg"):
             print("ffmpeg missing — keeping silent video only.")
             return {"mp4": str(video_path)}
         out_mp4 = Path(out_mp4)
-        self._ff(["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
-                  "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-                  str(out_mp4)], "mux")
+        dur = float(video_dur) if video_dur else \
+            self._media_duration(str(video_path))
+        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path)]
+        names = [("mix (content + mic)", "mix")]
+        for tag in ("content", "mic"):
+            p = (stems or {}).get(tag)
+            if p and Path(p).exists():
+                cmd += ["-i", str(p)]
+                names.append((f"{tag} only", tag))
+        cmd += ["-map", "0:v"]
+        for i in range(len(names)):
+            cmd += ["-map", f"{i + 1}:a"]
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+        for i, (title, tag) in enumerate(names):
+            cmd += [f"-metadata:s:a:{i}", f"title={title}"]
+            cmd += [f"-disposition:a:{i}", "default" if i == 0 else "0"]
+        if len(names) > 1:
+            # mp4 only round-trips a fixed set of format-level keys, so the
+            # machine-readable marker rides in `comment`
+            cmd += ["-metadata", "comment=reaction_stems="
+                    + ",".join(t for _, t in names),
+                    "-metadata", "title=Reaction master "
+                                 f"({len(names)} audio tracks)"]
+        if dur > 0:
+            cmd += ["-t", f"{dur:.3f}"]
+        cmd += ["-movflags", "+faststart", str(out_mp4)]
+        self._ff(cmd, "mux")
         result = {"mp4": str(out_mp4)}
+        if len(names) > 1:
+            result["stems"] = ",".join(t for _, t in names)
         if webm:
             wb = out_mp4.with_suffix(".webm")
             self._ff(["ffmpeg", "-y", "-i", str(out_mp4), "-c:v", "libvpx-vp9",
@@ -941,6 +1267,121 @@ class ReactionVideoProcessor:
         return result
 
     # ------------------------------------------- passthrough (YouTube) render
+    # ------------------------------------------------- passthrough (YouTube)
+    def _passthrough_streams(self, stems: Optional[bool] = None
+                             ) -> Tuple[List[str], bool]:
+        """Which audio streams of the source to read, and whether they are
+        separate buses.
+
+        A Patreon master rendered with stems carries three tracks: 1 = the
+        mix, 2 = content only, 3 = mic only. Reading 2 + 3 lets a mute/card
+        span silence the programme while your voice stays — the whole point
+        of publishing the stems. Any other source is a single mixed track.
+        """
+        n = len(self._probe_audio(str(self.input)))
+        use = n >= 3 if stems is None else bool(stems)
+        if use and n >= 3:
+            return ["0:a:1", "0:a:2"], True
+        return ["0:a"], False
+
+    def _passthrough_graph(self, kept: List[Dict[str, Any]], *, W: int, H: int,
+                           audio_cloak, video_cloak, card, fast_speed,
+                           master_gain_db, content_rect, out_fps, height,
+                           audio_inputs: List[str], card_suffix: str = ""
+                           ) -> Tuple[List[str], List[str]]:
+        """filter_complex for one (part of a) passthrough render.
+
+        Both streams are conformed from the same segment list, so A/V can
+        never desync. With two *audio_inputs* the first is the content bus
+        (silenced on mute/card) and the second the mic (never silenced).
+        """
+        n = len(kept)
+        chain: List[str] = [
+            f"[0:v]split={n}" + "".join(f"[vin{i}]" for i in range(n))
+        ]
+        vouts: List[str] = []
+        cloak_vf = _video_cloak_filters(video_cloak, W, H)
+        for i, s in enumerate(kept):
+            typ = s.get("type", "body")
+            a, b = float(s["start"]), float(s["end"])
+            if typ == "fast":
+                vf = f"trim=start={a:.3f}:end={b:.3f}," \
+                     f"setpts=(PTS-STARTPTS)/{float(fast_speed):.4f}"
+            else:
+                vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
+            if typ == "card":
+                # per-segment override; empty fields inherit the global card
+                vf += "," + ",".join(
+                    self._card_draws({**(card or {}), **(s.get("card") or {})},
+                                     W, H, suffix=f"{card_suffix}_{i}",
+                                     content=content_rect)
+                )
+            elif cloak_vf:
+                vf += "," + ",".join(cloak_vf)
+            vf += ",setsar=1"
+            chain.append(f"[vin{i}]{vf}[v{i}]")
+            vouts.append(f"[v{i}]")
+        chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
+
+        warns: List[str] = []
+        cats: List[str] = []
+        for j, spec in enumerate(audio_inputs):
+            outs = []
+            chain.append(f"[{spec}]asplit={n}"
+                         + "".join(f"[j{j}s{i}]" for i in range(n)))
+            for i, s in enumerate(kept):
+                typ = s.get("type", "body")
+                a, b = float(s["start"]), float(s["end"])
+                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+                if typ == "fast":
+                    af += "," + ",".join(_atempo_chain(fast_speed))
+                # single mixed track: everything goes quiet. Stems: only the
+                # content bus (j == 0) — the mic keeps talking.
+                if typ in ("mute", "card") and j == 0:
+                    af += ",volume=0"
+                chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
+                outs.append(f"[j{j}b{i}]")
+            chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
+            cats.append(f"[cat{j}]")
+        if len(cats) > 1:
+            chain.append("".join(cats)
+                         + f"amix=inputs={len(cats)}:duration=longest:"
+                           "dropout_transition=0.2[mix0]")
+            src = "mix0"
+        else:
+            src = cats[0][1:-1]
+        clk, cloak_warn = audio_cloak_chain(audio_cloak, src, "acl")
+        chain.append(clk)
+        warns.extend(cloak_warn)
+        chain.append(
+            f"[acl]volume={float(master_gain_db):.1f}dB,"
+            "alimiter=limit=-1.5dB:attack=5:release=50,"
+            "aformat=channel_layouts=stereo[aout]"
+        )
+
+        # trim/setpts leaves the link without a frame rate, and the muxer
+        # then guesses 25 fps — which silently drops every sixth frame of a
+        # 30 fps capture. State the rate explicitly (a no-op when it already
+        # matches, a real re-time when the caller asked for another one).
+        vtail = "[vcat]"
+        if out_fps and float(out_fps) > 0:
+            chain.append(f"[vcat]fps={float(out_fps):.6f}[vfps]")
+            vtail = "[vfps]"
+        if height and int(height) not in (0, H):
+            chain.append(f"{vtail}scale=-2:{int(height)}[vout]")
+        else:
+            chain.append(f"{vtail}null[vout]")
+        return chain, warns
+
+    def _passthrough_cmd(self, chain: List[str], out: Path, crf: int,
+                         preset: str) -> List[str]:
+        return ["ffmpeg", "-y", "-v", "info", "-i", str(self.input),
+                "-filter_complex", ";".join(chain),
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(out)]
+
     def render_passthrough(
         self,
         segments: List[Dict[str, Any]],
@@ -957,13 +1398,18 @@ class ReactionVideoProcessor:
         webm: bool = False,
         progress_cb=None,
         cancel_check=None,
+        content_rect: Optional[Dict[str, float]] = None,
+        stems: Optional[bool] = None,
+        stall_min: float = 15.0,
     ) -> Dict[str, str]:
         """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
 
         cuts are dropped, fast spans sped (atempo + setpts), mute/card spans
-        silence the whole mixed programme, card spans get a full-frame card,
-        everything else takes the cloak. A/V can never desync — both streams
-        are conformed from the same segment list in one command.
+        silence the programme (content bus only when the source carries
+        stems), card spans cover the *content rect* — the same rect the
+        Patreon compositor covered when it made this file, so the camera
+        corner stays visible — everything else takes the cloak. A/V can never
+        desync: both streams come from the same segment list in one command.
         """
         if not _has("ffmpeg"):
             raise RuntimeError("ffmpeg not found (needed for render_passthrough)")
@@ -975,121 +1421,56 @@ class ReactionVideoProcessor:
             raise ValueError("nothing to render — all segments are cut?")
         W = int(self.info.get("width") or 1920)
         H = int(self.info.get("height") or 1080)
-        total = C.render_duration(
-            [{"type": s.get("type", "body"), "start": s["start"], "end": s["end"]}
-             for s in kept],
-            fast_speed,
-        )
-
-        n = len(kept)
-        vparts: List[str] = [
-            f"[0:v]split={n}" + "".join(f"[vin{i}]" for i in range(n))
-        ]
-        aparts: List[str] = [
-            f"[0:a]asplit={n}" + "".join(f"[ain{i}]" for i in range(n))
-        ]
-        vouts, aouts = [], []
-        cloak_vf = _video_cloak_filters(video_cloak, W, H)
-        for i, s in enumerate(kept):
-            typ = s.get("type", "body")
-            a, b = float(s["start"]), float(s["end"])
-            if typ == "fast":
-                vf = f"trim=start={a:.3f}:end={b:.3f}," \
-                     f"setpts=(PTS-STARTPTS)/{float(fast_speed):.4f}"
-                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS," \
-                     + ",".join(_atempo_chain(fast_speed))
-            else:
-                vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
-                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-            if typ in ("mute", "card"):
-                af += ",volume=0"
-            if typ == "card":
-                # per-segment override; empty fields inherit the global card
-                vf += "," + ",".join(
-                    self._card_draws({**(card or {}), **(s.get("card") or {})},
-                                     W, H, suffix=f"_{i}")
-                )
-            elif cloak_vf:
-                vf += "," + ",".join(cloak_vf)
-            vf += ",setsar=1"
-            vparts.append(f"[vin{i}]{vf}[v{i}]")
-            aparts.append(f"[ain{i}]{af}[a{i}]")
-            vouts.append(f"[v{i}]")
-            aouts.append(f"[a{i}]")
-        vparts.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
-        aouts_s = f"{''.join(aouts)}concat=n={n}:v=0:a=1[acat]"
-        chain = vparts + aparts + [aouts_s]
-        clk, cloak_warn = audio_cloak_chain(audio_cloak, "acat", "acl")
-        chain.append(clk)
-        for w in cloak_warn:
-            print(f"  (cloak: {w})")
-        chain.append(
-            f"[acl]volume={float(master_gain_db):.1f}dB,"
-            "alimiter=limit=-1.5dB:attack=5:release=50,"
-            "aformat=channel_layouts=stereo[aout]"
-        )
-        vtail = "[vcat]"
-        # passthrough: only re-time when the caller asks for a genuinely
-        # different frame rate (a mismatched fps filter drops/duplicates
-        # frames — exactly the "cut/resized frame" symptom)
+        total = prog_len(kept, fast_speed)
         src_fps = float(self.info.get("fps") or 0.0)
-        if fps and (src_fps <= 0 or abs(float(fps) - src_fps) > 0.01):
-            chain.append(f"[vcat]fps={float(fps):.3f}[vfps]")
-            vtail = "[vfps]"
-        if height and int(height) not in (0, H):
-            chain.append(f"{vtail}scale=-2:{int(height)}[vout]")
-        else:
-            chain.append(f"{vtail}null[vout]")
+        out_fps = float(fps) if fps else src_fps
+        audio_inputs, used_stems = self._passthrough_streams(stems)
+        if used_stems:
+            print("  passthrough: reading the content + mic stems (tracks 2/3)")
+        chain, warns = self._passthrough_graph(
+            kept, W=W, H=H, audio_cloak=audio_cloak, video_cloak=video_cloak,
+            card=card, fast_speed=fast_speed, master_gain_db=master_gain_db,
+            content_rect=content_rect, out_fps=out_fps, height=height,
+            audio_inputs=audio_inputs)
+        for w in warns:
+            print(f"  (cloak: {w})")
 
         out = self.out / f"{name}.mp4"
-        cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(self.input),
-               "-filter_complex", ";".join(chain),
-               "-map", "[vout]", "-map", "[aout]",
-               "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
-               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-               "-movflags", "+faststart", str(out)]
-        p = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
-                             text=True, bufsize=1)
-        assert p.stdout is not None
-        tail: List[str] = []
-        for line in p.stdout:
-            tail.append(line)
-            if len(tail) > 60:
-                tail.pop(0)
-            if cancel_check is not None and cancel_check():
-                p.kill()
-                p.wait()
-                # don't leave a half-written file in the output folder
-                out.unlink(missing_ok=True)
-                raise RenderCancelled("render cancelled by user")
-            m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
-            if m and progress_cb:
-                t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                progress_cb(min(t, total), total)
-        p.wait()
-        if cancel_check is not None and cancel_check():
-            out.unlink(missing_ok=True)
-            raise RenderCancelled("render cancelled by user")
-        if p.returncode != 0 or not out.exists():
-            raise RuntimeError("passthrough render failed:\n" + "".join(tail)[-2000:])
-        if progress_cb:
-            progress_cb(total, total)
+        _EncoderRun(self._passthrough_cmd(chain, out, crf, preset), total,
+                    "passthrough render", progress_cb=progress_cb,
+                    cancel_check=cancel_check, stall_min=stall_min,
+                    out_path=out).run()
         result = {"mp4": str(out)}
+        if used_stems:
+            result["stems"] = "content+mic"
         if webm:
             result["webm"] = self._to_webm(out)
         print(f"Passthrough {total:.1f}s -> {out}")
         return result
 
     def _card_draws(self, card: Dict[str, Any], W: int, H: int,
-                    suffix: str = "") -> List[str]:
-        """Full-frame placeholder card as drawbox/drawtext filters."""
+                    suffix: str = "",
+                    content: Optional[Dict[str, float]] = None) -> List[str]:
+        """Placeholder card as drawbox/drawtext filters.
+
+        The box covers the layout's *content* rect (default) — a card that
+        covers the whole frame also buries the camera corner, which is the
+        one thing viewers are there for.
+        """
         title = str(card.get("title", "Full uncut reaction on Patreon"))
         sub = str(card.get("sub", "link in the description"))
         accent = str(card.get("accent", "#e879f9")).lstrip("#") or "e879f9"
-        x = int(round(W * 0.06))
-        y = int(round(H * 0.16))
-        cw = int(round(W * 0.88))
-        ch = int(round(H * 0.68))
+        r = content or {}
+        try:
+            lay = self.layout.content
+            dflt = {"x": lay.x, "y": lay.y, "w": lay.w, "h": lay.h}
+        except AttributeError:
+            dflt = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
+        x = int(round(W * float(r.get("x", dflt["x"]))))
+        y = int(round(H * float(r.get("y", dflt["y"]))))
+        cw = int(round(W * float(r.get("w", dflt["w"]))))
+        ch = int(round(H * float(r.get("h", dflt["h"]))))
+        cw, ch = max(16, cw), max(16, ch)
         draws = [f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=black@0.94:t=fill",
                  f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=0x{accent}80:t=2"]
         bar_h = max(2, int(round(4 * H / 1080)))
@@ -1116,6 +1497,491 @@ class ReactionVideoProcessor:
                 f"fontsize={fs2:.0f}:fontcolor=0xE2E8F0:"
                 f"x={x}+({cw}-text_w)/2:y={ys}-text_h/2")
         return draws
+
+    # ------------------------------------------- chunked / resumable render
+    def _fit_audio(self, wav: Path, dur: float, tag: str = "") -> Path:
+        """Pad/trim an audio part to exactly *dur* seconds.
+
+        Every part's audio is fitted to that part's measured picture length,
+        which is what keeps joins from drifting frame by frame.
+        """
+        if dur <= 0:
+            return wav
+        got = self._media_duration(str(wav))
+        if got > 0 and abs(got - dur) < 0.02:
+            return wav
+        out = wav.with_name(f"{wav.stem}_fit.wav")
+        self._ff(["ffmpeg", "-y", "-i", str(wav), "-af",
+                  f"apad=whole_dur={dur:.3f}", "-t", f"{dur:.3f}",
+                  "-c:a", "pcm_s16le", str(out)], f"fit {tag or wav.name}")
+        return out
+
+    def _concat_video(self, parts: List[Path], out: Path, crf: int = 18,
+                      preset: str = "fast", what: str = "concat") -> Path:
+        """Join picture parts: stream-copy first, re-encode if that fails."""
+        lst = out.with_name(out.stem + "_list.txt")
+        lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts),
+                       encoding="utf-8")
+        try:
+            self._ff(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                      "-i", str(lst), "-c", "copy", "-movflags", "+faststart",
+                      str(out)], what)
+            return out
+        except RuntimeError as e:
+            print(f"  ({what}: stream copy failed, re-encoding — {str(e)[:120]})")
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for p_ in parts:
+            cmd += ["-i", str(p_)]
+        n = len(parts)
+        cmd += ["-filter_complex",
+                "".join(f"[{i}:v]" for i in range(n))
+                + f"concat=n={n}:v=1:a=0[v]",
+                "-map", "[v]", "-c:v", "libx264", "-preset", preset,
+                "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", str(out)]
+        self._ff(cmd, what + " (re-encode)")
+        return out
+
+    def _concat_audio(self, parts: List[Path], out: Path,
+                      what: str = "concat audio") -> Path:
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for p_ in parts:
+            cmd += ["-i", str(p_)]
+        n = len(parts)
+        cmd += ["-filter_complex",
+                "".join(f"[{i}:a]" for i in range(n))
+                + f"concat=n={n}:v=0:a=1[out]",
+                "-map", "[out]", "-c:a", "pcm_s16le", str(out)]
+        self._ff(cmd, what)
+        return out
+
+    def _final_audio(self, wav: Path, audio_cloak: Optional[Dict[str, Any]],
+                     master_gain_db: float, out: Path) -> Path:
+        """Cloak + master gain + limiter on a joined audio track.
+
+        Applied once to the whole programme rather than per part: the cloak's
+        echo/reverb tail would otherwise be chopped at every join.
+        """
+        clk, warns = audio_cloak_chain(audio_cloak, "a0", "acl")
+        for w in warns:
+            print(f"  (cloak: {w})")
+        self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                  "-filter_complex",
+                  f"[0:a]anull[a0];{clk};"
+                  f"[acl]volume={float(master_gain_db):.1f}dB,"
+                  "alimiter=limit=-1.5dB:attack=5:release=50,"
+                  "aformat=channel_layouts=stereo[aout]",
+                  "-map", "[aout]", "-c:a", "pcm_s16le", str(out)],
+                 "final audio")
+        return out
+
+    def render_project(self, *, target: str, name: str,
+                       segments: List[Dict[str, Any]],
+                       layout: Optional[L.LayoutState] = None,
+                       audio: Optional[Dict[str, Any]] = None,
+                       retouch: Optional[Dict[str, Any]] = None,
+                       audio_cloak: Optional[Dict[str, Any]] = None,
+                       video_cloak: Optional[Dict[str, Any]] = None,
+                       card: Optional[Dict[str, Any]] = None,
+                       fast_speed: float = 4.0, master_gain_db: float = 0.0,
+                       crf: int = 18, preset: str = "fast",
+                       fps: Optional[float] = None, height: int = 0,
+                       width: int = 1920, webm: bool = False,
+                       stems: Optional[bool] = None,
+                       part_target: float = 0.0, min_part: float = 20.0,
+                       stall_min: float = 15.0, budget_min: float = 0.0,
+                       progress_cb=None, cancel_check=None,
+                       log: Optional[Callable[[str], None]] = None,
+                       resume_body: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
+        """Render a whole project, in parts, with a journal on disk.
+
+        Short renders (< 5 min of programme) take exactly one pass — the old
+        path, no overhead. Longer ones are split into parts of roughly
+        *part_target* seconds; each finished part is written to
+        `<out>/_parts/<name>/` and recorded in manifest.json, so a runtime
+        that gets reclaimed mid-render costs one part instead of everything.
+        Re-running with the same project reuses every part that is still on
+        disk and probes to its planned length.
+
+        *progress_cb(frac, info)* — info carries step/part/parts/eta_s/
+        elapsed_s/age_s/bytes so the UI can be honest about what is happening.
+        """
+        say = log or (lambda m: None)
+        target = "youtube" if str(target).lower().startswith("you") else "patreon"
+        kept = sorted([s for s in (segments or []) if s.get("type") != "cut"],
+                      key=lambda s: float(s["start"]))
+        if not kept:
+            raise ValueError("empty timeline — nothing to render")
+        fast = float(fast_speed or 4.0)
+        total_prog = prog_len(kept, fast)
+        if not part_target or float(part_target) <= 0:
+            part_target = auto_part_target(total_prog)
+        part_target = float(part_target)
+        parts = plan_parts(kept, fast, part_target, min_part) \
+            if part_target < total_prog - 1e-6 else [kept]
+
+        started = time.time()
+        state = {"step": "starting", "part": 0, "parts": len(parts),
+                 "eta_s": 0.0, "elapsed_s": 0.0, "age_s": 0.0, "bytes": 0,
+                 "reused": []}
+
+        def report(frac: float, **kw) -> None:
+            # never walk backwards: the UI reads a falling bar as a stall
+            frac = max(frac, state.get("_max", 0.0))
+            state["_max"] = frac
+            state.update(kw)
+            state["elapsed_s"] = time.time() - started
+            state["age_s"] = time.time() - state.get("_beat", started)
+            if progress_cb:
+                progress_cb(max(0.0, min(1.0, frac)), dict(state))
+
+        state["_beat"] = started
+        report(0.0)
+
+        def beat() -> None:
+            state["_beat"] = time.time()
+
+        def out_bytes() -> int:
+            try:
+                return sum(f.stat().st_size for f in self.out.rglob("*")
+                           if f.is_file())
+            except OSError:
+                return 0
+
+        # ---- single pass: short renders keep the old, simple path ----------
+        if len(parts) <= 1:
+            say(f"one pass ({total_prog:.0f}s of programme — under the 5 min "
+                "chunk threshold)")
+            # same default as the chunked path: a Patreon master carries the
+            # content/mic tracks whether or not it needed chunking
+            single_stems = (False if target == "youtube"
+                            else (True if stems is None else bool(stems)))
+            report(0.02, step="rendering")
+            if target == "youtube":
+                rect = None
+                if layout is not None:
+                    rect = {"x": layout.content.x, "y": layout.content.y,
+                            "w": layout.content.w, "h": layout.content.h}
+                outs = self.render_passthrough(
+                    kept, audio_cloak=audio_cloak, video_cloak=video_cloak,
+                    card=card, fast_speed=fast, master_gain_db=master_gain_db,
+                    crf=crf, preset=preset, fps=fps, height=height, name=name,
+                    webm=webm, content_rect=rect, stems=stems,
+                    stall_min=stall_min, cancel_check=cancel_check,
+                    progress_cb=lambda d, t: (beat(), report(
+                        0.05 + 0.9 * d / max(1e-6, t),
+                        step="encoding", part=1, parts=1))[0])
+            else:
+                lay = layout or self.layout
+                # only the compositor consumes the layout as engine state; a
+                # passthrough just borrows its content rect for the card
+                if layout is not None and target == "patreon":
+                    self.layout = lay
+                if audio is not None:
+                    self.audio_cfg.update(audio)
+                if isinstance(retouch, dict):
+                    self.retouch_cfg.update(retouch)
+                video_nc = self.work / f"{name}_video.mp4"
+                hook = (self._cam_hook()
+                        if self.retouch_cfg.get("enabled") else None)
+                C.render_video(str(self.input), str(video_nc), layout=lay,
+                               segments=kept, crf=crf,
+                               progress_cb=lambda d, t: (beat(), report(
+                                   0.05 + 0.8 * d / max(1, t),
+                                   step="compositing", part=1, parts=1))[0],
+                               cancel_check=cancel_check, cam_hook=hook,
+                               fps=fps, width=int(width),
+                               height=int(height) or 1080)
+                report(0.86, step="mixing audio")
+                beat()
+                mix = self.mix_audio(
+                    output_path=str(self.work / f"{name}_mix.wav"),
+                    segments=kept, fast_speed=fast,
+                    mute_solo=bool(lay.muteContentInSolo),
+                    master_gain_db=master_gain_db,
+                    cancel_check=cancel_check, stems=single_stems)
+                st = dict(self.last_stems) if single_stems else None
+                report(0.95, step="muxing")
+                beat()
+                dur = self._media_duration(str(video_nc))
+                outs = self.mux(video_nc, mix, self.out / f"{name}.mp4",
+                                webm=webm, stems=st, video_dur=dur)
+            report(1.0, step="done", part=1, parts=1, bytes=out_bytes())
+            return {"mp4": outs["mp4"], **({"webm": outs["webm"]}
+                                           if outs.get("webm") else {}),
+                    "parts": 1, "resumed": [], "chunked": False}
+
+        # ---- chunked: journal, reuse what is already on disk ---------------
+        key = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "render"
+        pdir = parts_dir(self.out, key)
+        pdir.mkdir(parents=True, exist_ok=True)
+        plan_json = json.dumps(
+            [[round(float(s["start"]), 3), round(float(s["end"]), 3),
+              str(s.get("type", "body"))] for p_ in parts for s in p_])
+        # Two different things: Patreon *writes* the content/mic stems as
+        # extra tracks (it builds both buses anyway); YouTube only *reads*
+        # them off a Patreon master (see _passthrough_streams) and publishes
+        # a single rebuilt mix, because YouTube keeps the first track only.
+        write_stems = (False if target == "youtube"
+                       else (True if stems is None else bool(stems)))
+        want_stems = write_stems
+        sig = hashlib.sha1(
+            (str(self.input) + target + plan_json + f"{fast}|{crf}|{fps}|"
+             f"{height}|{width}|stems={want_stems}").encode()).hexdigest()[:16]
+        man = read_manifest(self.out, key)
+        done: Dict[int, Dict[str, Any]] = {}
+        if man and man.get("sig") == sig and man.get("parts") == len(parts):
+            for rec in man.get("done", []):
+                i = int(rec.get("i", -1))
+                if not (0 <= i < len(parts)):
+                    continue
+                if not rec.get("v") or not rec.get("a"):
+                    continue
+                need = [pdir / str(rec["v"]), pdir / str(rec["a"])]
+                if want_stems:
+                    if not rec.get("ac") or not rec.get("am"):
+                        continue   # journalled without stems — rebuild
+                    need += [pdir / str(rec["ac"]), pdir / str(rec["am"])]
+                if not all(f.is_file() for f in need):
+                    continue
+                # a part that was reclaimed mid-encode is shorter than its
+                # plan says — rebuild it rather than splicing it in
+                size = need[0].stat().st_size
+                got = self._media_duration(str(need[0]))
+                if int(rec.get("bytes", -1)) != size:
+                    say(f"  part {i + 1} is {size} bytes, journal says "
+                        f"{rec.get('bytes')} — rebuilding")
+                    continue
+                if got <= 0 or abs(got - float(rec.get("dur", 0))) > PART_TOL_S:
+                    say(f"  part {i + 1} is {got:.1f}s, plan says "
+                        f"{float(rec.get('dur', 0)):.1f}s — rebuilding")
+                    continue
+                done[i] = rec
+        else:
+            for f in pdir.iterdir():
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+        man = {"key": key, "sig": sig, "target": target, "parts": len(parts),
+               "part_target": part_target, "total_prog": total_prog,
+               "created": (man or {}).get("created", time.time()),
+               "input": str(self.input), "plan": plan_json,
+               "stems": want_stems, "done": [done[i] for i in sorted(done)],
+               # the exact project that produced these parts, so Resume can
+               # re-post it verbatim (the caller's own shape wins)
+               "body": dict(resume_body) if resume_body else
+               {"target": target, "name": name, "segments": segments,
+                "fast": fast, "crf": crf, "fps": fps, "height": height,
+                "width": width,
+                "layout": layout.to_dict() if layout is not None else None,
+                "audio": audio}}
+        write_manifest(self.out, key, man)
+
+        reused = sorted(done)
+        if reused:
+            say(f"{len(reused)}/{len(parts)} parts already on disk — kept "
+                f"({', '.join(str(i + 1) for i in reused[:8])}"
+                f"{' …' if len(reused) > 8 else ''})")
+            state["reused"] = [i + 1 for i in reused]
+        else:
+            say(f"{len(parts)} parts of ~{part_target:.0f}s "
+                f"({total_prog:.0f}s of programme)")
+
+        done_prog = [prog_len(parts[i], fast) for i in sorted(done)]
+        prog_before = [0.0] * len(parts)
+        acc = 0.0
+        for i in range(len(parts)):
+            prog_before[i] = acc
+            acc += prog_len(parts[i], fast)
+
+        if audio is not None:
+            self.audio_cfg.update(audio)
+        if isinstance(retouch, dict):
+            self.retouch_cfg.update(retouch)
+        lay = layout or self.layout
+        if layout is not None and target == "patreon":
+            self.layout = lay
+        rect = {"x": lay.content.x, "y": lay.content.y,
+                "w": lay.content.w, "h": lay.content.h}
+        hook = (self._cam_hook() if target == "patreon"
+                and self.retouch_cfg.get("enabled") else None)
+        pt_streams, pt_used = self._passthrough_streams(stems)
+        if target == "youtube" and pt_used:
+            say("reading the content + mic stems (tracks 2/3) — mute and card "
+                "spans silence the programme, your voice stays")
+
+        for i, part in enumerate(parts):
+            if cancel_check is not None and cancel_check():
+                raise RenderCancelled("render cancelled by user")
+            if budget_min and time.time() - started > budget_min * 60.0:
+                write_manifest(self.out, key, man)
+                raise RenderPaused(
+                    f"time budget reached after {len(done)}/{len(parts)} "
+                    "parts — the rest is resumable")
+            pn = prog_len(part, fast)
+            if i in done:
+                report((prog_before[i] + pn) / total_prog,
+                       step="cached", part=i + 1, parts=len(parts),
+                       bytes=out_bytes())
+                continue
+            say(f"part {i + 1}/{len(parts)}: {part[0]['start']:.1f}"
+                f"→{part[-1]['end']:.1f}s ({pn:.0f}s of programme)")
+            vp = pdir / f"part_{i:03d}.mp4"
+            report(prog_before[i] / total_prog, step="encoding",
+                   part=i + 1, parts=len(parts), bytes=out_bytes())
+
+            def cb(d, t, i=i):
+                beat()
+                # picture tops out at 95% of the part; audio gets the rest
+                frac = (prog_before[i] + pn * min(0.95, d / max(1, t))) \
+                    / total_prog
+                report(frac, step="encoding", part=i + 1, parts=len(parts))
+
+            if target == "youtube":
+                chain, warns = self._passthrough_graph(
+                    part, W=int(self.info.get("width") or 1920),
+                    H=int(self.info.get("height") or 1080),
+                    audio_cloak=audio_cloak, video_cloak=video_cloak,
+                    card=card, fast_speed=fast, master_gain_db=master_gain_db,
+                    content_rect=rect, out_fps=(float(fps) if fps else
+                                                float(self.info.get("fps") or 0)),
+                    height=height, audio_inputs=pt_streams,
+                    card_suffix=f"p{i}")
+                for w in warns:
+                    say(f"  (cloak: {w})")
+                _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset), pn,
+                            f"part {i + 1}/{len(parts)}", progress_cb=cb,
+                            cancel_check=cancel_check, stall_min=stall_min,
+                            out_path=vp, heartbeat=beat).run()
+                ap = pdir / f"part_{i:03d}.wav"
+                report((prog_before[i] + pn * 0.97) / total_prog,
+                       step="audio", part=i + 1, parts=len(parts))
+                beat()
+                self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
+                          "-filter_complex",
+                          self._part_audio_chain(part, fast),
+                          "-map", "[aout]", "-c:a", "pcm_s16le", str(ap)],
+                         f"part {i + 1} audio")
+                rec: Dict[str, Any] = {"i": i, "v": vp.name, "a": ap.name}
+            else:
+                C.render_video(str(self.input), str(vp), layout=lay,
+                               segments=part, crf=crf, progress_cb=cb,
+                               cancel_check=cancel_check, cam_hook=hook,
+                               fps=fps, width=int(width),
+                               height=int(height) or 1080)
+                report((prog_before[i] + pn * 0.9) / total_prog,
+                       step="audio", part=i + 1, parts=len(parts))
+                beat()
+                mix = self.mix_audio(
+                    output_path=str(pdir / f"part_{i:03d}.wav"),
+                    segments=part, fast_speed=fast,
+                    mute_solo=bool(lay.muteContentInSolo),
+                    master_gain_db=master_gain_db, cancel_check=cancel_check,
+                    stems=want_stems, reuse_buses=True)
+                rec = {"i": i, "v": vp.name, "a": Path(mix).name}
+                if want_stems:
+                    rec["ac"] = Path(self.last_stems["content"]).name
+                    rec["am"] = Path(self.last_stems["mic"]).name
+
+            # fit this part's audio to its own measured picture length, so
+            # joins never accumulate drift
+            vdur = self._media_duration(str(vp))
+            rec["dur"] = round(vdur or pn, 3)
+            for tag in ("a", "ac", "am"):
+                if rec.get(tag):
+                    fitted = self._fit_audio(pdir / rec[tag], rec["dur"], tag)
+                    if fitted.name != rec[tag]:
+                        fitted.replace(pdir / rec[tag])
+            rec["bytes"] = vp.stat().st_size if vp.exists() else 0
+            done[i] = rec
+            man["done"] = [done[k] for k in sorted(done)]
+            write_manifest(self.out, key, man)
+            say(f"part {i + 1}/{len(parts)} saved "
+                f"({rec['dur']:.1f}s, {rec['bytes'] / 1e6:.0f} MB)")
+            report((prog_before[i] + pn) / total_prog, step="saved",
+                   part=i + 1, parts=len(parts), bytes=out_bytes())
+
+        # ---- join + mux ----------------------------------------------------
+        say(f"joining {len(parts)} parts …")
+        report(0.97, step="joining", part=len(parts), parts=len(parts))
+        beat()
+        vparts = [pdir / done[i]["v"] for i in range(len(parts))]
+        video_all = self.out / f"{name}.video.mp4"
+        self._concat_video(vparts, video_all, crf=crf, preset=preset,
+                           what=f"join {name} video")
+        mix_all = self._concat_audio([pdir / done[i]["a"]
+                                      for i in range(len(parts))],
+                                     self.work / f"{name}_mix.wav")
+        if target == "youtube":
+            # parts carry the raw conformed buses; cloak + master gain happen
+            # once here, over the whole programme
+            mix_all = self._final_audio(mix_all, audio_cloak, master_gain_db,
+                                        self.work / f"{name}_mix_final.wav")
+        st = None
+        if want_stems:
+            st = {}
+            for tag, field in (("content", "ac"), ("mic", "am")):
+                st[tag] = str(self._concat_audio(
+                    [pdir / done[i][field] for i in range(len(parts))],
+                    self.work / f"{name}_{tag}.wav", f"join {tag}"))
+        report(0.99, step="muxing")
+        beat()
+        vdur = self._media_duration(str(video_all))
+        outs = self.mux(video_all, mix_all, self.out / f"{name}.mp4",
+                        webm=webm, stems=st, video_dur=vdur)
+        video_all.unlink(missing_ok=True)
+        man["done"] = [done[k] for k in sorted(done)]
+        man["finished"] = time.time()
+        man["output"] = outs["mp4"]
+        write_manifest(self.out, key, man)
+        size = Path(outs["mp4"]).stat().st_size
+        say(f"done: {outs['mp4']} ({size / 1e6:.0f} MB) — parts kept in "
+            f"{pdir.relative_to(self.out)} in case you want to re-join")
+        report(1.0, step="done", part=len(parts), parts=len(parts),
+               bytes=size)
+        return {"mp4": outs["mp4"],
+                **({"webm": outs["webm"]} if outs.get("webm") else {}),
+                **({"stems": outs["stems"]} if outs.get("stems") else {}),
+                "parts": len(parts), "resumed": [i + 1 for i in reused],
+                "chunked": True}
+
+    def _part_audio_chain(self, part: List[Dict[str, Any]],
+                          fast_speed: float) -> str:
+        """Audio for one passthrough part (YouTube path).
+
+        Same conform math as the single-pass graph: stems are read
+        separately when the source has them, mute/card silences the content
+        bus only.
+        """
+        inputs, used = self._passthrough_streams(None)
+        n = len(part)
+        chain: List[str] = []
+        cats: List[str] = []
+        for j, spec in enumerate(inputs):
+            outs = []
+            chain.append(f"[{spec}]asplit={n}"
+                         + "".join(f"[j{j}s{i}]" for i in range(n)))
+            for i, s in enumerate(part):
+                typ = s.get("type", "body")
+                a, b = float(s["start"]), float(s["end"])
+                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+                if typ == "fast":
+                    af += "," + ",".join(_atempo_chain(fast_speed))
+                if typ in ("mute", "card") and j == 0:
+                    af += ",volume=0"
+                chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
+                outs.append(f"[j{j}b{i}]")
+            chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
+            cats.append(f"[cat{j}]")
+        if len(cats) > 1:
+            chain.append("".join(cats)
+                         + f"amix=inputs={len(cats)}:duration=longest:"
+                           "dropout_transition=0.2[mix0]")
+            src = "mix0"
+        else:
+            src = cats[0][1:-1]
+        chain.append(f"[{src}]aformat=channel_layouts=stereo[aout]")
+        return ";".join(chain)
 
     def _to_webm(self, mp4: Path) -> str:
         wb = Path(mp4).with_suffix(".webm")
@@ -1456,7 +2322,8 @@ class ReactionVideoProcessor:
     def render_with_layout(self, name: str,
                            layout: Optional[L.LayoutState] = None,
                            segments: Optional[List[Dict[str, Any]]] = None,
-                           crf: int = 18, webm: bool = True) -> Dict[str, str]:
+                           crf: int = 18, webm: bool = True,
+                           stems: bool = False) -> Dict[str, str]:
         """Full render: composed video + conformed audio + mux (+ webm)."""
         layout = layout or self.layout
         segments = segments or self.build_timeline()
@@ -1470,8 +2337,10 @@ class ReactionVideoProcessor:
         self.compose_reaction(output_path=str(video_nc), layout=layout,
                               segments=segments, crf=crf)
         audio = self.mix_audio(output_path=str(self.work / f"{name}_mix.wav"),
-                               segments=segments, fast_speed=layout.fastSpeed)
-        outs = self.mux(video_nc, audio, self.out / f"{name}.mp4", webm=webm)
+                               segments=segments, fast_speed=layout.fastSpeed,
+                               stems=stems)
+        outs = self.mux(video_nc, audio, self.out / f"{name}.mp4", webm=webm,
+                        stems=dict(self.last_stems) if stems else None)
         print("Done:")
         for k, v in outs.items():
             print(f"  {k}: {v}")
@@ -1498,8 +2367,15 @@ class ReactionVideoProcessor:
     # ------------------------------------------------------- legacy runners
     def run_patron_version(self, intro_range=(0, 45), outro_range=(1250, 1290),
                            preset="diagonal", retouch=False, fix_intro=True,
-                           layout: Optional[L.LayoutState] = None) -> str:
-        """Full uncut reaction, intro/outro in full-cam, transcript for cleanup."""
+                           layout: Optional[L.LayoutState] = None,
+                           stems: bool = True) -> str:
+        """Full uncut reaction, intro/outro in full-cam, transcript for cleanup.
+
+        *stems* publishes the content-only and mic-only buses as audio tracks
+        2 and 3 behind the mix (track 1 stays the full programme, so every
+        player behaves exactly as before). A later YouTube cut can then read
+        those tracks and silence the content without losing your voice.
+        """
         print("=== PATREON VERSION ===")
         layout = layout or (L.old_preset_to_layout(preset) if preset else self.layout)
         self.layout = layout
@@ -1515,7 +2391,7 @@ class ReactionVideoProcessor:
                                        outro_start=outro_range[0] - self.duration
                                        if outro_range[0] > 0 else outro_range[0])
         outs = self.render_with_layout("patreon_final", layout=layout,
-                                       segments=segments)
+                                       segments=segments, stems=stems)
         return outs.get("mp4", "")
 
     def run_youtube_version(self, preset="diagonal", auto_cut=True, retouch=True,

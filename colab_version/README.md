@@ -67,6 +67,87 @@ URL from notebook cell 3d:
 - The Render tab's Save/Load project keeps the timeline + all settings as one
   tiny `.reaction.json`, so the edit survives closed tabs and dead sessions.
 
+### Long renders survive a reclaimed runtime
+
+A 3840×1080 Patreon render encodes at roughly 1.5–3 output frames per
+second on Colab's 2 vCPUs — hours for a 20-minute cut, far past the
+~90-minute idle reclaim. A single-pass render of a long capture simply
+cannot finish, and the old code only wrote its file at the very end, so a
+reclaim lost everything and the browser kept showing the last progress
+number it had.
+
+So both server pipelines now go through
+`ReactionVideoProcessor.render_project()`:
+
+- **Chunked.** Anything over 5 minutes of programme is split into parts of
+  ~90–240 s (Export → *Long renders* → 2 min / 4 min to override; short
+  renders stay exactly one pass, with no journal and no overhead). Splits
+  land on programme boundaries and slice segments rather than padding
+  them, so joining the parts reproduces the single-pass timeline exactly
+  — verified by comparing frame counts (480 == 480 in the test suite).
+- **Journaled.** Each part lands in `reaction_output/_parts/<name>/` and is
+  recorded in `manifest.json` with its measured length and byte size. A
+  part is only reused when the file exists, its size matches the journal
+  and it probes to its planned length, so a half-written part is rebuilt,
+  never spliced into the deliverable.
+- **Resumable.** The cost of a reclaimed VM is one part. Re-run the
+  notebook cell: it prints what is unfinished, and either the editor's
+  Export tab (**Resume render**) or `tools("resume the unfinished render")`
+  finishes it from the parts on disk. `GET /api/job` reports such a render
+  as `state: "lost"` with `stopped after 12m of silence with 3/21 parts
+  saved — it did NOT finish`.
+- **Drift-free joins.** Every part's audio is fitted to that part's
+  *measured* picture length before the parts are concatenated, so joins
+  cannot accumulate frame drift; the picture parts are stream-copied
+  (re-encoded only if that fails) and muxed once.
+- **No silent hangs.** An ffmpeg that emits no `time=` line for 15 min is
+  killed with a message instead of holding the job slot forever, and the
+  render refuses to start when the output folder is unwritable or
+  `/content/drive` is unmounted (a watchdog aborts mid-render if the mount
+  drops, and a keep-alive stat keeps it warm).
+- **Honest progress.** `GET /api/job` carries `step`, `part`, `parts`,
+  `eta_s`, `elapsed_s`, `age_s` and `bytes`; the Export tab shows
+  `part 4 of 21 · ~12 min left`, warns when the encoder goes quiet, and
+  says so plainly when the backend stops answering instead of freezing on
+  the last number it saw.
+
+### Three audio tracks on the Patreon master
+
+A Patreon master written by this pipeline carries three audio tracks:
+
+| track | contents |
+| ----- | -------- |
+| 1 | the full mix (content + mic) — what every player picks up |
+| 2 | content only |
+| 3 | mic only |
+
+All three are conformed to the same segment map and gain/limited like the
+mix, and the file is tagged `comment=reaction_stems=mix,content,mic`.
+Nothing about playback changes: YouTube's transcoder and Patreon's player
+both keep the first stream only, so a 3-track file is never the uploaded
+deliverable. Its value is as the intermediate: when you cut the YouTube
+version *from* that master, the passthrough reads tracks 2 and 3 instead
+of the mix, so a mute or card span silences the programme and **keeps your
+voice** (the old path applied `volume=0` to everything). Your master gain
+and limiter are re-applied to the rebuilt mix, and the uploaded cut stays
+a single track. Any other source (one mixed track) still works exactly as
+before — the stems are used only when they are there. Turn them off in
+Export → *Long renders* → "Also write content & mic tracks".
+
+The source picker in the header lists the output folder as well as the raw
+folder, because that is where the master you cut from lives.
+
+### The placeholder card covers the content, not the frame
+
+A card span used to be drawn as a near-full-frame box (0.06/0.16/0.88/0.68)
+in the YouTube passthrough and on the server, which buried the camera
+corner — the one thing viewers are there for. It now covers the layout's
+**content rect**, i.e. the same rect the compositor covered when it made
+the file you are cutting, so the camera stays visible. (The Patreon
+compositor already did this, which is why the preview and the render
+disagreed.) A card segment with no text of its own no longer crashes the
+Patreon compositor either — it inherits the global card.
+
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
 instead reports that no tunnel could be verified, it has *already* tried,

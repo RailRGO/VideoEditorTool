@@ -29,7 +29,7 @@ export interface Scene {
   layers: SceneLayer[];
   mode: "solo" | "body" | "cut" | "fast" | "card" | "lead";
   speed: number;
-  /** overrides layout.content for the placeholder card (full-frame card in passthrough) */
+  /** rect the placeholder card covers — layout.content unless overridden */
   cardRect?: Rect;
   /** per-segment card text; empty fields fall back to layout.card */
   cardText?: { title?: string; sub?: string; accent?: string };
@@ -144,7 +144,14 @@ export function buildPassthroughScene(
   srcTime: number,
   full: SrcRect,
   speed: number,
-  cloak?: VideoCloak | null
+  cloak?: VideoCloak | null,
+  /**
+   * Where the card goes. This file is a cut of the finished Patreon render,
+   * so the card has to cover the same content rect the compositor covered
+   * when it made that file — a full-frame card also buries the camera
+   * corner, which is the only thing viewers came for.
+   */
+  cardRect?: Rect
 ): Scene {
   const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
   const type = active?.type ?? "body";
@@ -155,7 +162,7 @@ export function buildPassthroughScene(
       layers: [],
       mode: "card",
       speed: 1,
-      cardRect: { x: 0.06, y: 0.16, w: 0.88, h: 0.68 },
+      cardRect: cardRect ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
       cardText: active?.card,
     };
   }
@@ -555,7 +562,8 @@ export function renderScene(
     }
   }
 
-  if (scene.mode === "card") drawCard(ctx, layout, W, H, scene.cardRect);
+  if (scene.mode === "card")
+    drawCard(ctx, layout, W, H, scene.cardRect, scene.cardText);
   if (scene.mode === "lead") drawLeadBlock(ctx, layout, W, H);
   if (scene.mode === "fast") drawSpeedBadge(ctx, scene.speed, W, H);
   ctx.restore();

@@ -203,6 +203,10 @@ export default function App() {
   const [res, setRes] = useState<720 | 1080>(1080);
   const [fps, setFps] = useState<24 | 30 | 60>(30);
   const [bitrate, setBitrate] = useState(12);
+  /** seconds of programme per server part — 0 = automatic (short = 1 pass) */
+  const [partTarget, setPartTarget] = useState(0);
+  /** Patreon master: also publish content-only + mic-only audio tracks */
+  const [stems, setStems] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<{ url: string; size: number } | null>(null);
@@ -893,7 +897,10 @@ export default function App() {
               v.currentTime,
               halves.full,
               lay.fastSpeed,
-              videoCloakRef.current
+              videoCloakRef.current,
+              // the card covers the content rect this file was composed with,
+              // so the camera corner stays visible
+              lay.content
             )
           : buildScene(lay, segs, v.currentTime, halves);
         const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
@@ -1251,7 +1258,7 @@ export default function App() {
   );
 
   const selectRemoteSource = useCallback(
-    async (name: string) => {
+    async (name: string, folder: "input" | "output" = "input") => {
       const client = remoteRef.current;
       if (!client) return;
       const token = ++connectToken.current;
@@ -1263,7 +1270,7 @@ export default function App() {
       setProxyEta(0);
       proxyStartRef.current = 0;
       try {
-        await client.setSource(name);
+        await client.setSource(name, folder);
         if (connectToken.current !== token) return;
         const s = await client.sources();
         if (connectToken.current !== token) return;
@@ -1357,13 +1364,16 @@ export default function App() {
         webm: false,
         fps: passthrough ? null : fps,
         height: passthrough ? 0 : res === 1080 ? 1080 : 720,
+        partTarget,
+        stems: passthrough ? false : stems,
       });
       setRemoteJob(job);
       setRightTab("export");
+      pollNowRef.current?.();
     } catch (e) {
       setRemoteError(e instanceof Error ? e.message : String(e));
     }
-  }, [duration, fileName, fps, res, remoteJob?.state]);
+  }, [duration, fileName, fps, res, remoteJob?.state, partTarget, stems]);
 
   const cancelRemoteExport = useCallback(async () => {
     const client = remoteRef.current;
@@ -1375,18 +1385,59 @@ export default function App() {
     }
   }, []);
 
-  /* poll a running remote render until it lands */
+  /* finish a render that stopped with parts on disk */
+  const resumeRemoteExport = useCallback(async () => {
+    const client = remoteRef.current;
+    const key = remoteJob?.resume?.key;
+    if (!client || !key) return;
+    setRemoteError("");
+    try {
+      setRemoteJob(await client.resume(key));
+    } catch (e) {
+      setRemoteError(e instanceof Error ? e.message : String(e));
+    }
+  }, [remoteJob?.resume?.key]);
+
+  /* Poll a running remote render until it lands.
+
+     A dead tunnel used to be swallowed silently, so the tab kept printing
+     the last progress number forever — that is how a reclaimed runtime
+     looked like a slow render. Three failed polls in a row now say so, and
+     a tab that becomes visible polls immediately instead of waiting out the
+     interval (background tabs throttle timers hard). */
+  const pollNowRef = useRef<(() => void) | null>(null);
+  const pollFails = useRef(0);
   useEffect(() => {
     if (!remote || remoteJob?.state !== "running") return;
-    const t = window.setInterval(async () => {
+    const tick = async () => {
       try {
         const j = await remote.job();
+        pollFails.current = 0;
+        setRemoteError("");
         setRemoteJob(j);
       } catch {
-        /* tunnel hiccup — keep polling */
+        pollFails.current += 1;
+        if (pollFails.current === 3) {
+          setRemoteError(
+            "The backend stopped answering — this render is NOT running any " +
+              "more. Re-run the notebook cell, then reconnect: the parts it " +
+              "finished are on disk and the render can be resumed."
+          );
+        }
       }
-    }, 2000);
-    return () => window.clearInterval(t);
+    };
+    pollNowRef.current = () => void tick();
+    void tick();
+    const t = window.setInterval(() => void tick(), 2000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void tick();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(t);
+      document.removeEventListener("visibilitychange", onVis);
+      pollNowRef.current = null;
+    };
   }, [remote, remoteJob?.state]);
 
   /* one-click connect: the notebook prints a link with ?backend=<tunnel url> */
@@ -1965,18 +2016,39 @@ export default function App() {
         ) : (
           <span className="flex min-w-0 items-center gap-1.5">
             <select
-              value={sources.find((s) => s.current)?.name ?? fileName}
+              value={
+                sources.find((s) => s.current)
+                  ? `${sources.find((s) => s.current)?.folder ?? "input"}:${sources.find((s) => s.current)?.name}`
+                  : fileName
+              }
               disabled={connecting || sources.length === 0}
-              onChange={(e) => void selectRemoteSource(e.target.value)}
+              onChange={(e) => {
+                const [folder, ...rest] = e.target.value.split(":");
+                void selectRemoteSource(
+                  rest.join(":"),
+                  folder === "output" ? "output" : "input"
+                );
+              }}
               className="h-7 max-w-[220px] truncate rounded-lg border border-white/10 bg-black/40 px-1.5 text-[11px] text-slate-200 outline-none focus:border-emerald-400/50 disabled:opacity-50"
-              title="Source file on the Colab side"
+              title="Source file on the Colab side — the output folder holds finished renders, which is where the Patreon master you cut YouTube from lives"
             >
               {sources.length === 0 && <option value={fileName}>{fileName}</option>}
-              {sources.map((s) => (
-                <option key={s.name} value={s.name}>
-                  {s.name} · {(s.size / 1073741824).toFixed(1)} GB
-                </option>
-              ))}
+              {(["input", "output"] as const).map((folder) => {
+                const list = sources.filter((s) => (s.folder ?? "input") === folder);
+                if (list.length === 0) return null;
+                return (
+                  <optgroup
+                    key={folder}
+                    label={folder === "output" ? "renders (output)" : "recordings (raw)"}
+                  >
+                    {list.map((s) => (
+                      <option key={`${folder}:${s.name}`} value={`${folder}:${s.name}`}>
+                        {s.name} · {(s.size / 1073741824).toFixed(1)} GB
+                      </option>
+                    ))}
+                  </optgroup>
+                );
+              })}
             </select>
             <button
               type="button"
@@ -2609,6 +2681,10 @@ export default function App() {
                 onLoadProject={loadProjectFile}
                 projectMsg={projectMsg}
                 passthrough={isYT}
+                partTarget={partTarget}
+                setPartTarget={setPartTarget}
+                stems={stems}
+                setStems={setStems}
                 remote={
                   isRemote
                     ? {
@@ -2617,6 +2693,7 @@ export default function App() {
                         error: remoteError,
                         onExport: () => void startRemoteExport(),
                         onCancel: () => void cancelRemoteExport(),
+                        onResume: () => void resumeRemoteExport(),
                         fileUrl: (n) => remote?.fileUrl(n) ?? "#",
                       }
                     : null

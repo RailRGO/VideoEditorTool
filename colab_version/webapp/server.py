@@ -32,7 +32,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote, parse_qs
 
 HERE = Path(__file__).resolve().parent          # .../colab_version/webapp
@@ -47,6 +47,114 @@ RenderCancelled = C.RenderCancelled
 
 INDEX_HTML = HERE / "index.html"
 CLOUDFLARED = Path.home() / ".local" / "bin" / "cloudflared"
+
+# a render whose journal has been silent this long has no live owner
+LOST_AFTER_S = 90.0
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def read_journal(out_dir: Path, key: str) -> Optional[Dict[str, Any]]:
+    """One render journal by key (None when there is none)."""
+    from video_processor import read_manifest
+    try:
+        return read_manifest(Path(out_dir), key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def unfinished_renders(out_dir: Path) -> List[Dict[str, Any]]:
+    """Renders with parts on disk but no finished file — newest first.
+
+    Used by the notebook cell so a reclaimed runtime is recoverable without
+    opening the browser at all.
+    """
+    from video_processor import list_journals
+    out = []
+    for man in list_journals(Path(out_dir)):
+        try:
+            parts = int(man.get("parts") or 0)
+            saved = len(man.get("done") or [])
+        except (TypeError, ValueError):
+            continue
+        if parts <= 0 or saved <= 0 or saved >= parts:
+            continue
+        if man.get("finished") and Path(str(man.get("output") or "")).exists():
+            continue
+        out.append({"key": man.get("key"), "target": man.get("target"),
+                    "name": (man.get("body") or {}).get("name") or man.get("key"),
+                    "saved": saved, "parts": parts,
+                    "silent_s": time.time() - float(man.get("updated") or 0),
+                    "body": man.get("body") or {}})
+    return out
+
+
+def preflight_output(out_dir: Path, log=None) -> None:
+    """Refuse to start a render that cannot possibly be written.
+
+    A silently unmounted /content/drive turns a 40-minute render into an
+    empty output folder, so check the mount and the write permission up
+    front and say so in the log.
+    """
+    say = log or (lambda m: None)
+    out = Path(out_dir)
+    drive = None
+    for part in out.parts:
+        if part == "drive":
+            drive = Path(*out.parts[:out.parts.index("drive") + 1])
+            break
+    if drive is not None and not drive.is_dir():
+        raise RuntimeError(
+            f"{drive} is not mounted — reconnect the Drive folder in the "
+            "notebook (Files → Mount Drive) and render again")
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe = out / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as e:
+        raise RuntimeError(f"the output folder is not writable ({out}): {e}")
+    say(f"output folder ok: {out}")
+
+
+class MountWatchdog:
+    """Abort a render when the Drive mount disappears underneath it.
+
+    Also keeps the FUSE mount warm — an idle mount is the usual reason a
+    long render dies halfway.
+    """
+
+    def __init__(self, out_dir: Path, on_lost, every: float = 30.0):
+        self.out = Path(out_dir)
+        self.on_lost = on_lost
+        self.every = float(every)
+        self.stop = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> "MountWatchdog":
+        def loop():
+            while not self.stop.wait(self.every):
+                try:
+                    self.out.stat()
+                    (self.out.parent / ".").stat()
+                except OSError:
+                    if not self.stop.is_set():
+                        self.on_lost()
+                    return
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+        return self
+
+    def close(self) -> None:
+        self.stop.set()
+
 
 # Live servers in THIS kernel: port -> {"server", "app", "tunnel_proc", "public"}.
 # Lets re-running the launch cell reuse the server (and its state) instead of
@@ -590,6 +698,14 @@ class App:
         self.bus_proxies: Dict[str, Dict[str, Any]] = {}
         self.job: Dict[str, Any] = self._fresh_job("render")
         self._job_lock = threading.Lock()
+        # wall clock of the last progress line — the UI turns a stale one
+        # into "the encoder stopped answering" instead of a frozen bar
+        self.job_beat = time.time()
+        self.job_started = time.time()
+        self.watchdog: Optional[MountWatchdog] = None
+        # journal key of the render this server last ran (drives Resume
+        # after a cancel or an error)
+        self.last_render_key = ""
         self.proxy_width = proxy_width
         self.proxy_gen = 0  # orphaned workers (after a source switch) stand down
         # set by /api/job/cancel; polled by the running render/transcript worker
@@ -627,11 +743,101 @@ class App:
     def _fresh_job(kind: str, state: str = "idle") -> Dict[str, Any]:
         return {"kind": kind, "state": state, "progress": 0.0, "files": {},
                 "thumbs": [], "loudness": {}, "result": None, "error": None,
-                "log": []}
+                "log": [],
+                # honest progress: where the render actually is
+                "step": "", "part": 0, "parts": 1, "eta_s": 0.0,
+                "elapsed_s": 0.0, "age_s": 0.0, "bytes": 0, "updated": 0.0,
+                # set when a chunked render can be picked back up
+                "resume": None}
 
     def job_state(self) -> Dict[str, Any]:
+        now = time.time()
         with self._job_lock:
-            return dict(self.job)
+            j = dict(self.job)
+            if j["state"] == "running":
+                j["age_s"] = now - self.job_beat
+        if j["state"] == "idle":
+            # a fresh server (or a reclaimed runtime) knows nothing about the
+            # render that was running before it — but the parts on disk do
+            lost = self._lost_render()
+            if lost:
+                return lost
+        elif j["state"] in ("cancelled", "error") and not j.get("resume"):
+            # a stopped render keeps its parts, so stopping is not the end:
+            # offer to finish it instead of re-encoding everything
+            r = self._open_journal_for(self.last_render_key)
+            if r:
+                j["resume"] = r
+        return j
+
+    def _open_journal_for(self, key: str) -> Optional[Dict[str, Any]]:
+        if not key:
+            return None
+        return self._open_journal(read_journal(self.proc.out, key) or {})
+
+    # -- resumes ------------------------------------------------------------
+    def _journals(self) -> List[Dict[str, Any]]:
+        from video_processor import list_journals
+        try:
+            return list_journals(self.proc.out)
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
+    def _open_journal(man: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """A journal with parts saved but no finished output = resumable."""
+        try:
+            parts = int(man.get("parts") or 0)
+            done = len(man.get("done") or [])
+        except (TypeError, ValueError):
+            return None
+        if parts <= 0 or done <= 0 or done >= parts:
+            return None
+        if man.get("finished") and Path(str(man.get("output") or "")).exists():
+            return None
+        return {"key": man.get("key"), "target": man.get("target", "patreon"),
+                "name": (man.get("body") or {}).get("name") or man.get("key"),
+                "saved": done, "parts": parts,
+                "body": man.get("body") or {},
+                "silent_s": time.time() - float(man.get("updated") or 0),
+                "when": man.get("updated") or 0}
+
+    def _lost_render(self) -> Optional[Dict[str, Any]]:
+        for man in self._journals():
+            r = self._open_journal(man)
+            if not r or r["silent_s"] < LOST_AFTER_S:
+                continue
+            job = self._fresh_job("render", "lost")
+            job.update(
+                progress=r["saved"] / max(1, r["parts"]), part=r["saved"],
+                parts=r["parts"], step="lost", resume=r, age_s=r["silent_s"],
+                error=(f"stopped after {_fmt_dur(r['silent_s'])} of silence "
+                       f"with {r['saved']}/{r['parts']} parts saved — it did "
+                       "NOT finish"),
+                log=[f"{r['target']} render '{r['name']}' stopped "
+                     f"{_fmt_dur(r['silent_s'])} ago.",
+                     f"{r['saved']} of {r['parts']} parts are on disk and can "
+                     "be reused — press Resume to finish it."])
+            return job
+        return None
+
+    def resume_render(self, key: str = "") -> Dict[str, Any]:
+        """Re-run a stopped render; the parts still on disk are reused."""
+        with self._job_lock:
+            if self.job["state"] == "running":
+                return dict(self.job)
+        found = None
+        for man in self._journals():
+            r = self._open_journal(man)
+            if r and (not key or r["key"] == key):
+                found = r
+                break
+        if not found:
+            raise ValueError("no unfinished render to resume")
+        body = dict(found["body"])
+        body.setdefault("target", found["target"])
+        body["name"] = found["name"]
+        return self.start_render_project(body)
 
     def cancel_job(self) -> Dict[str, Any]:
         """Ask the running render/transcript worker to stop at its next
@@ -695,26 +901,27 @@ class App:
         """Render a full project posted by the new UI.
 
         body: {target, name, segments, layout, audio, retouch, audioCloak,
-        videoCloak, crf, webm, fps, height}. Patreon goes through the
-        compositor; YouTube through the single-pass ffmpeg passthrough.
+        videoCloak, crf, webm, fps, height, partTarget, stallMin, budgetMin,
+        stems}. Patreon goes through the compositor; YouTube through the
+        ffmpeg passthrough. Both render in parts with a journal on disk, so a
+        reclaimed runtime costs one part instead of the whole render.
         """
         with self._job_lock:
             if self.job["state"] == "running":
                 return dict(self.job)
             self.job = self._fresh_job("render", "running")
             self.cancel_requested = False
+            self.job_beat = time.time()
+            self.job_started = time.time()
 
         def log(msg):
             with self._job_lock:
                 self.job["log"].append(msg)
 
-        def frac(p):
-            with self._job_lock:
-                self.job["progress"] = max(0.0, min(1.0, p))
-
         target = str(body.get("target", "patreon"))
         name = str(body.get("name", "youtube_final" if target == "youtube" else "render"))
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "render"
+        self.last_render_key = name
         def _clean_card(s: Dict[str, Any]) -> Optional[Dict[str, str]]:
             c = s.get("card")
             if not isinstance(c, dict):
@@ -737,104 +944,157 @@ class App:
         layout_d = body.get("layout") or {}
         fast = float(layout_d.get("fastSpeed", 4.0) or 4.0)
 
+        # optional knobs from the Export panel
+        try:
+            part_target = float(body.get("partTarget") or 0.0)
+        except (TypeError, ValueError):
+            part_target = 0.0
+        try:
+            budget_min = float(body.get("budgetMin") or 0.0)
+        except (TypeError, ValueError):
+            budget_min = 0.0
+        try:
+            stall_min = float(body.get("stallMin") or 15.0)
+        except (TypeError, ValueError):
+            stall_min = 15.0
+        want_stems = body.get("stems")
+        want_stems = None if want_stems is None else bool(want_stems)
+
+        def prog(frac, info):
+            """render_project progress -> the job fields the UI reads."""
+            now = time.time()
+            el = float(info.get("elapsed_s") or (now - self.job_started))
+            with self._job_lock:
+                self.job["progress"] = max(0.0, min(1.0, float(frac)))
+                for k in ("step", "part", "parts", "bytes"):
+                    if info.get(k) is not None:
+                        self.job[k] = info[k]
+                self.job["elapsed_s"] = el
+                self.job["eta_s"] = (el * (1.0 - float(frac)) / float(frac)
+                                     if float(frac) > 0.02 else 0.0)
+                self.job["updated"] = now
+                if info.get("reused"):
+                    self.job["resume"] = {"saved": len(info["reused"]),
+                                          "parts": info.get("parts", 0),
+                                          "key": name}
+            self.job_beat = now
+
         def run():
+            wd = None
             try:
-                from video_processor import browser_audio_to_cfg  # noqa
+                from video_processor import (browser_audio_to_cfg,  # noqa
+                                             RenderPaused, StallTimeout)
                 if not segments:
                     raise ValueError("empty timeline — nothing to render")
-                if target == "youtube":
-                    log(f"YouTube passthrough: {len(segments)} segments, "
-                        f"{C.render_duration(segments, fast):.0f}s")
-                    card = layout_d.get("card") or body.get("card") or {}
-                    _, master = browser_audio_to_cfg(body.get("audio") or {})
-                    outs = self.proc.render_passthrough(
-                        segments=segments,
-                        audio_cloak=body.get("audioCloak"),
-                        video_cloak=body.get("videoCloak"),
-                        card=card, fast_speed=fast, master_gain_db=master,
-                        crf=int(body.get("crf", 18)),
-                        fps=body.get("fps") or None,
-                        height=int(body.get("height", 0) or 0),
-                        name=name, webm=bool(body.get("webm", False)),
-                        progress_cb=lambda d, t: frac(0.05 + 0.9 * d / max(1, t)),
-                        cancel_check=lambda: self.cancel_requested,
-                    )
-                else:
-                    self.proc.layout = L.LayoutState.from_dict(layout_d)
-                    flat, master = browser_audio_to_cfg(body.get("audio") or {})
+                preflight_output(self.proc.out, log)
+                wd = MountWatchdog(self.proc.out, self._mount_lost).start()
+                self.watchdog = wd
+                flat, master = browser_audio_to_cfg(body.get("audio") or {})
+                # the posted browser layout is the truth: for Patreon it drives
+                # the compositor, for YouTube its content rect is where the
+                # card goes (that is the rect the source file was composed in)
+                lay = L.LayoutState.from_dict(layout_d)
+                self.proc.layout = lay
+                if target != "youtube":
+                    # the posted browser state drives the engine, exactly as
+                    # the old single-pass path did
                     self.proc.audio_cfg.update(flat)
                     if isinstance(body.get("retouch"), dict):
                         self.proc.retouch_cfg.update(body["retouch"])
-                    log(f"Patreon composite: {len(segments)} segments, "
-                        f"{C.render_duration(segments, fast):.0f}s")
-                    video_nc = self.proc.work / f"{name}_video.mp4"
-                    h = int(body.get("height", 0) or 0)
-                    self.proc.compose_reaction(
-                        output_path=str(video_nc), layout=self.proc.layout,
-                        segments=segments, crf=int(body.get("crf", 18)),
-                        fps=body.get("fps") or None,
-                        width=1920 if not h or h >= 1080 else 1280,
-                        height=h or 1080,
-                        cancel_check=lambda: self.cancel_requested)
-                    frac(0.85)
-                    log("video done — mixing audio …")
-                    audio = self.proc.mix_audio(
-                        output_path=str(self.proc.work / f"{name}_mix.wav"),
-                        segments=segments, fast_speed=fast,
-                        mute_solo=bool(self.proc.layout.muteContentInSolo),
-                        master_gain_db=master,
-                        cancel_check=lambda: self.cancel_requested)
-                    outs = self.proc.mux(video_nc, audio,
-                                         self.proc.out / f"{name}.mp4",
-                                         webm=bool(body.get("webm", False)))
+                log(f"{'YouTube passthrough' if target == 'youtube' else 'Patreon composite'}: "
+                    f"{len(segments)} segments, "
+                    f"{C.render_duration(segments, fast):.0f}s")
+                outs = self.proc.render_project(
+                    target=target, name=name, segments=segments,
+                    layout=lay,
+                    audio=(dict(self.proc.audio_cfg)
+                           if target != "youtube" else None),
+                    audio_cloak=body.get("audioCloak"),
+                    video_cloak=body.get("videoCloak"),
+                    card=layout_d.get("card") or body.get("card") or {},
+                    fast_speed=fast, master_gain_db=master,
+                    crf=int(body.get("crf", 18)),
+                    fps=body.get("fps") or None,
+                    height=int(body.get("height", 0) or 0),
+                    width=1920 if not int(body.get("height", 0) or 0)
+                    or int(body.get("height", 0) or 0) >= 1080 else 1280,
+                    webm=bool(body.get("webm", False)),
+                    stems=want_stems, part_target=part_target,
+                    stall_min=stall_min, budget_min=budget_min,
+                    progress_cb=prog, log=log, resume_body=dict(body),
+                    cancel_check=lambda: self.cancel_requested)
                 log("building upload kit (chapters · thumbnails · loudness) …")
                 kit = _build_upload_kit(Path(outs.get("mp4") or
                                               next(iter(outs.values()))),
                                         name, segments, fast, self.proc.out, log)
-                files = {k: Path(v).name for k, v in outs.items()}
+                files = {k: Path(v).name for k, v in outs.items()
+                         if k in ("mp4", "webm")}
                 if kit["chapters"]:
                     files["chapters"] = kit["chapters"]
+                if outs.get("stems"):
+                    files["stems"] = outs["stems"]
                 with self._job_lock:
                     self.job.update(state="done", progress=1.0, files=files,
-                                    thumbs=kit["thumbs"], loudness=kit["loudness"])
-                log("done.")
+                                    thumbs=kit["thumbs"],
+                                    loudness=kit["loudness"], step="done",
+                                    resume=None)
+                log(f"done: {files.get('mp4')} in {self.proc.out}")
             except RenderCancelled:
                 with self._job_lock:
-                    self.job.update(state="cancelled", error=None)
-                log("render cancelled by user.")
+                    self.job.update(state="cancelled", error=None,
+                                    step="cancelled")
+                log("render cancelled by user — finished parts are kept.")
+            except RenderPaused as e:
+                with self._job_lock:
+                    self.job.update(state="paused", error=str(e), step="paused",
+                                    resume={"key": name, "parts": 0,
+                                            "saved": 0, "name": name,
+                                            "target": target})
+                log(f"paused: {e}")
+            except StallTimeout as e:
+                with self._job_lock:
+                    self.job.update(state="error", error=str(e),
+                                    step="stalled",
+                                    resume={"key": name, "name": name,
+                                            "target": target})
+                log(f"ERROR: {e}")
             except Exception as e:  # noqa: BLE001 — surfaced to the UI
                 with self._job_lock:
                     self.job.update(state="error", error=str(e))
                 log(f"ERROR: {e}")
+            finally:
+                if wd is not None:
+                    wd.close()
+                    self.watchdog = None
 
-        orig_render = C.render_video
-
-        def patched(*a, **kw):
-            kw["progress_cb"] = lambda d, t: frac(0.05 + 0.8 * d / max(1, t))
-            return orig_render(*a, **kw)
-
-        C.render_video = patched  # type: ignore
-        try:
-            threading.Thread(target=self._run_guarded(run, orig_render),
-                             daemon=True).start()
-        except Exception:
-            C.render_video = orig_render  # type: ignore
-            raise
+        threading.Thread(target=run, daemon=True).start()
         return self.job_state()
 
-    def set_input(self, name: str) -> Dict[str, Any]:
-        """Switch the source file (basename inside the input folder)."""
+    def _mount_lost(self) -> None:
+        """Drive vanished mid-render: stop now, keep the parts, say why."""
+        self.cancel_requested = True
+        with self._job_lock:
+            self.job["log"].append(
+                "the Drive mount disappeared — stopping; finished parts are "
+                "kept for resume")
+
+    def set_input(self, name: str, folder: str = "input") -> Dict[str, Any]:
+        """Switch the source file (basename inside the input or output folder).
+
+        folder="output" is how the YouTube step opens the finished Patreon
+        master without copying it back into raw/.
+        """
         from video_processor import ReactionVideoProcessor  # noqa
         clean = Path(str(name or "")).name
         if not clean or clean.startswith("."):
             raise ValueError("bad file name")
-        base = Path(self.proc.input).parent
+        base = self._source_base(folder)
         cand = (base / clean).resolve()
         if base.resolve() not in cand.parents and cand.parent != base.resolve():
             raise ValueError("file is outside the media folder")
         if not cand.exists() or not cand.is_file():
             raise ValueError(f"file not found: {clean}")
-        if cand.suffix.lower() not in (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"):
+        if cand.suffix.lower() not in self.VIDEO_EXT:
             raise ValueError("not a video file")
         with self._job_lock:
             if self.job["state"] == "running":
@@ -860,22 +1120,37 @@ class App:
         _start_proxy_worker(self, self.proxy_width)
         return self.state()
 
+    VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi")
+
+    def _source_base(self, folder: str = "input") -> Path:
+        return self.proc.out if str(folder) == "output" \
+            else Path(self.proc.input).parent
+
     def list_sources(self) -> List[Dict[str, Any]]:
-        base = Path(self.proc.input).parent
+        """Media in the input folder *and* the render output folder.
+
+        The Patreon master is written to the output folder, so that is where
+        you pick it up when cutting the YouTube version from it.
+        """
         out = []
-        try:
-            names = sorted(p.name for p in base.iterdir()
-                           if p.is_file() and p.suffix.lower() in
-                           (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"))
-        except OSError:
-            names = []
-        for nm in names[:200]:
+        cur = str(Path(self.proc.input).resolve())
+        for folder in ("input", "output"):
+            base = self._source_base(folder)
             try:
-                st = (base / nm).stat()
-                out.append({"name": nm, "size": st.st_size, "mtime": st.st_mtime,
-                            "current": nm == Path(self.proc.input).name})
+                names = sorted(p.name for p in base.iterdir()
+                               if p.is_file()
+                               and p.suffix.lower() in self.VIDEO_EXT
+                               and not p.name.startswith("."))
             except OSError:
-                continue
+                names = []
+            for nm in names[:200]:
+                try:
+                    st = (base / nm).stat()
+                except OSError:
+                    continue
+                out.append({"name": nm, "size": st.st_size,
+                            "mtime": st.st_mtime, "folder": folder,
+                            "current": str((base / nm).resolve()) == cur})
         return out
 
     # -- background full render ----------------------------------------------
@@ -1183,6 +1458,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(job)
             elif path == "/api/job/render":
                 self._json(app.start_render_project(body))
+            elif path == "/api/job/resume":
+                try:
+                    self._json(app.resume_render(str(body.get("key", ""))))
+                except ValueError as e:
+                    self._json({"error": str(e)}, 409)
             elif path == "/api/job/transcript":
                 try:
                     self._json(app.start_transcript(body))
@@ -1192,7 +1472,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(app.cancel_job())
             elif path == "/api/source":
                 try:
-                    self._json(app.set_input(str(body.get("name", ""))))
+                    self._json(app.set_input(str(body.get("name", "")),
+                                             str(body.get("folder", "input"))))
                 except ValueError as e:
                     self._json({"error": str(e)}, 400)
             elif path == "/api/mic_channel":
