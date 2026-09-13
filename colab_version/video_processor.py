@@ -203,11 +203,34 @@ def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
     return ";".join(parts), warnings
 
 
-def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[str]:
-    """Raw vf list for the frame cloak (shared by snippet + per-segment use)."""
+def _vignette_angle(amount: float) -> float:
+    """ffmpeg `vignette` lens angle for a 0..100 slider, matched to the
+    corner darkening of the browser's radial gradient.
+
+    ffmpeg's vignette is a cos-power falloff normalised to the frame
+    corner: at a=PI/2 the corners are pure black and a=1.3 blacks out
+    everything but the centre (the old mapping went *backwards* from
+    PI/2, so even the default 25 looked like a maxed-out vignette). The
+    gradient the preview fills darkens the corner by amount/100*0.55*0.72,
+    and a ~= 0.45*sqrt(v/100) lands the filter's corner gain on that.
+    Only a fallback — the passthrough composes the gradient itself as a
+    PNG overlay, so export and preview match exactly.
+    """
+    v = max(0.0, min(100.0, float(amount)))
+    return 0.45 * (v / 100.0) ** 0.5
+
+
+def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
+                      ) -> Tuple[List[str], List[str]]:
+    """(filters before the vignette overlay, filters after it).
+
+    The browser draws its vignette over the colour/grain and under the
+    cover bars + frame, so the passthrough graph inserts the gradient PNG
+    between these two halves.
+    """
     c = cfg or {}
     if not c.get("on", False):
-        return []
+        return [], []
     zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
     bars = max(0.0, min(12.0, float(c.get("bars", 0.0))))
     border = max(0.0, min(24.0, float(c.get("border", 0.0))))
@@ -217,33 +240,49 @@ def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[
     brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
     hue = float(c.get("hue", 0.0))
     grain = float(c.get("grain", 0.0))
-    vignette = float(c.get("vignette", 0.0))
 
-    f: List[str] = []
+    pre: List[str] = []
     if zoom > 1.001:
-        f.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
-        f.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
-        f.append(f"scale={W}:{H}")
+        pre.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
+        pre.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
+        pre.append(f"scale={W}:{H}")
     if abs(saturate - 1.0) > 0.005 or abs(contrast - 1.0) > 0.005 \
             or abs(brightness) > 0.005:
-        f.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
-                 f"brightness={brightness:.3f}")
+        pre.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
+                   f"brightness={brightness:.3f}")
     if abs(hue) > 0.5:
-        f.append(f"hue=h={hue:.1f}")
+        pre.append(f"hue=h={hue:.1f}")
     if grain > 0.5:
-        f.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
-    if vignette > 0.5:
-        angle = (3.14159 / 2.0) - (vignette / 100.0) * (3.14159 / 2.0 - 3.14159 / 7.0)
-        f.append(f"vignette=a={angle:.4f}")
+        pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+
+    post: List[str] = []
     if bars > 0.05:
         bh = max(1, int(round(H * bars / 100.0)))
-        f.append(f"drawbox=y=0:w=iw:h={bh}:c=black:t=fill")
-        f.append(f"drawbox=y=ih-{bh}:w=iw:h={bh}:c=black:t=fill")
+        post.append(f"drawbox=y=0:w=iw:h={bh}:c=black:t=fill")
+        post.append(f"drawbox=y=ih-{bh}:w=iw:h={bh}:c=black:t=fill")
     if border > 0.5:
         bw = max(1, int(round(border * H / 1080.0)))
         o = bw // 2
-        f.append(f"drawbox=x={o}:y={o}:w=iw-{2 * o}:h=ih-{2 * o}:"
-                 f"c=0x{border_color}:t={bw}")
+        post.append(f"drawbox=x={o}:y={o}:w=iw-{2 * o}:h=ih-{2 * o}:"
+                    f"c=0x{border_color}:t={bw}")
+    return pre, post
+
+
+def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[str]:
+    """Raw vf list for the frame cloak (shared by snippet + per-segment use).
+
+    Stands on its own (no overlay input to hang a gradient PNG on), so the
+    vignette here is the calibrated `vignette` filter rather than the exact
+    browser gradient the passthrough graph composites.
+    """
+    c = cfg or {}
+    pre, post = _video_cloak_split(c, W, H)
+    if not c.get("on", False):
+        return []
+    f = list(pre)
+    if float(c.get("vignette", 0.0)) > 0.5:
+        f.append(f"vignette=a={_vignette_angle(c.get('vignette', 0.0)):.4f}")
+    f.extend(post)
     return f
 
 
@@ -1287,20 +1326,43 @@ class ReactionVideoProcessor:
     def _passthrough_graph(self, kept: List[Dict[str, Any]], *, W: int, H: int,
                            audio_cloak, video_cloak, card, fast_speed,
                            master_gain_db, content_rect, out_fps, height,
-                           audio_inputs: List[str], card_suffix: str = ""
-                           ) -> Tuple[List[str], List[str]]:
+                           audio_inputs: List[str]
+                           ) -> Tuple[List[str], List[str], List[Path]]:
         """filter_complex for one (part of a) passthrough render.
 
         Both streams are conformed from the same segment list, so A/V can
         never desync. With two *audio_inputs* the first is the content bus
         (silenced on mute/card) and the second the mic (never silenced).
+
+        Returns (chain, warnings, extra_inputs): the card and the vignette
+        gradient arrive as single-frame PNG stills the caller must add to
+        the command as plain inputs (`overlay` repeats their one frame for
+        the whole base), because neither drawtext nor ffmpeg's own vignette
+        filter reproduces what the browser preview draws.
         """
         n = len(kept)
         chain: List[str] = [
             f"[0:v]split={n}" + "".join(f"[vin{i}]" for i in range(n))
         ]
         vouts: List[str] = []
-        cloak_vf = _video_cloak_filters(video_cloak, W, H)
+        warns: List[str] = []
+        inputs: List[Path] = []
+
+        def input_index(p: Path) -> int:
+            if p not in inputs:
+                inputs.append(p)
+            return inputs.index(p) + 1      # input 0 is the source
+
+        pre, post = _video_cloak_split(video_cloak, W, H)
+        want_vig = bool((video_cloak or {}).get("on", False)) and \
+            float((video_cloak or {}).get("vignette", 0.0)) > 0.5
+        vig_png: Optional[Path] = None
+        if want_vig:
+            if _ffmpeg_has_filter("overlay"):
+                vig_png = self._vignette_png(
+                    float(video_cloak.get("vignette", 0.0)), W, H)
+            else:
+                warns.append("overlay filter missing — vignette skipped")
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
@@ -1309,21 +1371,58 @@ class ReactionVideoProcessor:
                      f"setpts=(PTS-STARTPTS)/{float(fast_speed):.4f}"
             else:
                 vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
+            if pre:
+                vf += "," + ",".join(pre)
+            cur = f"vp{i}"
+            chain.append(f"[vin{i}]{vf}[{cur}]")
             if typ == "card":
                 # per-segment override; empty fields inherit the global card
-                vf += "," + ",".join(
-                    self._card_draws({**(card or {}), **(s.get("card") or {})},
-                                     W, H, suffix=f"{card_suffix}_{i}",
-                                     content=content_rect)
-                )
-            elif cloak_vf:
-                vf += "," + ",".join(cloak_vf)
-            vf += ",setsar=1"
-            chain.append(f"[vin{i}]{vf}[v{i}]")
+                png = self._card_png({**(card or {}), **(s.get("card") or {})},
+                                     W, H, content=content_rect)
+                if png is not None and _ffmpeg_has_filter("overlay"):
+                    path, ox, oy = png
+                    nxt = f"vo{i}"
+                    chain.append(f"[{cur}][{input_index(path)}:v]"
+                                 f"overlay=x={ox}:y={oy}:format=auto[{nxt}]")
+                    cur = nxt
+                else:
+                    warns.append("overlay filter missing — card skipped")
+            chain.append(f"[{cur}]setsar=1[v{i}]")
             vouts.append(f"[v{i}]")
         chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
 
-        warns: List[str] = []
+        # The vignette gradient and the cover bars/frame are properties of
+        # the programme, not of a segment, so they run once over the joined
+        # stream — except on card spans, where the preview shows the bare
+        # card (enable=… skips exactly those spans, in programme time).
+        spans: List[Tuple[float, float]] = []
+        t_acc = 0.0
+        for s in kept:
+            dur = float(s["end"]) - float(s["start"])
+            pd = dur / float(fast_speed) if s.get("type", "body") == "fast" \
+                else dur
+            if s.get("type", "body") == "card":
+                spans.append((t_acc, t_acc + pd))
+            t_acc += pd
+        en = ""
+        if spans:
+            # half-open spans: between() would also swallow the first frame
+            # of the segment that follows a card
+            terms = "+".join(f"gte(t,{a:.3f})*lt(t,{b:.3f})" for a, b in spans)
+            en = f":enable='1-({terms})'"
+        cur = "vcat"
+        if vig_png is not None:
+            nxt = "vvig"
+            chain.append(f"[{cur}][{input_index(vig_png)}:v]"
+                         f"overlay=x=0:y=0:format=auto{en}[{nxt}]")
+            cur = nxt
+        if post:
+            nxt = "vpost"
+            chain.append(f"[{cur}]"
+                         + (",".join(f"{p}{en}" for p in post))
+                         + f"[{nxt}]")
+            cur = nxt
+
         cats: List[str] = []
         for j, spec in enumerate(audio_inputs):
             outs = []
@@ -1363,24 +1462,32 @@ class ReactionVideoProcessor:
         # then guesses 25 fps — which silently drops every sixth frame of a
         # 30 fps capture. State the rate explicitly (a no-op when it already
         # matches, a real re-time when the caller asked for another one).
-        vtail = "[vcat]"
+        vtail = f"[{cur}]"
         if out_fps and float(out_fps) > 0:
-            chain.append(f"[vcat]fps={float(out_fps):.6f}[vfps]")
+            chain.append(f"[{cur}]fps={float(out_fps):.6f}[vfps]")
             vtail = "[vfps]"
         if height and int(height) not in (0, H):
             chain.append(f"{vtail}scale=-2:{int(height)}[vout]")
         else:
             chain.append(f"{vtail}null[vout]")
-        return chain, warns
+        return chain, warns, inputs
 
     def _passthrough_cmd(self, chain: List[str], out: Path, crf: int,
-                         preset: str) -> List[str]:
-        return ["ffmpeg", "-y", "-v", "info", "-i", str(self.input),
-                "-filter_complex", ";".join(chain),
+                         preset: str,
+                         inputs: Optional[List[Path]] = None) -> List[str]:
+        cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(self.input)]
+        # still-image inputs for the overlay PNGs (card / vignette). One
+        # frame each, on purpose: `overlay` repeats the last secondary frame
+        # (repeatlast=1) for the rest of the base, while -loop 1 would feed
+        # frames forever and the graph would never reach EOF.
+        for p in (inputs or []):
+            cmd += ["-i", str(p)]
+        cmd += ["-filter_complex", ";".join(chain),
                 "-map", "[vout]", "-map", "[aout]",
                 "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart", str(out)]
+        return cmd
 
     def render_passthrough(
         self,
@@ -1427,7 +1534,7 @@ class ReactionVideoProcessor:
         audio_inputs, used_stems = self._passthrough_streams(stems)
         if used_stems:
             print("  passthrough: reading the content + mic stems (tracks 2/3)")
-        chain, warns = self._passthrough_graph(
+        chain, warns, extra = self._passthrough_graph(
             kept, W=W, H=H, audio_cloak=audio_cloak, video_cloak=video_cloak,
             card=card, fast_speed=fast_speed, master_gain_db=master_gain_db,
             content_rect=content_rect, out_fps=out_fps, height=height,
@@ -1436,7 +1543,8 @@ class ReactionVideoProcessor:
             print(f"  (cloak: {w})")
 
         out = self.out / f"{name}.mp4"
-        _EncoderRun(self._passthrough_cmd(chain, out, crf, preset), total,
+        _EncoderRun(self._passthrough_cmd(chain, out, crf, preset, extra),
+                    total,
                     "passthrough render", progress_cb=progress_cb,
                     cancel_check=cancel_check, stall_min=stall_min,
                     out_path=out).run()
@@ -1448,55 +1556,63 @@ class ReactionVideoProcessor:
         print(f"Passthrough {total:.1f}s -> {out}")
         return result
 
-    def _card_draws(self, card: Dict[str, Any], W: int, H: int,
-                    suffix: str = "",
-                    content: Optional[Dict[str, float]] = None) -> List[str]:
-        """Placeholder card as drawbox/drawtext filters.
+    def _card_png(self, card: Dict[str, Any], W: int, H: int,
+                  content: Optional[Dict[str, float]] = None
+                  ) -> Optional[Tuple[Path, int, int]]:
+        """The placeholder card as a PNG overlay: (path, x, y).
 
-        The box covers the layout's *content* rect (default) — a card that
-        covers the whole frame also buries the camera corner, which is the
-        one thing viewers are there for.
+        drawtext needs a freetype-enabled ffmpeg *and* a system TTF, and
+        static / pip-bundled builds ship neither — which is how card spans
+        used to export as a black box with a lone accent line and no words.
+        The compositor's own card (rounded gradient, accent bar, title/sub —
+        the one the Patreon render and the browser preview draw) is rendered
+        to a PNG here and composited with `overlay`, which every ffmpeg
+        build has. Identical cards share one file.
         """
-        title = str(card.get("title", "Full uncut reaction on Patreon"))
-        sub = str(card.get("sub", "link in the description"))
-        accent = str(card.get("accent", "#e879f9")).lstrip("#") or "e879f9"
         r = content or {}
         try:
             lay = self.layout.content
             dflt = {"x": lay.x, "y": lay.y, "w": lay.w, "h": lay.h}
         except AttributeError:
             dflt = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
-        x = int(round(W * float(r.get("x", dflt["x"]))))
-        y = int(round(H * float(r.get("y", dflt["y"]))))
-        cw = int(round(W * float(r.get("w", dflt["w"]))))
-        ch = int(round(H * float(r.get("h", dflt["h"]))))
-        cw, ch = max(16, cw), max(16, ch)
-        draws = [f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=black@0.94:t=fill",
-                 f"drawbox=x={x}:y={y}:w={cw}:h={ch}:c=0x{accent}80:t=2"]
-        bar_h = max(2, int(round(4 * H / 1080)))
-        draws.append(f"drawbox=x={x + int(cw * 0.16)}:y={y + int(ch * 0.34)}:"
-                     f"w={int(cw * 0.68)}:h={bar_h}:c=0x{accent}:t=fill")
-        font = _drawtext_font(bold=True)
-        # static/minimal ffmpeg builds sometimes ship without drawtext —
-        # the card still renders (shapes only) instead of failing the job
-        if font and _ffmpeg_has_filter("drawtext") and (title.strip() or sub.strip()):
-            tf = self.work / f"card_title{suffix}.txt"
-            sf = self.work / f"card_sub{suffix}.txt"
-            tf.write_text(title, encoding="utf-8")
-            sf.write_text(sub, encoding="utf-8")
-            fs = min(58 * H / 1080, cw * 0.072)
-            fs2 = max(10, fs * 0.62)
-            yt = y + int(ch * 0.47)
-            ys = y + int(ch * 0.58)
-            draws.append(
-                f"drawtext=fontfile='{font}':textfile='{tf}':"
-                f"fontsize={fs:.0f}:fontcolor=white:"
-                f"x={x}+({cw}-text_w)/2:y={yt}-text_h/2")
-            draws.append(
-                f"drawtext=fontfile='{font}':textfile='{sf}':"
-                f"fontsize={fs2:.0f}:fontcolor=0xE2E8F0:"
-                f"x={x}+({cw}-text_w)/2:y={ys}-text_h/2")
-        return draws
+        rect = (round(float(r.get("x", dflt["x"])), 4),
+                round(float(r.get("y", dflt["y"])), 4),
+                round(float(r.get("w", dflt["w"])), 4),
+                round(float(r.get("h", dflt["h"])), 4))
+        g = card or {}
+        d = L.CardStyle()
+        title = str(g.get("title") or d.title)
+        sub = str(g.get("sub") or d.sub)
+        accent = str(g.get("accent") or d.accent)
+        key = (title, sub, accent, W, H, rect)
+        cache: Dict[Any, Tuple[Path, int, int]] = \
+            self.__dict__.setdefault("_card_png_cache", {})
+        hit = cache.get(key)
+        if hit and hit[0].is_file():
+            return hit
+        lay = L.LayoutState()
+        lay.content = L.Rect(*rect)
+        lay.card = L.CardStyle(title=title, sub=sub, accent=accent)
+        img, x0, y0 = C.card_overlay({}, lay, W, H)
+        if img.size == 0:
+            return None
+        digest = hashlib.sha1(repr(key).encode()).hexdigest()[:10]
+        path = self.work / f"card_{digest}_{W}x{H}.png"
+        C.write_png(path, img)
+        cache[key] = (path, x0, y0)
+        return cache[key]
+
+    def _vignette_png(self, amount: float, W: int, H: int) -> Optional[Path]:
+        """The browser's radial vignette gradient as a full-frame PNG."""
+        cache: Dict[Any, Path] = self.__dict__.setdefault("_vig_png_cache", {})
+        key = (round(float(amount), 2), W, H)
+        path = cache.get(key)
+        if path and path.is_file():
+            return path
+        path = self.work / f"vignette_{key[0]:g}_{W}x{H}.png"
+        C.write_png(path, C.vignette_overlay(W, H, amount))
+        cache[key] = path
+        return path
 
     # ------------------------------------------- chunked / resumable render
     def _fit_audio(self, wav: Path, dur: float, tag: str = "") -> Path:
@@ -1838,18 +1954,18 @@ class ReactionVideoProcessor:
                 report(frac, step="encoding", part=i + 1, parts=len(parts))
 
             if target == "youtube":
-                chain, warns = self._passthrough_graph(
+                chain, warns, extra = self._passthrough_graph(
                     part, W=int(self.info.get("width") or 1920),
                     H=int(self.info.get("height") or 1080),
                     audio_cloak=audio_cloak, video_cloak=video_cloak,
                     card=card, fast_speed=fast, master_gain_db=master_gain_db,
                     content_rect=rect, out_fps=(float(fps) if fps else
                                                 float(self.info.get("fps") or 0)),
-                    height=height, audio_inputs=pt_streams,
-                    card_suffix=f"p{i}")
+                    height=height, audio_inputs=pt_streams)
                 for w in warns:
                     say(f"  (cloak: {w})")
-                _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset), pn,
+                _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset,
+                                                  extra), pn,
                             f"part {i + 1}/{len(parts)}", progress_cb=cb,
                             cancel_check=cancel_check, stall_min=stall_min,
                             out_path=vp, heartbeat=beat).run()

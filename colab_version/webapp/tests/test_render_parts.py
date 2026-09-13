@@ -24,6 +24,7 @@ Needs ffmpeg on PATH plus numpy/opencv (the compositor). No pytest required.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -34,6 +35,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 HERE = Path(__file__).resolve().parent
 COLAB = HERE.parent.parent
@@ -174,6 +177,35 @@ def region_brightness(path: Path, t: float, rect: tuple, size=(960, 540)
     return float(roi.mean()) if roi.size else -1.0
 
 
+def frame_gray(path: Path, t: float, size=(1920, 1080)) -> np.ndarray:
+    """One decoded frame as luma (empty array when the seek lands nowhere)."""
+    w, h = size
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", str(t), "-i", str(path),
+         "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True).stdout
+    if len(raw) < w * h:
+        return np.zeros((0, 0), np.uint8)
+    return np.frombuffer(raw[:w * h], dtype=np.uint8).reshape(h, w)
+
+
+def bright_pixels(path: Path, t: float, rect: tuple,
+                  size=(1920, 1080), thresh: int = 200) -> int:
+    """Count of near-white pixels in a normalised rect of one frame.
+
+    The card's title/sub are the only near-white things inside the card
+    rect, so this is how the suite proves the words reached the export —
+    a shapes-only card (the old drawtext-less fallback) scores ~0 here.
+    """
+    img = frame_gray(path, t, size)
+    if img.size == 0:
+        return -1
+    h, w = img.shape
+    x, y, rw, rh = rect
+    roi = img[int(y * h):int((y + rh) * h), int(x * w):int((x + rw) * w)]
+    return int((roi > thresh).sum())
+
+
 def frame_pixel(path: Path, t: float, x: float, y: float) -> List[int]:
     """One pixel of one frame — used to prove what a card does NOT cover."""
     import numpy as np
@@ -266,23 +298,39 @@ def test_auto_part_target():
 
 def test_card_covers_content_only():
     print("card rect")
+    import cv2
     proc = V.ReactionVideoProcessor.__new__(V.ReactionVideoProcessor)
     proc.layout = L.LayoutState()
     proc.work = Path(tempfile.mkdtemp())
     W, H = 1920, 1080
-    draws = proc._card_draws({"title": "Full uncut reaction on Patreon"}, W, H)
-    box = re.search(r"drawbox=x=(\d+):y=(\d+):w=(\d+):h=(\d+)", draws[0])
-    got = [int(box.group(i)) for i in range(1, 5)]
+    got = proc._card_png({"title": "Full uncut reaction on Patreon"}, W, H)
+    check(got is not None, "the card renders to a PNG overlay")
+    path, x, y = got
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     want = [int(round(v)) for v in proc.layout.content.px(W, H)]
-    check(got == want, f"server card box {got} == content rect {want}")
-    check(got[2] < W * 0.8 and got[3] < H * 0.8,
+    check([x, y, img.shape[1], img.shape[0]] == want,
+          f"server card overlay {([x, y, img.shape[1], img.shape[0]])} == "
+          f"content rect {want}")
+    check(img.shape[1] < W * 0.8 and img.shape[0] < H * 0.8,
           "card no longer covers ~the whole frame")
+    # the point of the PNG: the words ride along, on builds with no drawtext
+    # and on images with no system font alike
+    opaque = img[..., 3] > 200
+    bright = (img[..., :3].max(axis=2) > 200) & opaque
+    check(int(bright.sum()) > 2000,
+          f"the card PNG carries {int(bright.sum())} bright text pixels")
+    rows = np.where(bright.any(axis=1))[0] if bright.any() else np.array([])
+    check(len(rows) > 20, f"text spans {len(rows)} rows (a glyph height, "
+                          "not a drawbox line)")
     # an explicit rect (YouTube passthrough) wins
-    draws2 = proc._card_draws({}, W, H, content={"x": 0.1, "y": 0.2,
-                                                 "w": 0.5, "h": 0.4})
-    box2 = re.search(r"drawbox=x=(\d+):y=(\d+):w=(\d+):h=(\d+)", draws2[0])
-    check([int(box2.group(i)) for i in range(1, 5)] == [192, 216, 960, 432],
-          "explicit content rect is honoured")
+    got2 = proc._card_png({}, W, H, content={"x": 0.1, "y": 0.2,
+                                             "w": 0.5, "h": 0.4})
+    check([got2[1], got2[2]] == [192, 216],
+          f"explicit content rect is honoured (origin {got2[1]}, {got2[2]})")
+    # same text + rect -> one shared file, not one per segment
+    again = proc._card_png({}, W, H, content={"x": 0.1, "y": 0.2,
+                                              "w": 0.5, "h": 0.4})
+    check(again[0] == got2[0], "identical cards share one PNG")
     # browser parity: the React passthrough must not hardcode a full-frame box
     ts = (HERE.parent.parent.parent / "src" / "lib" / "render.ts").read_text()
     body = ts.split("export function buildPassthroughScene")[1].split("\n}")[0]
@@ -291,6 +339,51 @@ def test_card_covers_content_only():
     check("cardRect" in body and "content" in body,
           "buildPassthroughScene takes the card rect from the layout")
     check("scene.cardText" in ts, "renderScene passes per-segment card text")
+
+
+def test_vignette_matches_preview():
+    """The export's edge darkening is the preview's radial gradient.
+
+    ffmpeg's own `vignette` filter is a different curve: the old mapping
+    handed it angles around PI/2, which blacked out everything but the
+    frame centre — the single worst regression this suite guards against.
+    """
+    print("vignette parity")
+    import cv2
+    W, H = 1920, 1080
+    png = Path(tempfile.mkdtemp()) / "vig.png"
+    C.write_png(png, C.vignette_overlay(W, H, 25))
+    img = cv2.imread(str(png), cv2.IMREAD_UNCHANGED)
+    a_edge = 0.25 * 0.55
+
+    def want(x: float, y: float) -> float:
+        d = ((x - W / 2) ** 2 + (y - H / 2) ** 2) ** 0.5
+        t = max(0.0, min(1.0, (d - min(W, H) * 0.36)
+                        / (max(W, H) * 0.72 - min(W, H) * 0.36)))
+        return t * a_edge
+    for (x, y) in ((3, 3), (480, 540), (960, 540), (1600, 900)):
+        got = img[y, x, 3] / 255.0
+        check(abs(got - want(x, y)) < 0.01,
+              f"gradient alpha at ({x},{y}) = {got:.3f} == preview "
+              f"{want(x, y):.3f}")
+    # monotonic slider, and nothing at zero
+    z = cv2.imread(C.write_png(Path(tempfile.mkdtemp()) / "z.png",
+                               C.vignette_overlay(W, H, 0)),
+                   cv2.IMREAD_UNCHANGED)
+    check(int(z[..., 3].max()) == 0, "vignette 0 draws nothing")
+    hi = cv2.imread(C.write_png(Path(tempfile.mkdtemp()) / "hi.png",
+                                C.vignette_overlay(W, H, 100)),
+                    cv2.IMREAD_UNCHANGED)
+    check(hi[3, 3, 3] > img[3, 3, 3] > z[3, 3, 3],
+          "the slider darkens monotonically (0 < 25 < 100)")
+    # the calibrated ffmpeg-filter fallback stays mild too
+    for amt, lo, hi_b in ((25, 0.05, 0.20), (100, 0.25, 0.50)):
+        a = V._vignette_angle(amt)
+        gain = math.cos(a) ** 5          # ~the filter's corner falloff
+        check(lo < 1 - gain < hi_b,
+              f"fallback vignette angle {a:.3f} keeps the corner within "
+              f"{1 - gain:.2f} of full brightness at slider={amt}")
+    check(V._vignette_angle(0.0) == 0.0, "slider 0 -> no filter angle")
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +679,68 @@ def test_youtube_stems(root: Path):
     check(cam_b > 20,
           f"passthrough card leaves the camera corner alone "
           f"(mean {cam_b:.0f})")
+    # the words, not just the box: a card whose text never rendered is the
+    # bug this whole check exists for (drawtext-less ffmpeg builds)
+    # the card rect is near-black except for the words (the accent bar and
+    # ring are mid-luma magenta), so bright pixels inside it ARE the text —
+    # a shapes-only card, the old drawtext-less fallback, scores ~0 here
+    words = bright_pixels(fin, 10.5, (0.32, 0.40, 0.64, 0.25))
+    check(words > 2000,
+          f"the exported card carries its title/sub ({words} bright px)")
+
+
+def test_youtube_default_cloak(root: Path):
+    """The cloak the browser posts by default must look like the preview.
+
+    Regression guard for the inverted `vignette` mapping: at the old
+    angles the export kept only a bright island in the frame centre.
+    """
+    print("youtube default cloak == preview")
+    src = root / "master.mp4"
+    out = root / "out_yt_cloak"
+    proc = V.ReactionVideoProcessor(str(src), work_dir=str(root / "work_cloak"),
+                                    output_dir=str(out))
+    segs = [{"type": "body", "start": 0, "end": 4},
+            {"type": "card", "start": 4, "end": 7},
+            {"type": "body", "start": 7, "end": 10}]
+    rect = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
+    lay = L.LayoutState()
+    card = {"title": lay.card.title, "sub": lay.card.sub,
+            "accent": lay.card.accent}
+    plain = proc.render_passthrough(segs, audio_cloak={"on": False},
+                                    video_cloak={"on": False}, card=card,
+                                    fast_speed=4.0, crf=30,
+                                    preset="ultrafast", name="cloak_off",
+                                    content_rect=rect)
+    cloaked = proc.render_passthrough(
+        segs, audio_cloak=L.default_audio_cloak(),
+        video_cloak=L.default_video_cloak(), card=card, fast_speed=4.0,
+        crf=30, preset="ultrafast", name="cloak_on", content_rect=rect)
+    a = frame_gray(Path(plain["mp4"]), 2.0)
+    b = frame_gray(Path(cloaked["mp4"]), 2.0)
+    check(a.size and b.size, "both renders decoded")
+    # the default vignette (25) darkens the corner by ~10%, the whole frame
+    # by a hair — the old mapping cut the mean to a third of this
+    check(b.mean() > 0.85 * a.mean(),
+          f"default cloak keeps the frame bright (mean {b.mean():.0f} vs "
+          f"uncloaked {a.mean():.0f})")
+    # sample inside the 3% cover bars (which body frames DO carry, like the
+    # preview) and away from testsrc2's timestamp box
+    corner_off, corner_on = a[64:128, 8:72].mean(), b[64:128, 8:72].mean()
+    check(corner_on > 0.75 * corner_off,
+          f"corners dim, not black ({corner_on:.0f} vs {corner_off:.0f})")
+    # and a card span skips the vignette + bars, like the preview
+    c_on = frame_gray(Path(cloaked["mp4"]), 5.0)
+    top_bar = c_on[0:8, :].mean()
+    check(top_bar > 40,
+          f"no cover bars over a card span (top rows mean {top_bar:.0f})")
+    check(c_on[64:128, 8:72].mean() > 0.9 * corner_off,
+          f"no vignette over a card span "
+          f"({c_on[64:128, 8:72].mean():.0f} vs {corner_off:.0f})")
+    words = bright_pixels(Path(cloaked["mp4"]), 5.0,
+                          (0.32, 0.40, 0.64, 0.25))
+    check(words > 2000, f"cloaked export still shows the card text "
+                        f"({words} bright px)")
 
 
 def test_http_api(root: Path):
@@ -758,6 +913,7 @@ def main() -> int:
     test_plan_parts()
     test_auto_part_target()
     test_card_covers_content_only()
+    test_vignette_matches_preview()
     if fast_only:
         print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed "
               f"({time.time() - t0:.0f}s)")
@@ -770,14 +926,16 @@ def main() -> int:
     # fixtures are reused between runs; render outputs are not (a resume test
     # against last run's finished output would prove nothing)
     for d in ("out", "out_resume", "out_yt", "out_yt_single", "out_short",
-              "out_http", "out_yt_rect", "work", "work_resume", "work_yt",
-              "work_yt2", "work_short", "work_http", "work_yt_rect"):
+              "out_http", "out_yt_rect", "out_yt_cloak", "work",
+              "work_resume", "work_yt", "work_yt2", "work_short",
+              "work_http", "work_yt_rect", "work_cloak"):
         shutil.rmtree(root / d, ignore_errors=True)
     test_patreon_chunked(root)
     test_short_render_single_pass(root)
     test_truncated_part_rebuilt(root)
     test_resume_after_kill(root)
     test_youtube_stems(root)
+    test_youtube_default_cloak(root)
     test_youtube_card_follows_posted_layout(root)
     test_http_api(root)
 

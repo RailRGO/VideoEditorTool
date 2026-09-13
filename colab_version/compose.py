@@ -251,9 +251,19 @@ def _fit_text(text: str, max_w: int, font: int, start: float, thick: int):
     return scale
 
 
-def draw_card(canvas: np.ndarray, layout: LayoutState,
-              card: Optional[Dict[str, Any]] = None) -> None:
-    H, W = canvas.shape[:2]
+def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
+                 W: int, H: int) -> Tuple[np.ndarray, int, int]:
+    """The placeholder card as a standalone BGRA (RGBA) image.
+
+    Same math the compositor paints inline and the browser preview draws:
+    rounded gradient backdrop, accent bar, centred title/sub, accent ring —
+    but as its own image, so the ffmpeg passthrough (whose filter graph has
+    no cv2, and on many builds no drawtext either) can composite the exact
+    card the Patreon render shows, with `overlay`, instead of approximating
+    it with drawbox/drawtext.
+
+    Returns (bgra, x0, y0); the array is empty when the rect is degenerate.
+    """
     k = H / 1080.0
     card = card or {}   # a card span with no text of its own is normal
     # per-segment override; empty fields inherit the global card
@@ -267,53 +277,89 @@ def draw_card(canvas: np.ndarray, layout: LayoutState,
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
     if x1 - x0 < 8 or y1 - y0 < 8:
-        return
-    bw, bh = x - x0 + (x1 - x0), y - y0 + (y1 - y0)  # full box
+        return np.zeros((0, 0, 4), np.uint8), x0, y0
     fw, fh = x1 - x0, y1 - y0
     radius = min(28.0 * k, min(fw, fh) / 2.0)
     mask = shape_mask(fw, fh, "rounded", radius)
 
-    # vertical gradient backdrop
+    # Colour and alpha are built separately and only joined at the end:
+    # cv2's anti-aliased drawing rewrites the 4th channel of a BGRA image
+    # (glyph edges punch alpha holes), which would make the text vanish
+    # once the overlay is composited. Drawing into a plain BGR layer is the
+    # same math draw_card always did onto the canvas.
     top = np.array((26, 15, 11), np.float32)   # #0b0f1a
     bot = np.array((12, 6, 4), np.float32)     # #04060c
     t = np.linspace(0, 1, fh, dtype=np.float32)[:, None, None]
     grad = (top * (1 - t) + bot * t).astype(np.uint8)
-    grad = np.repeat(grad, fw, axis=1)
-    a = (mask.astype(np.float32) / 255.0)[..., None]
-    roi = canvas[y0:y1, x0:x1].astype(np.float32)
-    canvas[y0:y1, x0:x1] = (roi * (1 - a) + grad.astype(np.float32) * a).astype(np.uint8)
+    rgb = np.repeat(grad, fw, axis=1)
 
-    accent = hex_to_bgr(accent)
+    accent_bgr = hex_to_bgr(accent)
     # accent bar
-    bx, by = int(x0 + fw * 0.16), int(y0 + fh * 0.34)
-    cv2.rectangle(canvas, (bx, by),
-                  (int(x0 + fw * 0.84), int(by + max(2, 4 * k))), accent, -1)
+    bx, by = int(fw * 0.16), int(fh * 0.34)
+    cv2.rectangle(rgb, (bx, by), (int(fw * 0.84), int(by + max(2, 4 * k))),
+                  accent_bgr, -1)
     # title + sub, centered
     font = cv2.FONT_HERSHEY_DUPLEX
     size = max(0.4, min(2.2 * k, (fw * 0.072) / 20.0))
     size = _fit_text(title, int(fw * 0.88), font, size, 2)
     (tw, th), _ = cv2.getTextSize(title, font, size, 2)
-    cv2.putText(canvas, title,
-                (int(x0 + (fw - tw) / 2), int(y0 + fh * 0.47 + th / 2)),
+    cv2.putText(rgb, title, (int((fw - tw) / 2), int(fh * 0.47 + th / 2)),
                 font, size, (241, 245, 249), 2, cv2.LINE_AA)
     s2 = _fit_text(sub, int(fw * 0.88),
                    cv2.FONT_HERSHEY_SIMPLEX, size * 0.62, 1)
     (tw2, th2), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
-    cv2.putText(canvas, sub,
-                (int(x0 + (fw - tw2) / 2), int(y0 + fh * 0.58 + th2 / 2)),
+    cv2.putText(rgb, sub, (int((fw - tw2) / 2), int(fh * 0.58 + th2 / 2)),
                 cv2.FONT_HERSHEY_SIMPLEX, s2, (200, 210, 225), 1, cv2.LINE_AA)
-    # accent ring
+    # accent ring (2*k px inset stroke at 50%, like draw_card always drew)
     outer = shape_mask(fw, fh, "rounded", radius)
     inner = np.zeros_like(outer)
     b = max(1, int(round(2 * k)))
     if fw - 2 * b > 2 and fh - 2 * b > 2:
-        ring_in = shape_mask(fw - 2 * b, fh - 2 * b, "rounded", max(0.0, radius - b))
+        ring_in = shape_mask(fw - 2 * b, fh - 2 * b, "rounded",
+                             max(0.0, radius - b))
         inner[b:b + fh - 2 * b, b:b + fw - 2 * b] = ring_in
     ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
-    roi = canvas[y0:y1, x0:x1].astype(np.float32)
-    canvas[y0:y1, x0:x1] = (
-        roi * (1 - ring[..., None]) +
-        np.array(accent, np.float32) * ring[..., None]).astype(np.uint8)
+    rgb = (rgb.astype(np.float32) * (1 - ring[..., None]) +
+           np.array(accent_bgr, np.float32) * ring[..., None]).astype(np.uint8)
+    return np.dstack([rgb, mask]), x0, y0
+
+
+def draw_card(canvas: np.ndarray, layout: LayoutState,
+              card: Optional[Dict[str, Any]] = None) -> None:
+    """Composite the placeholder card onto *canvas* at the content rect."""
+    H, W = canvas.shape[:2]
+    img, x0, y0 = card_overlay(card, layout, W, H)
+    if img.size == 0:
+        return
+    fh, fw = img.shape[:2]
+    a = (img[..., 3].astype(np.float32) / 255.0)[..., None]
+    roi = canvas[y0:y0 + fh, x0:x0 + fw].astype(np.float32)
+    canvas[y0:y0 + fh, x0:x0 + fw] = (
+        roi * (1 - a) + img[..., :3].astype(np.float32) * a).astype(np.uint8)
+
+
+def vignette_overlay(W: int, H: int, amount: float) -> np.ndarray:
+    """Edge darkening as a BGRA image — the exact stops render.ts fills:
+    a radial gradient, transparent at min(W,H)*0.36, black at
+    amount/100*0.55 alpha by max(W,H)*0.72. ffmpeg's own `vignette` filter
+    is a different curve (and at the angles this used to pass, everything
+    but the frame centre went black), so the passthrough composites this
+    instead and the export matches the preview pixel for pixel.
+    """
+    a_edge = max(0.0, min(1.0, float(amount) / 100.0)) * 0.55
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.sqrt((xx - W / 2.0) ** 2 + (yy - H / 2.0) ** 2)
+    r0, r1 = min(W, H) * 0.36, max(W, H) * 0.72
+    t = np.clip((d - r0) / max(1e-6, r1 - r0), 0.0, 1.0)
+    img = np.zeros((H, W, 4), np.uint8)
+    img[..., 3] = (t * a_edge * 255.0 + 0.5).astype(np.uint8)
+    return img
+
+
+def write_png(path, bgra: np.ndarray) -> str:
+    """Save a BGRA overlay as a PNG ffmpeg can read as an alpha input."""
+    cv2.imwrite(str(path), bgra)
+    return str(path)
 
 
 def draw_lead_block(canvas: np.ndarray, layout: LayoutState) -> None:
