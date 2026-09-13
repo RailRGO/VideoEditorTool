@@ -1,8 +1,10 @@
-import { useEffect, useRef } from "react";
-import type { CutOptions, LayoutState } from "../lib/types";
+import { useEffect, useRef, useState } from "react";
+import type { CutOptions, LayoutState, TranscriptCutOptions } from "../lib/types";
 import type { Detection, Envelope } from "../lib/analyze";
+import type { Transcript } from "../lib/polish";
 import { fmtTime } from "../lib/timeline";
 import { Btn, Note, Section, Segmented, Slider, Toggle } from "./ui";
+import { analyseTranscriptCut } from "../lib/transcriptCut";
 
 function EnvelopeChart({
   env,
@@ -88,7 +90,7 @@ function EnvelopeChart({
     let last = 0;
     const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
-      if (t - last < 33) return; // ~30 fps playhead — same budget as the timeline
+      if (t - last < 33) return;
       last = t;
       const node = head.current;
       if (!node || !env.duration) return;
@@ -135,6 +137,21 @@ export default function AutoCut({
   introOutro,
   browserOk,
   mixed = false,
+  // transcript-driven silent-gap cutter
+  transcript,
+  transcriptCutOpts,
+  setTranscriptCutOpts,
+  onTranscriptFile,
+  onTranscriptText,
+  canTranscribe,
+  trBusy,
+  trProgress,
+  trLang,
+  setTrLang,
+  onTranscribe,
+  trError,
+  onApplyTranscriptCut,
+  bodySpan,
 }: {
   hasSource: boolean;
   duration: number;
@@ -156,8 +173,21 @@ export default function AutoCut({
   getSrcTime: () => number;
   introOutro: { start: number; end: number }[];
   browserOk: boolean;
-  /** the source is a finished mixed render rather than a raw dual-channel capture */
   mixed?: boolean;
+  transcript: Transcript | null;
+  transcriptCutOpts: TranscriptCutOptions;
+  setTranscriptCutOpts: React.Dispatch<React.SetStateAction<TranscriptCutOptions>>;
+  onTranscriptFile: (f: File) => void;
+  onTranscriptText: (t: string) => void;
+  canTranscribe: boolean;
+  trBusy: boolean;
+  trProgress: number;
+  trLang: string;
+  setTrLang: (v: string) => void;
+  onTranscribe: () => void;
+  trError: string;
+  onApplyTranscriptCut: () => void;
+  bodySpan: { start: number; end: number };
 }) {
   const density =
     detection && duration > 0 ? (detection.speechSec / duration) * 100 : 0;
@@ -166,9 +196,29 @@ export default function AutoCut({
     : duration;
   const bodyDensity = detection && bodySec > 0 ? (detection.speechSec / bodySec) * 100 : 0;
 
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [paste, setPaste] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
+
+  const trReport = (() => {
+    if (!transcript?.words?.length || !duration) return null;
+    try {
+      return analyseTranscriptCut(
+        [], // we only need gaps stats, segments not needed for analysis here — but we pass empty and use bodySpan
+        transcript.words,
+        duration,
+        transcriptCutOpts,
+        bodySpan
+      );
+    } catch {
+      return null;
+    }
+  })();
+
   return (
     <div className="space-y-2.5">
-      <Section title="1 · Find your commentary">
+      {/* ---------- audio-level auto-cut (existing) ---------- */}
+      <Section title="1 · Find your commentary (audio level)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
           {mixed
             ? "The auto-cut plays your Patreon render once (silently, at high speed) and measures the mixed audio, then keeps only the stretches where you are actually talking — plus a little context on each side. Intro and outro are never touched."
@@ -372,7 +422,7 @@ export default function AutoCut({
             )}
           </Section>
 
-          <Section title="4 · Apply">
+          <Section title="4 · Apply audio cut">
             <div className="mb-2 grid grid-cols-2 gap-1.5 text-center">
               <div className="rounded-lg border border-white/10 bg-black/25 p-1.5">
                 <p className="text-[9px] uppercase tracking-wider text-slate-500">source</p>
@@ -385,24 +435,234 @@ export default function AutoCut({
             </div>
             <div className="flex gap-1.5">
               <Btn variant="primary" className="flex-1 py-1.5" onClick={onApply}>
-                Apply to timeline
+                Apply audio cut to timeline
               </Btn>
               <Btn onClick={onReset} title="Restore a plain intro / reaction / outro timeline">
                 Reset
               </Btn>
             </div>
             <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
-              Applying rewrites only the reaction part of the timeline — you can still drag every
-              segment afterwards.
+              Rewrites only the reaction part — you can still drag every segment afterwards.
             </p>
           </Section>
         </>
       )}
 
-      {!env && !scanning && hasSource && (
+      {/* ---------- transcript-driven silent-gap cutter ---------- */}
+      <Section title="5 · Silent gaps → Patreon card (transcript)">
+        <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+          Transcribe your commentary, then every stretch <em>without words</em> becomes a card that
+          points to Patreon. The content area is covered (camera corner stays), audio silenced,
+          and the rest of the silent stretch is hard-cut. Short pauses under 1 s can stay, be
+          fast-forwarded, or muted — your call. This is the strongest Content ID shield because
+          long no-dialog sections simply disappear.
+        </p>
+
+        {canTranscribe ? (
+          <div className="mb-2 rounded-lg border border-emerald-400/25 bg-emerald-500/[0.07] p-2">
+            <div className="flex items-center gap-1.5">
+              <select
+                value={trLang}
+                disabled={trBusy}
+                onChange={(e) => setTrLang(e.target.value)}
+                className="h-7 shrink-0 rounded-lg border border-white/10 bg-black/40 px-1.5 text-[11px] text-slate-200 outline-none focus:border-emerald-400/50 disabled:opacity-50"
+                title="Spoken language"
+              >
+                <option value="auto">Auto</option>
+                <option value="ru">Русский</option>
+                <option value="en">English</option>
+              </select>
+              <Btn
+                variant="primary"
+                className="flex-1"
+                disabled={trBusy || !hasSource}
+                onClick={onTranscribe}
+              >
+                {trBusy
+                  ? `Transcribing… ${Math.round(trProgress * 100)}%`
+                  : "Transcribe reaction (body)"}
+              </Btn>
+            </div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
+              Runs Whisper on the server against the reaction part only — much faster than full
+              file. Or load a .srt / .vtt / .json below.
+            </p>
+            {trError && (
+              <p className="mt-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1 text-[10px] leading-relaxed text-rose-200">
+                {trError}
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+            Load a transcript file below — Whisper SRT/VTT/JSON with word timestamps works best.
+            (Connect Colab to transcribe directly.)
+          </p>
+        )}
+
+        <div className="flex gap-1.5">
+          <Btn className="flex-1" onClick={() => fileRef.current?.click()}>
+            Load .srt / .vtt / .json
+          </Btn>
+          <Btn className="flex-1" onClick={() => setShowPaste((s) => !s)}>
+            Paste
+          </Btn>
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".srt,.vtt,.txt,.json,text/plain,application/json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onTranscriptFile(f);
+          }}
+        />
+        {showPaste && (
+          <div className="mt-2">
+            <textarea
+              value={paste}
+              onChange={(e) => setPaste(e.target.value)}
+              rows={4}
+              spellCheck={false}
+              placeholder={"00:00:01,000 --> 00:00:04,000\nso um today we're going to…"}
+              className="w-full resize-y rounded-lg border border-white/10 bg-black/40 p-2 font-mono text-[10px] text-slate-200 outline-none placeholder:text-slate-600 focus:border-violet-400/50"
+            />
+            <Btn variant="primary" className="mt-1.5 w-full" onClick={() => onTranscriptText(paste)}>
+              Use this transcript
+            </Btn>
+          </div>
+        )}
+
+        {transcript && (
+          <div className="mt-2 rounded-lg border border-white/10 bg-black/25 p-2">
+            <p className="text-[10px] text-slate-400">
+              {transcript.words.length} words ·{" "}
+              <span className={transcript.timed ? "text-emerald-300" : "text-amber-300"}>
+                {transcript.timed ? "timed" : "no timings"}
+              </span>{" "}
+              · {transcript.source}
+            </p>
+            <p className="mt-1 max-h-20 overflow-y-auto text-[11px] leading-relaxed text-slate-300">
+              {transcript.words.map((w) => w.text).join(" ").slice(0, 600)}
+              {transcript.words.length > 120 ? "…" : ""}
+            </p>
+          </div>
+        )}
+
+        {transcript?.timed && (
+          <div className="mt-3 space-y-2">
+            <Slider
+              label="Silence ≥ becomes card+cut"
+              value={transcriptCutOpts.minSilence}
+              min={0.5}
+              max={10}
+              step={0.25}
+              display={`${transcriptCutOpts.minSilence.toFixed(2)} s`}
+              onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, minSilence: v }))}
+              hint="long no-dialog stretches become a Patreon card, rest cut"
+            />
+            <Slider
+              label="Card lasts"
+              value={transcriptCutOpts.cardDuration}
+              min={1}
+              max={8}
+              step={0.5}
+              display={`${transcriptCutOpts.cardDuration.toFixed(1)} s`}
+              onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, cardDuration: v }))}
+              hint="fixed card duration inserted for each long silence"
+            />
+            <div className="grid grid-cols-2 gap-x-3">
+              <Slider
+                label="Ignore gaps <"
+                value={transcriptCutOpts.minGap}
+                min={0}
+                max={1}
+                step={0.05}
+                display={`${transcriptCutOpts.minGap.toFixed(2)} s`}
+                onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, minGap: v }))}
+              />
+              <Slider
+                label="Word padding"
+                value={transcriptCutOpts.pad}
+                min={0}
+                max={1}
+                step={0.05}
+                display={`${transcriptCutOpts.pad.toFixed(2)} s`}
+                onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, pad: v }))}
+                hint="context kept before/after each word"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-x-3">
+              <Slider
+                label="Merge words within"
+                value={transcriptCutOpts.mergeGap}
+                min={0.2}
+                max={3}
+                step={0.1}
+                display={`${transcriptCutOpts.mergeGap.toFixed(1)} s`}
+                onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, mergeGap: v }))}
+                hint="words closer than this are same speech burst"
+              />
+              <div>
+                <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
+                  Tiny silences (&lt; {transcriptCutOpts.minSilence.toFixed(1)}s)
+                </p>
+                <Segmented
+                  value={transcriptCutOpts.tinyAction}
+                  onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, tinyAction: v }))}
+                  options={[
+                    { value: "keep", label: "Keep" },
+                    { value: "fast", label: "FFWD" },
+                    { value: "mute", label: "Mute" },
+                  ]}
+                />
+              </div>
+            </div>
+
+            {trReport && (
+              <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+                <div className="grid grid-cols-3 gap-1.5 text-center">
+                  <div className="rounded border border-white/10 bg-black/30 p-1">
+                    <p className="text-[8px] uppercase tracking-wider text-slate-500">silent gaps</p>
+                    <p className="font-mono text-[11px] text-slate-200">{trReport.gaps.length}</p>
+                  </div>
+                  <div className="rounded border border-fuchsia-400/20 bg-fuchsia-500/10 p-1">
+                    <p className="text-[8px] uppercase tracking-wider text-slate-400">will be cards</p>
+                    <p className="font-mono text-[11px] text-fuchsia-200">{trReport.largeGaps.length}</p>
+                  </div>
+                  <div className="rounded border border-rose-400/20 bg-rose-500/10 p-1">
+                    <p className="text-[8px] uppercase tracking-wider text-slate-400">time saved</p>
+                    <p className="font-mono text-[11px] text-rose-200">{fmtTime(trReport.saved)}</p>
+                  </div>
+                </div>
+                <p className="mt-1.5 font-mono text-[9px] text-slate-500">
+                  {trReport.speech.length} speech bursts · {fmtTime(trReport.cardTime)} of cards ·{" "}
+                  {trReport.tinyGaps.length} tiny gaps → {transcriptCutOpts.tinyAction}
+                </p>
+              </div>
+            )}
+
+            <Btn
+              variant="primary"
+              className="w-full py-1.5"
+              onClick={onApplyTranscriptCut}
+              disabled={!transcript?.timed}
+            >
+              Apply transcript cut → card+cut
+            </Btn>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Rewrites only the reaction part: speech stays, long silences become a {transcriptCutOpts.cardDuration}s
+              Patreon card (content area only, camera stays) plus hard cut for the rest. Drag segments after if needed.
+            </p>
+          </div>
+        )}
+      </Section>
+
+      {!env && !scanning && hasSource && !transcript && (
         <Note>
-          Run the analysis first. It only reads the audio and takes about{" "}
-          {fmtTime(duration / scanSpeed)} at {scanSpeed}×.
+          Run the audio analysis or load a transcript. Audio scan takes about {fmtTime(duration / scanSpeed)} at{" "}
+          {scanSpeed}×. Transcript mode needs word timestamps.
         </Note>
       )}
       {!hasSource && (
@@ -417,8 +677,8 @@ export default function AutoCut({
         <Note tone="warn">
           <strong>{bodyDensity.toFixed(0)}% of the reaction has you talking.</strong> That’s on the
           quiet side — the cut version will lean heavily on{" "}
-          {opts.replace === "cut" ? "hard cuts" : opts.replace === "fast" ? "fast-forward" : "cards"}
-          . If you can, try narrating reactions as they happen (“oh wait—”, “no way”, “look at
+          {opts.replace === "cut" ? "hard cuts" : opts.replace === "fast" ? "fast-forward" : "cards"}.
+          If you can, try narrating reactions as they happen (“oh wait—”, “no way”, “look at
           this”) — even short interjections give the auto-cut something to hold on to, and they’re
           what makes a cut version worth watching.
         </Note>

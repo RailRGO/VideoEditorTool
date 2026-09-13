@@ -53,6 +53,7 @@ import {
   type FillerHit,
   type Transcript,
 } from "./lib/polish";
+import { buildTranscriptCut } from "./lib/transcriptCut";
 import {
   activeSegment,
   buildCut,
@@ -82,6 +83,7 @@ import {
   defaultLayout,
   defaultPolish,
   defaultRetouch,
+  defaultTranscriptCut,
   defaultVideoCloak,
   SEGMENT_META,
   TARGET_META,
@@ -98,6 +100,7 @@ import {
   type Segment,
   type SegmentType,
   type Target,
+  type TranscriptCutOptions,
   type VideoCloak,
 } from "./lib/types";
 import { cn } from "./utils/cn";
@@ -191,6 +194,7 @@ export default function App() {
   const [layout, setLayout] = useState<LayoutState>(defaultLayout);
   const [audio, setAudio] = useState<AudioState>(defaultAudio);
   const [cutOpts, setCutOpts] = useState<CutOptions>(defaultCut);
+  const [transcriptCutOpts, setTranscriptCutOpts] = useState<TranscriptCutOptions>(defaultTranscriptCut);
   const [playing, setPlaying] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedClaim, setSelectedClaim] = useState<string | null>(null);
@@ -321,6 +325,7 @@ export default function App() {
     audioCloak: AudioCloak;
     videoCloak: VideoCloak;
     cutOpts: CutOptions;
+    transcriptCutOpts: TranscriptCutOptions;
     polish: PolishRules;
     disruptRules: DisruptRules;
     leadCfg: LeadConfig;
@@ -339,6 +344,7 @@ export default function App() {
     a.audioCloak === b.audioCloak &&
     a.videoCloak === b.videoCloak &&
     a.cutOpts === b.cutOpts &&
+    a.transcriptCutOpts === b.transcriptCutOpts &&
     a.polish === b.polish &&
     a.disruptRules === b.disruptRules &&
     a.leadCfg === b.leadCfg &&
@@ -347,11 +353,11 @@ export default function App() {
 
   const editStateRef = useRef<EditState>({
     segments, layout, audio, retouch, audioCloak, videoCloak,
-    cutOpts, polish, disruptRules, leadCfg, res, fps,
+    cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
   });
   editStateRef.current = {
     segments, layout, audio, retouch, audioCloak, videoCloak,
-    cutOpts, polish, disruptRules, leadCfg, res, fps,
+    cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
   };
 
   const pastRef = useRef<EditState[]>([]);
@@ -405,6 +411,7 @@ export default function App() {
         case "audioCloak": setAudioCloak(next as AudioCloak); break;
         case "videoCloak": setVideoCloak(next as VideoCloak); break;
         case "cutOpts": setCutOpts(next as CutOptions); break;
+        case "transcriptCutOpts": setTranscriptCutOpts(next as TranscriptCutOptions); break;
         case "polish": setPolish(next as PolishRules); break;
         case "disruptRules": setDisruptRules(next as DisruptRules); break;
         case "leadCfg": setLeadCfg(next as LeadConfig); break;
@@ -447,6 +454,7 @@ export default function App() {
     [makeSetter]
   );
   const setCutOptsH = useMemo(() => makeSetter("cutOpts", "cutOpts"), [makeSetter]);
+  const setTranscriptCutOptsH = useMemo(() => makeSetter("transcriptCutOpts", "transcriptCut"), [makeSetter]);
   const setPolishH = useMemo(() => makeSetter("polish", "polish"), [makeSetter]);
   const setDisruptH = useMemo(
     () => makeSetter("disruptRules", "disruptRules"),
@@ -494,6 +502,7 @@ export default function App() {
     setAudioCloak(st.audioCloak);
     setVideoCloak(st.videoCloak);
     setCutOpts(st.cutOpts);
+    setTranscriptCutOpts(st.transcriptCutOpts);
     setPolish(st.polish);
     setDisruptRules(st.disruptRules);
     setLeadCfg(st.leadCfg);
@@ -1538,14 +1547,11 @@ export default function App() {
     [loadTranscript]
   );
 
-  const runTranscript = useCallback(async () => {
+  const runTranscriptSpans = useCallback(async (spans: { start: number; end: number }[], errMsg: string) => {
     const client = remoteRef.current;
     if (!client || trBusy) return;
-    const spans = segsRef.current
-      .filter((s) => s.type === "intro" || s.type === "outro")
-      .map((s) => ({ start: s.start, end: s.end }));
     if (!spans.length) {
-      setTrError("No intro/outro segments on the timeline — nothing to transcribe.");
+      setTrError(errMsg);
       return;
     }
     const token = ++trToken.current;
@@ -1569,7 +1575,7 @@ export default function App() {
               source: `whisper (${j.result.lang})`,
             });
           } else {
-            setTrError("No speech detected in the intro/outro — check the mic channel.");
+            setTrError("No speech detected — check the mic channel.");
           }
           break;
         }
@@ -1593,6 +1599,22 @@ export default function App() {
       }
     }
   }, [trBusy, trLang]);
+
+  const runTranscript = useCallback(async () => {
+    const spans = segsRef.current
+      .filter((s) => s.type === "intro" || s.type === "outro")
+      .map((s) => ({ start: s.start, end: s.end }));
+    await runTranscriptSpans(spans, "No intro/outro segments on the timeline — nothing to transcribe.");
+  }, [runTranscriptSpans]);
+
+  const runTranscriptBody = useCallback(async () => {
+    // For YouTube: transcribe the reaction body (where silent gaps matter)
+    const spans = segsRef.current
+      .filter((s) => s.type === "body" || s.type === "lead")
+      .map((s) => ({ start: s.start, end: s.end }));
+    const fallback = spans.length ? spans : [{ start: 0, end: durRef.current }];
+    await runTranscriptSpans(fallback, "No reaction segments on the timeline — nothing to transcribe.");
+  }, [runTranscriptSpans]);
 
   const doBuildSkeleton = useCallback(() => {
     if (reactionStart === null || !duration) return;
@@ -1627,6 +1649,21 @@ export default function App() {
     withTxn(buildCut(segsRef.current, detection.regions, cutRef.current, durRef.current));
     setSelectedId(null);
   }, [detection, withTxn]);
+
+  const applyTranscriptCut = useCallback(() => {
+    if (!transcript?.timed || !transcript.words.length || !durRef.current) return;
+    // Use bodySpan if we have a meaningful reaction part, else whole file
+    const span = bodySpan.end - bodySpan.start > 1 ? bodySpan : { start: 0, end: durRef.current };
+    const next = buildTranscriptCut(
+      segsRef.current,
+      transcript.words,
+      durRef.current,
+      transcriptCutOpts,
+      span
+    );
+    withTxn(next);
+    setSelectedId(null);
+  }, [transcript, bodySpan, transcriptCutOpts, withTxn]);
 
   const resetTimeline = useCallback(() => {
     const d = durRef.current;
@@ -1726,7 +1763,7 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 1,
+    version: 2,
     savedAt: new Date().toISOString(),
     sourceFile: fileName,
     sourceDuration: duration,
@@ -1739,6 +1776,7 @@ export default function App() {
     audioCloak,
     videoCloak,
     cutOpts,
+    transcriptCutOpts,
     polish,
     disruptRules,
     leadCfg,
@@ -1774,6 +1812,7 @@ export default function App() {
     if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
     if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
     if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
+    if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
     if (p.polish) setPolish(p.polish as PolishRules);
     if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
     if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
@@ -1795,7 +1834,7 @@ export default function App() {
     setProjectMsg(`Saved ${segments.length} segments + all settings.`);
   }, [
     fileName, duration, target, segments, claims, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const loadProjectFile = useCallback(
@@ -1841,7 +1880,7 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [
     duration, segments, claims, fileName, target, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const doRestore = () => {
@@ -2275,6 +2314,20 @@ export default function App() {
                 introOutro={introOutro}
                 browserOk={browserOk}
                 mixed
+                transcript={transcript}
+                transcriptCutOpts={transcriptCutOpts}
+                setTranscriptCutOpts={setTranscriptCutOptsH}
+                onTranscriptFile={onTranscriptFile}
+                onTranscriptText={loadTranscript}
+                canTranscribe={isRemote && !!remote}
+                trBusy={trBusy}
+                trProgress={trProgress}
+                trLang={trLang}
+                setTrLang={setTrLang}
+                onTranscribe={() => void runTranscriptBody()}
+                trError={trError}
+                onApplyTranscriptCut={applyTranscriptCut}
+                bodySpan={bodySpan}
               />
             )}
             {leftTab === "claims" && (

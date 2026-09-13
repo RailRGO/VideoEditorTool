@@ -2328,6 +2328,134 @@ class ReactionVideoProcessor:
             drops.append((last, total))
         return drops
 
+    # ------------------------------------------------- transcript → card+cut
+    @staticmethod
+    def speech_regions_from_words(words, pad=0.25, merge_gap=0.8):
+        """Word list -> merged speech regions (pad + merge)."""
+        if not words:
+            return []
+        ws = sorted(words, key=lambda w: float(w.get("start", 0)))
+        expanded = []
+        for w in ws:
+            try:
+                a = max(0.0, float(w["start"]) - pad)
+                b = float(w["end"]) + pad
+            except Exception:
+                continue
+            if b - a > 0.02:
+                expanded.append([a, b])
+        if not expanded:
+            return []
+        expanded.sort(key=lambda x: x[0])
+        merged = [expanded[0][:]]
+        for a, b in expanded[1:]:
+            if a - merged[-1][1] <= merge_gap:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        return [(float(a), float(b)) for a, b in merged if b - a > 0.05]
+
+    @staticmethod
+    def build_transcript_cut(segments, words, duration, opts=None, body_span=None):
+        """YouTube-style: speech stays, long silences -> card (fixed) + cut.
+
+        Mirrors src/lib/transcriptCut.ts so browser and server produce the
+        same timeline. Only body/lead/mute/fast/card spans are rewritten;
+        intro/outro stay whole. body_span optionally limits the rewrite.
+        opts: {minSilence, cardDuration, minGap, tinyAction, pad, mergeGap}
+        """
+        import copy
+        if not words or duration <= 0:
+            return segments
+        o = opts or {}
+        min_silence = float(o.get("minSilence", o.get("min_silence", 1.0)))
+        card_dur = float(o.get("cardDuration", o.get("card_duration", 3.0)))
+        min_gap = float(o.get("minGap", o.get("min_gap", 0.25)))
+        tiny_action = str(o.get("tinyAction", o.get("tiny_action", "keep")))
+        pad = float(o.get("pad", 0.25))
+        merge_gap = float(o.get("mergeGap", o.get("merge_gap", 0.8)))
+
+        speech = ReactionVideoProcessor.speech_regions_from_words(words, pad, merge_gap)
+        rewrite_types = {"body", "lead", "mute", "fast", "card"}
+        # determine rewrite window
+        body_segs = [s for s in (segments or []) if s.get("type") in rewrite_types]
+        if body_span:
+            span_start = float(body_span.get("start", 0))
+            span_end = float(body_span.get("end", duration))
+        else:
+            span_start = float(body_segs[0]["start"]) if body_segs else 0.0
+            span_end = float(body_segs[-1]["end"]) if body_segs else float(duration)
+
+        # clip speech to window
+        clipped = []
+        for a, b in speech:
+            a = max(a, span_start)
+            b = min(b, span_end)
+            if b - a > 0.02:
+                clipped.append((a, b))
+        clipped.sort(key=lambda x: x[0])
+
+        def emit_gap(gs, ge):
+            dur = ge - gs
+            if dur < 1e-6:
+                return []
+            if dur < min_gap:
+                return [{"type": "body", "start": gs, "end": ge}]
+            if dur < min_silence:
+                if tiny_action == "keep":
+                    return [{"type": "body", "start": gs, "end": ge}]
+                if tiny_action == "fast":
+                    return [{"type": "fast", "start": gs, "end": ge}]
+                return [{"type": "mute", "start": gs, "end": ge}]
+            if dur <= card_dur:
+                return [{"type": "card", "start": gs, "end": ge}]
+            return [
+                {"type": "card", "start": gs, "end": gs + card_dur},
+                {"type": "cut", "start": gs + card_dur, "end": ge},
+            ]
+
+        out = []
+        # tidy-ish: sort and assume no overlaps in input
+        segs = sorted(segments or [], key=lambda s: float(s.get("start", 0)))
+        for s in segs:
+            typ = str(s.get("type", "body"))
+            if typ not in rewrite_types:
+                out.append(dict(s))
+                continue
+            ss = float(s["start"])
+            se = float(s["end"])
+            if se <= span_start or ss >= span_end:
+                out.append(dict(s))
+                continue
+            seg_start = max(ss, span_start)
+            seg_end = min(se, span_end)
+            if seg_end - seg_start <= 0.02:
+                continue
+            overlapping = [(a, b) for a, b in clipped if b > seg_start + 0.01 and a < seg_end - 0.01]
+            if not overlapping:
+                out.extend(emit_gap(seg_start, seg_end))
+                continue
+            cursor = seg_start
+            for a, b in overlapping:
+                a = max(a, seg_start)
+                b = min(b, seg_end)
+                if a - cursor > 0.02:
+                    out.extend(emit_gap(cursor, a))
+                out.append({"type": "body", "start": max(cursor, a), "end": b})
+                cursor = b
+            if seg_end - cursor > 0.02:
+                out.extend(emit_gap(cursor, seg_end))
+        # final tidy: merge neighbours of same type
+        out.sort(key=lambda s: s["start"])
+        tidy = []
+        for s in out:
+            if tidy and tidy[-1]["type"] == s["type"] and abs(tidy[-1]["end"] - s["start"]) < 0.02:
+                tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
+            else:
+                tidy.append(dict(s))
+        return [s for s in tidy if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
+
+
     def detect_content_start(self, threshold_db=-35.0, min_len=1.0,
                              window=(0, 300)) -> Optional[float]:
         """First sustained content-bus energy — i.e. where the reaction starts."""

@@ -451,6 +451,30 @@ export const defaultCut: CutOptions = {
   replace: "card",
 };
 
+export interface TranscriptCutOptions {
+  /** gaps >= this become a Patreon card (rest cut) */
+  minSilence: number;
+  /** how long the inserted card lasts when a gap is long */
+  cardDuration: number;
+  /** gaps shorter than this are ignored — kept as speech continuity */
+  minGap: number;
+  /** what to do with small silences (minGap <= gap < minSilence) */
+  tinyAction: "keep" | "fast" | "mute";
+  /** breathing room kept before/after each word */
+  pad: number;
+  /** max gap between words to still count as continuous speech */
+  mergeGap: number;
+}
+
+export const defaultTranscriptCut: TranscriptCutOptions = {
+  minSilence: 1.0,
+  cardDuration: 3.0,
+  minGap: 0.25,
+  tinyAction: "keep",
+  pad: 0.25,
+  mergeGap: 0.8,
+};
+
 export type LayoutPreset = {
   id: string;
   name: string;
