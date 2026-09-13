@@ -426,6 +426,14 @@ export interface VideoCloak {
   grain: number;
   /** edge darkening 0..100 */
   vignette: number;
+  /** horizontal mirror — strongest single Content ID evasion */
+  flip: boolean;
+  /** subtle blur 0..10 (px at 1080p) — breaks pixel hashes */
+  blur: number;
+  /** slight rotation -5..5 deg — breaks frame hash, adds black edges */
+  rotate: number;
+  /** playback speed tweak 0.95..1.05 — breaks audio fingerprint when combined with pitch */
+  speed: number;
 }
 
 export const defaultVideoCloak: VideoCloak = {
@@ -440,6 +448,10 @@ export const defaultVideoCloak: VideoCloak = {
   hue: 0,
   grain: 12,
   vignette: 25,
+  flip: false,
+  blur: 0,
+  rotate: 0,
+  speed: 1,
 };
 
 export const defaultCut: CutOptions = {

@@ -614,16 +614,43 @@ def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
 # full render (same compositor => preview == output)
 # ---------------------------------------------------------------------------
 
+def _has_nvenc() -> bool:
+    if not has_ffmpeg():
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, check=False)
+        txt = (out.stdout or "") + (out.stderr or "")
+        return "h264_nvenc" in txt
+    except Exception:
+        return False
+
+
 def _open_writer(path: str, W: int, H: int, fps: float,
                  crf: int = 18, preset: str = "fast"):
-    """Prefer an ffmpeg rawvideo pipe; fall back to cv2.VideoWriter."""
+    """Prefer an ffmpeg rawvideo pipe; fall back to cv2.VideoWriter.
+
+    If a T4 GPU is present (h264_nvenc encoder exists), use it — ~5-10x
+    faster than libx264 and actually fills the GPU RAM Colab warns about.
+    """
     if has_ffmpeg():
-        cmd = ["ffmpeg", "-y", "-v", "error",
-               "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
-               "-an", "-c:v", "libx264", "-preset", preset,
-               "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
-               "-movflags", "+faststart", str(path)]
+        use_nvenc = _has_nvenc()
+        if use_nvenc:
+            # nvenc: p4 ~ medium, vbr_hq + cq = quality-controlled VBR
+            cmd = ["ffmpeg", "-y", "-v", "error",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
+                   "-an", "-c:v", "h264_nvenc", "-preset", "p4",
+                   "-rc", "vbr_hq", "-cq", str(int(crf)), "-b:v", "0",
+                   "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", str(path)]
+        else:
+            cmd = ["ffmpeg", "-y", "-v", "error",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
+                   "-an", "-c:v", "libx264", "-preset", preset,
+                   "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", str(path)]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
         return ("pipe", proc)

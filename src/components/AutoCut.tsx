@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import type { CutOptions, LayoutState, TranscriptCutOptions } from "../lib/types";
+import type { CutOptions, LayoutState, TranscriptCutOptions, VideoCloak } from "../lib/types";
 import type { Detection, Envelope } from "../lib/analyze";
 import type { Transcript } from "../lib/polish";
 import { fmtTime } from "../lib/timeline";
 import { Btn, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { analyseTranscriptCut } from "../lib/transcriptCut";
+import type { FairUseOptions } from "../lib/fairUseCut";
+import { buildFairUseLimit } from "../lib/fairUseCut";
 
 function EnvelopeChart({
   env,
@@ -44,19 +46,16 @@ function EnvelopeChart({
       const n = env.db.length;
       const y = (db: number) => H - ((Math.min(HI, Math.max(LO, db)) - LO) / (HI - LO)) * H;
 
-      // intro / outro spans
       ctx.fillStyle = "rgba(139,92,246,0.16)";
       for (const s of introOutro) {
         ctx.fillRect((s.start / env.duration) * W, 0, ((s.end - s.start) / env.duration) * W, H);
       }
 
-      // kept regions
       ctx.fillStyle = "rgba(56,189,248,0.16)";
       for (const r of detection.regions) {
         ctx.fillRect((r.start / env.duration) * W, 0, ((r.end - r.start) / env.duration) * W, H);
       }
 
-      // envelope
       ctx.fillStyle = "rgba(148,163,184,0.75)";
       const step = W / n;
       for (let i = 0; i < n; i++) {
@@ -64,7 +63,6 @@ function EnvelopeChart({
         ctx.fillRect(i * step, v, Math.max(0.6, step), H - v);
       }
 
-      // threshold
       ctx.strokeStyle = "rgba(251,191,36,0.9)";
       ctx.setLineDash([4, 3]);
       ctx.beginPath();
@@ -137,7 +135,6 @@ export default function AutoCut({
   introOutro,
   browserOk,
   mixed = false,
-  // transcript-driven silent-gap cutter
   transcript,
   transcriptCutOpts,
   setTranscriptCutOpts,
@@ -152,6 +149,11 @@ export default function AutoCut({
   trError,
   onApplyTranscriptCut,
   bodySpan,
+  fairUseOpts,
+  setFairUseOpts,
+  onApplyFairUse,
+  videoCloak,
+  setVideoCloak,
 }: {
   hasSource: boolean;
   duration: number;
@@ -188,6 +190,11 @@ export default function AutoCut({
   trError: string;
   onApplyTranscriptCut: () => void;
   bodySpan: { start: number; end: number };
+  fairUseOpts: FairUseOptions;
+  setFairUseOpts: React.Dispatch<React.SetStateAction<FairUseOptions>>;
+  onApplyFairUse: () => void;
+  videoCloak: VideoCloak;
+  setVideoCloak: React.Dispatch<React.SetStateAction<VideoCloak>>;
 }) {
   const density =
     detection && duration > 0 ? (detection.speechSec / duration) * 100 : 0;
@@ -204,7 +211,7 @@ export default function AutoCut({
     if (!transcript?.words?.length || !duration) return null;
     try {
       return analyseTranscriptCut(
-        [], // we only need gaps stats, segments not needed for analysis here — but we pass empty and use bodySpan
+        [],
         transcript.words,
         duration,
         transcriptCutOpts,
@@ -215,9 +222,31 @@ export default function AutoCut({
     }
   })();
 
+  const fairUsePreview = (() => {
+    if (!duration || bodySpan.end - bodySpan.start < 1) return null;
+    try {
+      const speech = transcript?.timed ? transcript.words : detection?.regions ?? null;
+      const { report } = buildFairUseLimit(
+        [],
+        duration,
+        fairUseOpts,
+        speech as any,
+        bodySpan,
+        detection?.regions ?? null
+      );
+      // When passing empty segments, report uses bodySpan as original
+      // So compute original from bodySpan
+      const orig = bodySpan.end - bodySpan.start;
+      return { ...report, originalBody: orig, limitedBody: Math.min(orig, fairUseOpts.maxBodySec), saved: Math.max(0, orig - fairUseOpts.maxBodySec) };
+    } catch {
+      return null;
+    }
+  })();
+
+  const bodyCurrent = bodySpan.end - bodySpan.start;
+
   return (
     <div className="space-y-2.5">
-      {/* ---------- audio-level auto-cut (existing) ---------- */}
       <Section title="1 · Find your commentary (audio level)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
           {mixed
@@ -448,7 +477,6 @@ export default function AutoCut({
         </>
       )}
 
-      {/* ---------- transcript-driven silent-gap cutter ---------- */}
       <Section title="5 · Silent gaps → Patreon card (transcript)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
           Transcribe your commentary, then every stretch <em>without words</em> becomes a card that
@@ -657,6 +685,117 @@ export default function AutoCut({
             </p>
           </div>
         )}
+      </Section>
+
+      <Section title="6 · Fair-use limiter (10 min rule)">
+        <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+          YouTube fair-use: keep reaction body ≤10 min. Intro/outro are never touched. When you have
+          little commentary, this keeps only the most speech-dense parts (from transcript or audio scan)
+          and cuts the rest. Use after the transcript cut for best result.
+        </p>
+        <div className="space-y-2">
+          <Slider
+            label="Max reaction time"
+            value={fairUseOpts.maxBodySec}
+            min={60}
+            max={900}
+            step={30}
+            display={fmtTime(fairUseOpts.maxBodySec)}
+            onChange={(v) => setFairUseOpts((o) => ({ ...o, maxBodySec: v }))}
+            hint="target duration for reaction part only"
+          />
+          <div className="grid grid-cols-2 gap-x-3">
+            <div>
+              <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">Removed parts</p>
+              <Segmented
+                value={fairUseOpts.removedAction}
+                onChange={(v) => setFairUseOpts((o) => ({ ...o, removedAction: v as any }))}
+                options={[
+                  { value: "cut", label: "Cut" },
+                  { value: "card", label: "Card" },
+                ]}
+              />
+            </div>
+            <Slider
+              label="Keep context"
+              value={fairUseOpts.keepPad}
+              min={0}
+              max={3}
+              step={0.25}
+              display={`${fairUseOpts.keepPad.toFixed(2)} s`}
+              onChange={(v) => setFairUseOpts((o) => ({ ...o, keepPad: v }))}
+              hint="extra context around kept speech"
+            />
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+            <div className="grid grid-cols-3 gap-1.5 text-center">
+              <div className="rounded border border-white/10 bg-black/30 p-1">
+                <p className="text-[8px] uppercase tracking-wider text-slate-500">reaction now</p>
+                <p className="font-mono text-[11px] text-slate-200">{fmtTime(bodyCurrent)}</p>
+              </div>
+              <div className="rounded border border-emerald-400/20 bg-emerald-500/10 p-1">
+                <p className="text-[8px] uppercase tracking-wider text-slate-400">target</p>
+                <p className="font-mono text-[11px] text-emerald-200">{fmtTime(fairUseOpts.maxBodySec)}</p>
+              </div>
+              <div className="rounded border border-amber-400/20 bg-amber-500/10 p-1">
+                <p className="text-[8px] uppercase tracking-wider text-slate-400">will save</p>
+                <p className="font-mono text-[11px] text-amber-200">{fmtTime(Math.max(0, bodyCurrent - fairUseOpts.maxBodySec))}</p>
+              </div>
+            </div>
+            {fairUsePreview && (
+              <p className="mt-1.5 font-mono text-[9px] text-slate-500">
+                {fairUsePreview.totalBuckets} sec buckets · keeping most speech-dense {fairUsePreview.keptBuckets} · transcript {transcript?.timed ? "yes" : detection ? "audio scan" : "none (chronological)"}
+              </p>
+            )}
+          </div>
+          <Btn
+            variant="primary"
+            className="w-full py-1.5"
+            onClick={onApplyFairUse}
+            disabled={!hasSource || bodyCurrent <= fairUseOpts.maxBodySec + 0.5}
+          >
+            {bodyCurrent > fairUseOpts.maxBodySec + 0.5
+              ? `Limit reaction to ${fmtTime(fairUseOpts.maxBodySec)} (keep speech-rich)`
+              : "Reaction already within limit"}
+          </Btn>
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Only rewrites body — intro/outro preserved. Keeps highest-scoring seconds (speech overlap), preserves order, merges neighbours. If no transcript/scan, keeps first {fmtTime(fairUseOpts.maxBodySec)}.
+          </p>
+        </div>
+      </Section>
+
+      <Section title="7 · Video disguise (anti-Content ID)">
+        <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+          Alter the picture itself so Content ID can’t match frames. Mirror is strongest single trick. Combine with zoom, hue, blur, rotate and audio pitch. Preview shows effect, final render uses same in ffmpeg (hflip, gblur, rotate). GPU (nvenc) will be used if available.
+        </p>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setVideoCloak((c) => ({ ...c, flip: !c.flip }))}
+              className={
+                videoCloak.flip
+                  ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
+                  : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"
+              }
+            >
+              {videoCloak.flip ? "Mirror ON (hflip)" : "Mirror off"}
+            </button>
+            <span className="text-[10px] text-slate-500">Flips whole frame horizontally</span>
+          </div>
+          <div className="grid grid-cols-2 gap-x-3">
+            <Slider label="Zoom" value={videoCloak.zoom} min={1} max={1.12} step={0.005} display={`${Math.round((videoCloak.zoom - 1) * 1000) / 10}%`} onChange={(v) => setVideoCloak((c) => ({ ...c, zoom: v }))} />
+            <Slider label="Blur" value={videoCloak.blur} min={0} max={3} step={0.1} display={videoCloak.blur ? `${videoCloak.blur.toFixed(1)}px` : "off"} onChange={(v) => setVideoCloak((c) => ({ ...c, blur: v }))} />
+          </div>
+          <div className="grid grid-cols-2 gap-x-3">
+            <Slider label="Rotate" value={videoCloak.rotate} min={-5} max={5} step={0.25} display={`${videoCloak.rotate > 0 ? "+" : ""}${videoCloak.rotate.toFixed(2)}°`} onChange={(v) => setVideoCloak((c) => ({ ...c, rotate: v }))} />
+            <Slider label="Hue" value={videoCloak.hue} min={-30} max={30} step={1} display={`${videoCloak.hue > 0 ? "+" : ""}${videoCloak.hue}°`} onChange={(v) => setVideoCloak((c) => ({ ...c, hue: v }))} />
+          </div>
+          <div className="grid grid-cols-2 gap-x-3">
+            <Slider label="Saturation" value={videoCloak.saturate} min={50} max={150} step={1} display={`${videoCloak.saturate}%`} onChange={(v) => setVideoCloak((c) => ({ ...c, saturate: v }))} />
+            <Slider label="Speed tweak" value={videoCloak.speed} min={0.95} max={1.05} step={0.01} display={`${videoCloak.speed.toFixed(2)}×`} onChange={(v) => setVideoCloak((c) => ({ ...c, speed: v }))} hint="re-times video+audio together" />
+          </div>
+        </div>
       </Section>
 
       {!env && !scanning && hasSource && !transcript && (

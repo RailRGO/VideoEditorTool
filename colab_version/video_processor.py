@@ -240,8 +240,17 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
     hue = float(c.get("hue", 0.0))
     grain = float(c.get("grain", 0.0))
+    flip = bool(c.get("flip", False))
+    blur = float(c.get("blur", 0.0))
+    rotate = float(c.get("rotate", 0.0))
 
     pre: List[str] = []
+    if flip:
+        pre.append("hflip")
+    if abs(rotate) > 0.05:
+        # rotate adds black edges, keep same size, fill black
+        # ffmpeg rotate angle in radians
+        pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
     if zoom > 1.001:
         pre.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
         pre.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
@@ -252,6 +261,9 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
                    f"brightness={brightness:.3f}")
     if abs(hue) > 0.5:
         pre.append(f"hue=h={hue:.1f}")
+    if blur > 0.05:
+        # subtle blur breaks pixel hash, keep it small
+        pre.append(f"gblur=sigma={min(3.0, blur):.2f}")
     if grain > 0.5:
         pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
 
@@ -758,12 +770,65 @@ def _pick_stt_backend() -> str:
 def _fw_model(name: str):
     if name not in _FW_MODELS:
         from faster_whisper import WhisperModel
-        try:
-            _FW_MODELS[name] = WhisperModel(name, device="auto")
-        except Exception:
-            _FW_MODELS[name] = WhisperModel(name, device="cpu",
-                                            compute_type="int8")
+        # Try GPU first (float16 is ~3-4x faster on T4, uses GPU RAM)
+        # Colab warning "GPU runtime but not utilizing GPU" comes from
+        # ffmpeg running CPU-only + whisper falling back to CPU.
+        # We explicitly try cuda, then auto, then cpu.
+        last_exc = None
+        for kwargs in (
+            {"device": "cuda", "compute_type": "float16"},
+            {"device": "cuda", "compute_type": "int8_float16"},
+            {"device": "auto"},
+        ):
+            try:
+                _FW_MODELS[name] = WhisperModel(name, **kwargs)
+                dev = getattr(_FW_MODELS[name], "model", None)
+                print(f"  whisper {name} loaded on {kwargs.get('device')} ({kwargs.get('compute_type','default')})")
+                break
+            except Exception as e:
+                last_exc = e
+                continue
+        else:
+            try:
+                _FW_MODELS[name] = WhisperModel(name, device="cpu", compute_type="int8")
+                print(f"  whisper {name} loaded on cpu (int8) — GPU not available: {last_exc}")
+            except Exception as e:
+                raise RuntimeError(f"Could not load whisper model {name}: {e}") from e
     return _FW_MODELS[name]
+
+
+def _has_encoder(name: str) -> bool:
+    """True if ffmpeg lists *name* as an encoder (cached)."""
+    key = f"enc:{name}"
+    if key in _filter_cache:
+        return _filter_cache[key]
+    try:
+        out = _run(["ffmpeg", "-hide_banner", "-encoders"], check=False)
+        ok = f" {name} " in out or f"\n {name}" in out or f" {name}\n" in out
+        # also substring fallback
+        if not ok:
+            ok = name in out
+    except Exception:
+        ok = False
+    _filter_cache[key] = ok
+    return ok
+
+
+def _pick_video_encoder(prefer_gpu: bool = True) -> Tuple[str, List[str]]:
+    """Choose best available h264 encoder: nvenc if GPU, else libx264.
+
+    Returns (encoder_name, extra_global_args). Using nvenc gives ~5-10x
+    speedup on T4 and actually uses the GPU RAM Colab warns about.
+    """
+    if prefer_gpu and _has_encoder("h264_nvenc"):
+        # nvenc preset p4 = medium quality, good speed; rc vbr_hq
+        # No crf — nvenc uses qp/cq; we map crf to qp via caller, but here
+        # we return encoder and let caller build args.
+        return "h264_nvenc", []
+    if prefer_gpu and _has_encoder("hevc_nvenc"):
+        # fallback, but we prefer h264 for compatibility
+        return "h264_nvenc", []
+    return "libx264", []
 
 
 def _stt_words(backend: str, model: str, wav: str,
@@ -1363,12 +1428,17 @@ class ReactionVideoProcessor:
                     float(video_cloak.get("vignette", 0.0)), W, H)
             else:
                 warns.append("overlay filter missing — vignette skipped")
+        # global speed tweak from video cloak (breaks fingerprint)
+        global_speed = float((video_cloak or {}).get("speed", 1.0) or 1.0)
+        global_speed = max(0.5, min(2.0, global_speed))
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
-            if typ == "fast":
+            # effective speed = fast_speed * global_speed for fast, else global_speed
+            eff_speed = float(fast_speed) * global_speed if typ == "fast" else global_speed
+            if abs(eff_speed - 1.0) > 0.001:
                 vf = f"trim=start={a:.3f}:end={b:.3f}," \
-                     f"setpts=(PTS-STARTPTS)/{float(fast_speed):.4f}"
+                     f"setpts=(PTS-STARTPTS)/{eff_speed:.6f}"
             else:
                 vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
             if pre:
@@ -1424,6 +1494,12 @@ class ReactionVideoProcessor:
             cur = nxt
 
         cats: List[str] = []
+        # global speed already extracted above, reuse
+        try:
+            gs = global_speed
+        except NameError:
+            gs = float((video_cloak or {}).get("speed", 1.0) or 1.0)
+            gs = max(0.5, min(2.0, gs))
         for j, spec in enumerate(audio_inputs):
             outs = []
             chain.append(f"[{spec}]asplit={n}"
@@ -1432,7 +1508,11 @@ class ReactionVideoProcessor:
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
                 af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                if typ == "fast":
+                # combine fast_speed and global speed
+                eff = float(fast_speed) * gs if typ == "fast" else gs
+                if abs(eff - 1.0) > 0.001:
+                    af += "," + ",".join(_atempo_chain(eff))
+                elif typ == "fast":
                     af += "," + ",".join(_atempo_chain(fast_speed))
                 # single mixed track: everything goes quiet. Stems: only the
                 # content bus (j == 0) — the mic keeps talking.
@@ -1482,9 +1562,15 @@ class ReactionVideoProcessor:
         # frames forever and the graph would never reach EOF.
         for p in (inputs or []):
             cmd += ["-i", str(p)]
+        # Pick GPU encoder if available — actually uses the T4
+        enc, _ = _pick_video_encoder(prefer_gpu=True)
+        if enc == "h264_nvenc":
+            vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
+                      "-cq", str(int(crf)), "-b:v", "0"]
+        else:
+            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf))]
         cmd += ["-filter_complex", ";".join(chain),
-                "-map", "[vout]", "-map", "[aout]",
-                "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
+                "-map", "[vout]", "-map", "[aout]"] + vcodec + [
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart", str(out)]
         return cmd
@@ -1649,11 +1735,16 @@ class ReactionVideoProcessor:
         for p_ in parts:
             cmd += ["-i", str(p_)]
         n = len(parts)
+        enc, _ = _pick_video_encoder(prefer_gpu=True)
+        if enc == "h264_nvenc":
+            vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
+                      "-cq", str(int(crf)), "-b:v", "0"]
+        else:
+            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf))]
         cmd += ["-filter_complex",
                 "".join(f"[{i}:v]" for i in range(n))
                 + f"concat=n={n}:v=1:a=0[v]",
-                "-map", "[v]", "-c:v", "libx264", "-preset", preset,
-                "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
+                "-map", "[v]"] + vcodec + ["-pix_fmt", "yuv420p",
                 "-movflags", "+faststart", str(out)]
         self._ff(cmd, what + " (re-encode)")
         return out
@@ -2454,6 +2545,175 @@ class ReactionVideoProcessor:
             else:
                 tidy.append(dict(s))
         return [s for s in tidy if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
+
+    @staticmethod
+    def build_fair_use_limit(segments, duration, opts=None, words=None, body_span=None, detection_regions=None):
+        """Limit reaction body to maxBodySec, keeping most speech-dense parts.
+
+        Mirrors src/lib/fairUseCut.ts.
+        - words: list of {start,end,text} or regions [{start,end}]
+        - detection_regions: fallback speech regions
+        - body_span: {start,end} or None
+        - opts: {maxBodySec, removedAction, cardDuration, bucketSec, keepPad}
+        """
+        import copy
+        o = opts or {}
+        max_body = float(o.get("maxBodySec", o.get("max_body_sec", 600)))
+        removed_action = str(o.get("removedAction", o.get("removed_action", "cut")))
+        card_dur = float(o.get("cardDuration", o.get("card_duration", 3.0)))
+        bucket_sec = float(o.get("bucketSec", o.get("bucket_sec", 1.0)))
+        keep_pad = float(o.get("keepPad", o.get("keep_pad", 0.5)))
+
+        rewrite_types = {"body", "lead", "mute", "fast", "card"}
+        body_segs = [s for s in (segments or []) if s.get("type") in rewrite_types]
+        if body_span:
+            span_start = float(body_span.get("start", 0))
+            span_end = float(body_span.get("end", duration))
+        else:
+            span_start = float(body_segs[0]["start"]) if body_segs else 0.0
+            span_end = float(body_segs[-1]["end"]) if body_segs else float(duration)
+        body_dur = max(0.0, span_end - span_start)
+        if body_dur <= max_body + 0.01:
+            return segments
+
+        # Normalize speech regions
+        speech = []
+        if words and len(words):
+            first = words[0]
+            if isinstance(first, dict) and "text" in first:
+                speech = ReactionVideoProcessor.speech_regions_from_words(words, 0.25, 0.8)
+            else:
+                # assume regions
+                speech = [(float(r.get("start", r[0])), float(r.get("end", r[1]))) if isinstance(r, dict) else (float(r[0]), float(r[1])) for r in words]
+                speech = [(a,b) for a,b in speech if b>a]
+        elif detection_regions:
+            speech = [(float(r.get("start", r[0])), float(r.get("end", r[1]))) if isinstance(r, dict) else (float(r[0]), float(r[1])) for r in detection_regions]
+
+        speech = sorted(speech, key=lambda x: x[0])
+
+        # Build buckets
+        buckets = []
+        t = span_start
+        while t < span_end - 0.01:
+            be = min(t + bucket_sec, span_end)
+            score = 0.0
+            for a,b in speech:
+                if b <= t: continue
+                if a >= be: break
+                overlap = min(b, be) - max(a, t)
+                if overlap>0: score+=overlap
+            buckets.append((t, be, score))
+            t = be
+
+        target_buckets = int((max_body + bucket_sec - 1e-6)//bucket_sec)
+        # If no speech, keep first max_body chronologically
+        if not speech:
+            keep_end = span_start + max_body
+            out=[]
+            for s in sorted(segments or [], key=lambda x: float(x.get("start",0))):
+                typ=str(s.get("type","body"))
+                if typ not in rewrite_types:
+                    out.append(dict(s)); continue
+                ss=float(s["start"]); se=float(s["end"])
+                if se<=span_start or ss>=span_end:
+                    out.append(dict(s)); continue
+                ss=max(ss, span_start); se=min(se, span_end)
+                if se<=keep_end:
+                    if ss<keep_end:
+                        out.append({**s, "start":ss, "end":min(se, keep_end)})
+                elif ss<keep_end:
+                    out.append({**s, "start":ss, "end":keep_end})
+                    if removed_action=="card" and se-keep_end>card_dur:
+                        out.append({"type":"card","start":keep_end,"end":keep_end+card_dur})
+                        out.append({"type":"cut","start":keep_end+card_dur,"end":se})
+                    else:
+                        out.append({"type":removed_action,"start":keep_end,"end":se})
+                else:
+                    if removed_action=="card" and se-ss>card_dur:
+                        out.append({"type":"card","start":ss,"end":ss+card_dur})
+                        out.append({"type":"cut","start":ss+card_dur,"end":se})
+                    else:
+                        out.append({"type":removed_action,"start":ss,"end":se})
+            # tidy merge same type
+            out.sort(key=lambda x: x["start"])
+            tidy=[]
+            for s in out:
+                if tidy and tidy[-1]["type"]==s["type"] and abs(tidy[-1]["end"]-s["start"])<0.02:
+                    tidy[-1]["end"]=max(tidy[-1]["end"], s["end"])
+                else:
+                    tidy.append(dict(s))
+            return [s for s in tidy if s["end"]-s["start"]>0.08]
+
+        # Score buckets
+        sorted_buckets = sorted(enumerate(buckets), key=lambda x: (-x[1][2], x[1][0]))
+        selected_idx = [i for i,_ in sorted_buckets[:target_buckets]]
+        pad_n = int((keep_pad + bucket_sec -1e-6)//bucket_sec)
+        keep_set=set()
+        for idx in selected_idx:
+            for d in range(-pad_n, pad_n+1):
+                ni=idx+d
+                if 0 <= ni < len(buckets):
+                    keep_set.add(ni)
+        keep_indices=sorted(keep_set)
+        if len(keep_indices)>target_buckets:
+            scored=[(i, buckets[i][2], buckets[i][0]) for i in keep_indices]
+            scored.sort(key=lambda x: (-x[1], x[2]))
+            keep_indices=sorted([i for i,_,_ in scored[:target_buckets]])
+        keep_mask=set(keep_indices)
+        kept_intervals=[]
+        cur=None
+        for i,(bs,be,sc) in enumerate(buckets):
+            if i not in keep_mask:
+                if cur:
+                    kept_intervals.append(cur); cur=None
+                continue
+            if not cur:
+                cur=[bs,be]
+            elif abs(cur[1]-bs)<0.02:
+                cur[1]=be
+            else:
+                kept_intervals.append(cur); cur=[bs,be]
+        if cur:
+            kept_intervals.append(cur)
+        kept_intervals=[(float(a),float(b)) for a,b in kept_intervals]
+
+        out=[]
+        for s in sorted(segments or [], key=lambda x: float(x.get("start",0))):
+            typ=str(s.get("type","body"))
+            if typ not in rewrite_types:
+                out.append(dict(s)); continue
+            ss=float(s["start"]); se=float(s["end"])
+            if se<=span_start or ss>=span_end:
+                out.append(dict(s)); continue
+            ss=max(ss, span_start); se=min(se, span_end)
+            cursor=ss
+            for ks,ke in kept_intervals:
+                if ke<=cursor+0.01: continue
+                if ks>=se-0.01: break
+                kss=max(ks, ss); kee=min(ke, se)
+                if kss-cursor>0.02:
+                    if removed_action=="card" and kss-cursor>card_dur:
+                        out.append({"type":"card","start":cursor,"end":cursor+card_dur})
+                        out.append({"type":"cut","start":cursor+card_dur,"end":kss})
+                    else:
+                        out.append({"type":removed_action,"start":cursor,"end":kss})
+                out.append({"type":"body","start":kss,"end":kee})
+                cursor=kee
+            if se-cursor>0.02:
+                if removed_action=="card" and se-cursor>card_dur:
+                    out.append({"type":"card","start":cursor,"end":cursor+card_dur})
+                    out.append({"type":"cut","start":cursor+card_dur,"end":se})
+                else:
+                    out.append({"type":removed_action,"start":cursor,"end":se})
+        out.sort(key=lambda x: x["start"])
+        tidy=[]
+        for s in out:
+            if tidy and tidy[-1]["type"]==s["type"] and abs(tidy[-1]["end"]-s["start"])<0.02:
+                tidy[-1]["end"]=max(tidy[-1]["end"], s["end"])
+            else:
+                tidy.append(dict(s))
+        return [s for s in tidy if s["end"]-s["start"]>0.08 and s["end"]<=duration+0.05]
+
 
 
     def detect_content_start(self, threshold_db=-35.0, min_len=1.0,

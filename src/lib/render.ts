@@ -413,11 +413,22 @@ function drawCloakedFrame(
     sy = src.y + (src.h - sh) / 2;
   }
   ctx.save();
+  // global transforms: rotate around center, then optional flip
+  if (Math.abs(c.rotate ?? 0) > 0.05) {
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+    ctx.translate(-W / 2, -H / 2);
+  }
+  if (c.flip) {
+    ctx.translate(W, 0);
+    ctx.scale(-1, 1);
+  }
   const f: string[] = [];
   if (Math.abs(c.saturate - 100) > 0.5) f.push(`saturate(${(c.saturate / 100).toFixed(3)})`);
   if (Math.abs(c.contrast - 100) > 0.5) f.push(`contrast(${(c.contrast / 100).toFixed(3)})`);
   if (Math.abs(c.brightness - 100) > 0.5) f.push(`brightness(${(c.brightness / 100).toFixed(3)})`);
   if (Math.abs(c.hue) > 0.5) f.push(`hue-rotate(${c.hue.toFixed(1)}deg)`);
+  if ((c.blur ?? 0) > 0.05) f.push(`blur(${c.blur!.toFixed(2)}px)`);
   ctx.filter = f.length ? f.join(" ") : "none";
   try {
     ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);

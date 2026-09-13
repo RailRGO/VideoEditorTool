@@ -54,6 +54,7 @@ import {
   type Transcript,
 } from "./lib/polish";
 import { buildTranscriptCut } from "./lib/transcriptCut";
+import { buildFairUseLimit, defaultFairUse, type FairUseOptions } from "./lib/fairUseCut";
 import {
   activeSegment,
   buildCut,
@@ -195,6 +196,7 @@ export default function App() {
   const [audio, setAudio] = useState<AudioState>(defaultAudio);
   const [cutOpts, setCutOpts] = useState<CutOptions>(defaultCut);
   const [transcriptCutOpts, setTranscriptCutOpts] = useState<TranscriptCutOptions>(defaultTranscriptCut);
+  const [fairUseOpts, setFairUseOpts] = useState<FairUseOptions>(defaultFairUse);
   const [playing, setPlaying] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedClaim, setSelectedClaim] = useState<string | null>(null);
@@ -326,6 +328,7 @@ export default function App() {
     videoCloak: VideoCloak;
     cutOpts: CutOptions;
     transcriptCutOpts: TranscriptCutOptions;
+    fairUseOpts: FairUseOptions;
     polish: PolishRules;
     disruptRules: DisruptRules;
     leadCfg: LeadConfig;
@@ -345,6 +348,7 @@ export default function App() {
     a.videoCloak === b.videoCloak &&
     a.cutOpts === b.cutOpts &&
     a.transcriptCutOpts === b.transcriptCutOpts &&
+    a.fairUseOpts === b.fairUseOpts &&
     a.polish === b.polish &&
     a.disruptRules === b.disruptRules &&
     a.leadCfg === b.leadCfg &&
@@ -353,11 +357,11 @@ export default function App() {
 
   const editStateRef = useRef<EditState>({
     segments, layout, audio, retouch, audioCloak, videoCloak,
-    cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
+    cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   });
   editStateRef.current = {
     segments, layout, audio, retouch, audioCloak, videoCloak,
-    cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
+    cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   };
 
   const pastRef = useRef<EditState[]>([]);
@@ -412,6 +416,7 @@ export default function App() {
         case "videoCloak": setVideoCloak(next as VideoCloak); break;
         case "cutOpts": setCutOpts(next as CutOptions); break;
         case "transcriptCutOpts": setTranscriptCutOpts(next as TranscriptCutOptions); break;
+        case "fairUseOpts": setFairUseOpts(next as FairUseOptions); break;
         case "polish": setPolish(next as PolishRules); break;
         case "disruptRules": setDisruptRules(next as DisruptRules); break;
         case "leadCfg": setLeadCfg(next as LeadConfig); break;
@@ -455,6 +460,7 @@ export default function App() {
   );
   const setCutOptsH = useMemo(() => makeSetter("cutOpts", "cutOpts"), [makeSetter]);
   const setTranscriptCutOptsH = useMemo(() => makeSetter("transcriptCutOpts", "transcriptCut"), [makeSetter]);
+  const setFairUseOptsH = useMemo(() => makeSetter("fairUseOpts", "fairUse"), [makeSetter]);
   const setPolishH = useMemo(() => makeSetter("polish", "polish"), [makeSetter]);
   const setDisruptH = useMemo(
     () => makeSetter("disruptRules", "disruptRules"),
@@ -503,6 +509,7 @@ export default function App() {
     setVideoCloak(st.videoCloak);
     setCutOpts(st.cutOpts);
     setTranscriptCutOpts(st.transcriptCutOpts);
+    setFairUseOpts(st.fairUseOpts);
     setPolish(st.polish);
     setDisruptRules(st.disruptRules);
     setLeadCfg(st.leadCfg);
@@ -1665,6 +1672,22 @@ export default function App() {
     setSelectedId(null);
   }, [transcript, bodySpan, transcriptCutOpts, withTxn]);
 
+  const applyFairUseLimit = useCallback(() => {
+    if (!durRef.current) return;
+    const span = bodySpan.end - bodySpan.start > 1 ? bodySpan : { start: 0, end: durRef.current };
+    const speech = transcript?.timed ? transcript.words : detection?.regions ?? null;
+    const { segments: next } = buildFairUseLimit(
+      segsRef.current,
+      durRef.current,
+      fairUseOpts,
+      speech as any,
+      span,
+      detection?.regions ?? null
+    );
+    withTxn(next);
+    setSelectedId(null);
+  }, [transcript, detection, bodySpan, fairUseOpts, withTxn]);
+
   const resetTimeline = useCallback(() => {
     const d = durRef.current;
     const intro = Math.min(4, d * 0.12);
@@ -1763,7 +1786,7 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 2,
+    version: 3,
     savedAt: new Date().toISOString(),
     sourceFile: fileName,
     sourceDuration: duration,
@@ -1777,6 +1800,7 @@ export default function App() {
     videoCloak,
     cutOpts,
     transcriptCutOpts,
+    fairUseOpts,
     polish,
     disruptRules,
     leadCfg,
@@ -1813,6 +1837,7 @@ export default function App() {
     if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
     if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
     if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
+    if (p.fairUseOpts) setFairUseOpts(p.fairUseOpts as FairUseOptions);
     if (p.polish) setPolish(p.polish as PolishRules);
     if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
     if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
@@ -1834,7 +1859,7 @@ export default function App() {
     setProjectMsg(`Saved ${segments.length} segments + all settings.`);
   }, [
     fileName, duration, target, segments, claims, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const loadProjectFile = useCallback(
@@ -1880,7 +1905,7 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [
     duration, segments, claims, fileName, target, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, transcriptCutOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const doRestore = () => {
@@ -2328,6 +2353,11 @@ export default function App() {
                 trError={trError}
                 onApplyTranscriptCut={applyTranscriptCut}
                 bodySpan={bodySpan}
+                fairUseOpts={fairUseOpts}
+                setFairUseOpts={setFairUseOptsH}
+                onApplyFairUse={applyFairUseLimit}
+                videoCloak={videoCloak}
+                setVideoCloak={setVideoCloakH}
               />
             )}
             {leftTab === "claims" && (
