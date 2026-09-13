@@ -148,6 +148,19 @@ compositor already did this, which is why the preview and the render
 disagreed.) A card segment with no text of its own no longer crashes the
 Patreon compositor either — it inherits the global card.
 
+The card is drawn by the compositor itself (`compose.card_overlay`) and
+composited into the passthrough as a PNG with ffmpeg's `overlay` — not
+with `drawtext`. Static and pip-bundled ffmpeg builds ship no drawtext,
+and minimal images ship no TTF, which is how cards used to export as a
+black box with a lone accent line and no words; `overlay` is in every
+build, and a PNG means the YouTube card is pixel-for-pixel the Patreon
+card and the browser preview. For the same reason the cloak's vignette
+is the preview's radial gradient as a PNG overlay instead of ffmpeg's
+`vignette` filter, whose cos-power falloff (at the angles this used to
+pass: ~PI/2) blacked out everything but the frame centre. Cover bars and
+the frame border run once over the joined programme and skip card spans
+via `enable=`, exactly like the preview does.
+
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
 instead reports that no tunnel could be verified, it has *already* tried,
