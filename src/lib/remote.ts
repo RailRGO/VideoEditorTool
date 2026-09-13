@@ -132,6 +132,8 @@ export interface ProjectBody {
   budgetMin?: number;
   /** Patreon master: also publish content-only and mic-only audio tracks */
   stems?: boolean;
+  /** join-fade length in ms at cut/card/mute edges (0 = off, default 80) */
+  audioFadeMs?: number;
 }
 
 const UNREACHABLE =

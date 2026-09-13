@@ -105,6 +105,9 @@ export function buildTranscriptCut(
   const maxSpeech = (opts as any).maxSpeech ?? 30;
   const breakerDur = (opts as any).breakerDuration ?? 3;
   const breakerAction = (opts as any).breakerAction ?? "card";
+  // long-talk breakers default to the short card (subs stay visible);
+  // silence cards from emitGap stay full
+  const breakerVariant = (opts as any).breakerVariant ?? "short";
 
   let breakerRegions: Region[] = [];
   if (maxSpeech > 1 && breakerDur > 0) {
@@ -182,6 +185,9 @@ export function buildTranscriptCut(
           type: breakerAction === "cut" ? "cut" : "card",
           start: p.start,
           end: p.end,
+          ...(breakerAction !== "cut" && breakerVariant === "short"
+            ? { card: { variant: "short" as const } }
+            : {}),
         });
       } else {
         out.push({ id: uid(), type: "body", start: p.start, end: p.end });

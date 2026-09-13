@@ -268,8 +268,6 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
     hue = float(c.get("hue", 0.0))
     grain = float(c.get("grain", 0.0))
-    flip = bool(c.get("flip", False))
-    flip_content = bool(c.get("flipContent", False))
     blur = float(c.get("blur", 0.0))
     rotate = float(c.get("rotate", 0.0))
 
@@ -277,13 +275,14 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     post: List[str] = []
 
     if content_only:
-        # Full-frame part only: full flip, bars, border
-        if flip:
-            pre.append("hflip")
+        # Full-frame part only: bars, border. Mirroring is NOT here — it is
+        # always content-only (content filters + the mirror step in
+        # _passthrough_graph), so the camera and card text stay readable.
         # zoom/rotate/eq/hue/blur/grain/flipContent are content-only, handled separately
+        pass
     else:
-        if flip or flip_content:
-            pre.append("hflip")
+        # legacy full-frame path (mirroring is content-only here too — it
+        # happens per segment in _passthrough_graph, never full-frame)
         if abs(rotate) > 0.05:
             pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
         if zoom > 1.001:
@@ -329,7 +328,9 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
     grain = float(c.get("grain", 0.0))
     blur = float(c.get("blur", 0.0))
     rotate = float(c.get("rotate", 0.0))
-    flip_content = bool(c.get("flipContent", False))
+    # `flip` is a legacy alias — all mirroring is content-only, so the
+    # camera corner and the card text stay readable
+    flip_content = bool(c.get("flipContent", False) or c.get("flip", False))
 
     f: List[str] = []
     if flip_content:
@@ -363,6 +364,8 @@ def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[
     pre, post = _video_cloak_split(c, W, H)
     if not c.get("on", False):
         return []
+    # no mirror here: mirroring is always content-only, which needs the
+    # content rect the graph has and this snippet doesn't
     f = list(pre)
     if float(c.get("vignette", 0.0)) > 0.5:
         f.append(f"vignette=a={_vignette_angle(c.get('vignette', 0.0)):.4f}")
@@ -395,6 +398,48 @@ def _atempo_chain(factor: float) -> List[str]:
         factor /= 0.5
     out.append(f"atempo={factor:.4f}")
     return out
+
+
+def _fade_filters(out_dur: float, fade_s: float, fade_in: bool = True,
+                  fade_out: bool = True) -> List[str]:
+    """afade pair for one conformed audio span (empty when pointless).
+
+    *out_dur* is the span's OUTPUT seconds (after atempo); the fade is
+    clamped to half of it so short spans can't go negative.
+    """
+    f = max(0.0, min(float(fade_s or 0.0), max(0.0, float(out_dur)) / 2.0))
+    if f < 0.015:
+        return []
+    out = []
+    if fade_in:
+        out.append(f"afade=t=in:st=0:d={f:.3f}")
+    if fade_out:
+        out.append(f"afade=t=out:st={max(0.0, float(out_dur) - f):.3f}:d={f:.3f}")
+    return out
+
+
+def _fade_edges(spans: List[Dict[str, Any]], i: int,
+                states: List[Any]) -> Tuple[bool, bool]:
+    """(fade_in, fade_out) for spans[i]: skip the dip where the join is
+    source-continuous with an identical state, so only real cuts,
+    card/mute edges and speed changes get smoothed."""
+    a = float(spans[i]["start"])
+    b = float(spans[i]["end"])
+    fade_in, fade_out = True, True
+    if i > 0 and states[i - 1] == states[i] and \
+            abs(float(spans[i - 1]["end"]) - a) < 0.02:
+        fade_in = False
+    if i + 1 < len(spans) and states[i + 1] == states[i] and \
+            abs(b - float(spans[i + 1]["start"])) < 0.02:
+        fade_out = False
+    return fade_in, fade_out
+
+
+def _card_variant(s: Dict[str, Any]) -> str:
+    """A card span's size variant ("full" unless stored as short)."""
+    c = s.get("card") or {}
+    return "short" if str(c.get("variant") or "").strip().lower() == "short" \
+        else "full"
 
 
 def _drawtext_font(bold: bool = True) -> Optional[str]:
@@ -1292,7 +1337,7 @@ class ReactionVideoProcessor:
                   fast_speed: float = 4.0, mute_solo: bool = True,
                   master_gain_db: float = 0.0,
                   cancel_check=None, stems: bool = False,
-                  reuse_buses: bool = False) -> str:
+                  reuse_buses: bool = False, fade_s: float = 0.08) -> str:
         """Mix mic + content buses, conformed to the same segment map as video.
 
         *segments*: cut spans are dropped, fast spans get atempo, mute/card
@@ -1321,11 +1366,13 @@ class ReactionVideoProcessor:
             content_channel=content_channel)
 
         mic_final = self._conform_bus(mic_proc, segments, fast_speed, mute_to_zero=False,
-                                      tag="mic", cancel_check=cancel_check)
+                                      tag="mic", cancel_check=cancel_check,
+                                      fade_s=fade_s)
         content_final = self._conform_bus(content_proc, segments, fast_speed,
                                           mute_to_zero=True, tag="content",
                                           mute_solo=mute_solo,
-                                          cancel_check=cancel_check)
+                                          cancel_check=cancel_check,
+                                          fade_s=fade_s)
         tail = (f"aformat=channel_layouts=stereo,"
                 f"volume={float(master_gain_db):.1f}dB,"
                 "alimiter=limit=-1.5dB:attack=5:release=50")
@@ -1352,14 +1399,23 @@ class ReactionVideoProcessor:
         return str(dst)
 
     def _conform_bus(self, wav: Path, segments, fast_speed, mute_to_zero, tag,
-                     mute_solo: bool = False, cancel_check=None) -> Path:
-        """Cut/drop/speed one audio bus identically to the video timeline."""
+                     mute_solo: bool = False, cancel_check=None,
+                     fade_s: float = 0.08) -> Path:
+        """Cut/drop/speed one audio bus identically to the video timeline.
+
+        Small fades smooth every real join (cuts, card/mute edges, speed
+        changes); source-continuous joins with identical state are left
+        alone so speech never dips mid-word.
+        """
         if not segments:
             return wav
         kept = [s for s in segments if s.get("type") != "cut"]
         if not kept:
             raise ValueError("all segments are cut — nothing to mix")
         mute_types = {"mute", "card"} | ({"intro", "outro"} if mute_solo else set())
+        states = [((s.get("type") in mute_types and bool(mute_to_zero)),
+                   (float(fast_speed) if s.get("type") == "fast" else 1.0))
+                  for s in kept]
         # single untouched span -> no work (unless it mutes this bus)
         if len(kept) == 1 and kept[0].get("type") not in ({"fast"} | mute_types):
             return wav
@@ -1377,6 +1433,11 @@ class ReactionVideoProcessor:
                 f.extend(_atempo_chain(float(fast_speed)))
             if mute_to_zero and s.get("type") in mute_types:
                 f.append("volume=0")
+            dur = float(s["end"]) - float(s["start"])
+            if s.get("type") == "fast":
+                dur = dur / max(0.125, float(fast_speed))
+            fi, fo = _fade_edges(kept, i, states)
+            f.extend(_fade_filters(dur, fade_s, fi, fo))
             outs.append(f"[b{i}]")
             chain.append(f"[s{i}]{','.join(f)}[b{i}]")
         chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[out]")
@@ -1464,7 +1525,9 @@ class ReactionVideoProcessor:
     def _passthrough_graph(self, kept: List[Dict[str, Any]], *, W: int, H: int,
                            audio_cloak, video_cloak, card, fast_speed,
                            master_gain_db, content_rect, out_fps, height,
-                           audio_inputs: List[str]
+                           audio_inputs: List[str],
+                           cam_rect: Optional[Dict[str, float]] = None,
+                           audio_fade_s: float = 0.08
                            ) -> Tuple[List[str], List[str], List[Path]]:
         """filter_complex for one (part of a) passthrough render.
 
@@ -1473,8 +1536,14 @@ class ReactionVideoProcessor:
         (silenced on mute/card) and the second the mic (never silenced).
 
         When video_cloak contentOnly=True (default), zoom/blur/eq/hue/grain/
-        flipContent/rotate affect ONLY the content rect — camera stays clean.
+        flipContent/rotate affect ONLY the content rect — camera stays clean
+        (`flip` is a legacy alias of flipContent: no whole-frame mirror).
         That fixes \"reaction cuts video up/down, black lines, camera cropped\".
+
+        Card spans cover the content rect 100% and then paste the camera
+        corner back on top (cropped from the same trimmed base), so the card
+        can never touch the camera whatever the two rects do — the ffmpeg
+        twin of the browser preview's snapshot/restore.
 
         Returns (chain, warnings, extra_inputs): the card and the vignette
         gradient arrive as single-frame PNG stills the caller must add to
@@ -1516,7 +1585,24 @@ class ReactionVideoProcessor:
         cy = max(0, min(H - 1, cy))
         cw = max(1, min(W - cx, cw))
         ch = max(1, min(H - cy, ch))
-        flip_full = bool((video_cloak or {}).get("flip", False)) and bool((video_cloak or {}).get("on", False))
+        # camera corner, restored on top of card spans (see docstring).
+        # All rects below are in unflipped coordinates: the full-frame
+        # mirror (flip) is applied once to the finished programme after
+        # the concat, so it can never misplace the card, the content
+        # cloak or the camera restore.
+        kr = cam_rect or {}
+        try:
+            krx = float(kr.get("x", 0.006))
+            kry = float(kr.get("y", 0.011))
+            krw = float(kr.get("w", 0.30))
+            krh = float(kr.get("h", 0.30))
+        except Exception:
+            krx, kry, krw, krh = 0.006, 0.011, 0.30, 0.30
+        kcx = max(0, min(W - 1, int(round(W * krx))))
+        kcy = max(0, min(H - 1, int(round(H * kry))))
+        kcw = max(1, min(W - kcx, int(round(W * krw))))
+        kch = max(1, min(H - kcy, int(round(H * krh))))
+        cam_ok = kcw > 1 and kch > 1
 
         want_vig = bool((video_cloak or {}).get("on", False)) and \
             float((video_cloak or {}).get("vignette", 0.0)) > 0.5
@@ -1542,6 +1628,16 @@ class ReactionVideoProcessor:
             if pre:
                 base_vf += "," + ",".join(pre)
 
+            want_camfix = (typ == "card" and cam_ok
+                           and _ffmpeg_has_filter("overlay"))
+            # content-only mirror for the legacy cloak path (the content-only
+            # path takes it through content_filters instead) — `flip` is a
+            # legacy alias, the camera and card text are never mirrored
+            want_mirror = (bool((video_cloak or {}).get("on", False))
+                           and (bool((video_cloak or {}).get("flip", False))
+                                or bool((video_cloak or {}).get("flipContent", False)))
+                           and _ffmpeg_has_filter("overlay"))
+
             if is_content_only and content_filters:
                 # Split trimmed frame into base and content crop
                 tmp_label = f"vtmp{i}"
@@ -1549,10 +1645,12 @@ class ReactionVideoProcessor:
                 # base stays full frame
                 base_label = f"vbase{i}"
                 content_src_label = f"vcsrc{i}"
-                chain.append(f"[{tmp_label}]split=2[{base_label}][{content_src_label}]")
-                # content crop + filters
-                # Note: if full flip is on, base is already flipped; content crop is from flipped base,
-                # but overlay position must be mirrored. We handle x mirroring below.
+                if want_camfix:
+                    cam_src_label = f"vcamsrc{i}"
+                    chain.append(f"[{tmp_label}]split=3[{base_label}][{content_src_label}][{cam_src_label}]")
+                else:
+                    chain.append(f"[{tmp_label}]split=2[{base_label}][{content_src_label}]")
+                # content crop + filters (unflipped coordinates throughout)
                 crop_vf = f"crop={cw}:{ch}:{cx}:{cy}"
                 cf = list(content_filters)
                 # ensure final size matches content rect
@@ -1560,11 +1658,7 @@ class ReactionVideoProcessor:
                 content_filt_label = f"vcf{i}"
                 chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
                 # overlay filtered content back onto base
-                if flip_full:
-                    # when full frame is flipped, content x mirrors
-                    ov_x = W - cx - cw
-                else:
-                    ov_x = cx
+                ov_x = cx
                 ov_y = cy
                 cloaked_label = f"vp{i}"
                 chain.append(f"[{base_label}][{content_filt_label}]overlay=x={ov_x}:y={ov_y}:format=auto[{cloaked_label}]")
@@ -1576,6 +1670,22 @@ class ReactionVideoProcessor:
                     # legacy path shouldn't happen, but include
                     pass
                 chain.append(f"[vin{i}]{vf}[{cur}]")
+                if want_mirror:
+                    # mirror just the content rect, like the content-only path
+                    mbase, msrc, mfl = f"vmbase{i}", f"vmsrc{i}", f"vmf{i}"
+                    chain.append(f"[{cur}]split=2[{mbase}][{msrc}]")
+                    chain.append(f"[{msrc}]crop={cw}:{ch}:{cx}:{cy},hflip,"
+                                 f"scale={cw}:{ch}:flags=lanczos[{mfl}]")
+                    mcur = f"vm{i}"
+                    chain.append(f"[{mbase}][{mfl}]overlay=x={cx}:y={cy}:"
+                                 f"format=auto[{mcur}]")
+                    cur = mcur
+                if want_camfix:
+                    # a second tap of the trimmed base feeds the camera restore
+                    cam_src_label = f"vpcamsrc{i}"
+                    card_branch = f"vpcard{i}"
+                    chain.append(f"[{cur}]split=2[{card_branch}][{cam_src_label}]")
+                    cur = card_branch
 
             if typ == "card":
                 png = self._card_png({**(card or {}), **(s.get("card") or {})},
@@ -1586,6 +1696,13 @@ class ReactionVideoProcessor:
                     chain.append(f"[{cur}][{input_index(path)}:v]"
                                  f"overlay=x={ox}:y={oy}:format=auto[{nxt}]")
                     cur = nxt
+                    if want_camfix:
+                        # paste the camera corner back on top of the card —
+                        # full content cover, camera never touched
+                        chain.append(f"[{cam_src_label}]crop={kcw}:{kch}:{kcx}:{kcy}[cam{i}]")
+                        fixed = f"vfix{i}"
+                        chain.append(f"[{cur}][cam{i}]overlay=x={kcx}:y={kcy}:format=auto[{fixed}]")
+                        cur = fixed
                 else:
                     warns.append("overlay filter missing — card skipped")
             chain.append(f"[{cur}]setsar=1[v{i}]")
@@ -1628,6 +1745,9 @@ class ReactionVideoProcessor:
             outs = []
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
+            states = [((t in ("mute", "card") and j == 0),
+                       (float(fast_speed) * gs if t == "fast" else gs))
+                      for t in (s.get("type", "body") for s in kept)]
             for i, s in enumerate(kept):
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
@@ -1639,6 +1759,10 @@ class ReactionVideoProcessor:
                     af += "," + ",".join(_atempo_chain(fast_speed))
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
+                fi, fo = _fade_edges(kept, i, states)
+                fz = _fade_filters((b - a) / max(0.125, eff), audio_fade_s, fi, fo)
+                if fz:
+                    af += "," + ",".join(fz)
                 chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
                 outs.append(f"[j{j}b{i}]")
             chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
@@ -1709,17 +1833,21 @@ class ReactionVideoProcessor:
         progress_cb=None,
         cancel_check=None,
         content_rect: Optional[Dict[str, float]] = None,
+        cam_rect: Optional[Dict[str, float]] = None,
         stems: Optional[bool] = None,
         stall_min: float = 30.0,
+        audio_fade_s: float = 0.08,
     ) -> Dict[str, str]:
         """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
 
         cuts are dropped, fast spans sped (atempo + setpts), mute/card spans
         silence the programme (content bus only when the source carries
         stems), card spans cover the *content rect* — the same rect the
-        Patreon compositor covered when it made this file, so the camera
-        corner stays visible — everything else takes the cloak. A/V can never
-        desync: both streams come from the same segment list in one command.
+        Patreon compositor covered when it made this file — and then paste
+        the *cam rect* back on top, so the camera corner stays visible
+        whatever the two rects do. Everything else takes the cloak. A/V can
+        never desync: both streams come from the same segment list in one
+        command.
         """
         if not _has("ffmpeg"):
             raise RuntimeError("ffmpeg not found (needed for render_passthrough)")
@@ -1741,7 +1869,8 @@ class ReactionVideoProcessor:
             kept, W=W, H=H, audio_cloak=audio_cloak, video_cloak=video_cloak,
             card=card, fast_speed=fast_speed, master_gain_db=master_gain_db,
             content_rect=content_rect, out_fps=out_fps, height=height,
-            audio_inputs=audio_inputs)
+            audio_inputs=audio_inputs, cam_rect=cam_rect,
+            audio_fade_s=audio_fade_s)
         for w in warns:
             print(f"  (cloak: {w})")
 
@@ -1788,7 +1917,19 @@ class ReactionVideoProcessor:
         title = str(g.get("title") or d.title)
         sub = str(g.get("sub") or d.sub)
         accent = str(g.get("accent") or d.accent)
-        key = (title, sub, accent, W, H, rect)
+        img_spec = str(g.get("image") or getattr(d, "image", "") or "")
+        show_text = g.get("showText", getattr(d, "showText", True))
+        show_text = False if show_text is False else True
+        img_hash = (hashlib.sha1(img_spec.encode("utf-8", "ignore")).hexdigest()[:12]
+                    if img_spec else "")
+        variant = str(g.get("variant") or "full").strip().lower()
+        variant = variant if variant == "short" else "full"
+        short_h = float(g.get("shortHeight", getattr(d, "shortHeight", 0.62)) or 0.62)
+        short_h = max(0.2, min(1.0, short_h))
+        opac = float(g.get("opacity", getattr(d, "opacity", 0.9)) or 0.9)
+        opac = max(0.05, min(1.0, opac))
+        key = (title, sub, accent, img_hash, show_text, variant,
+               round(short_h, 4), round(opac, 4), W, H, rect)
         cache: Dict[Any, Tuple[Path, int, int]] = \
             self.__dict__.setdefault("_card_png_cache", {})
         hit = cache.get(key)
@@ -1796,8 +1937,10 @@ class ReactionVideoProcessor:
             return hit
         lay = L.LayoutState()
         lay.content = L.Rect(*rect)
-        lay.card = L.CardStyle(title=title, sub=sub, accent=accent)
-        img, x0, y0 = C.card_overlay({}, lay, W, H)
+        lay.card = L.CardStyle(title=title, sub=sub, accent=accent,
+                               image=img_spec, showText=show_text,
+                               shortHeight=short_h, opacity=opac)
+        img, x0, y0 = C.card_overlay({"variant": variant}, lay, W, H)
         if img.size == 0:
             return None
         digest = hashlib.sha1(repr(key).encode()).hexdigest()[:10]
@@ -1917,7 +2060,8 @@ class ReactionVideoProcessor:
                        stall_min: float = 30.0, budget_min: float = 0.0,
                        progress_cb=None, cancel_check=None,
                        log: Optional[Callable[[str], None]] = None,
-                       resume_body: Optional[Dict[str, Any]] = None
+                       resume_body: Optional[Dict[str, Any]] = None,
+                       audio_fade_s: float = 0.08
                        ) -> Dict[str, Any]:
         """Render a whole project, in parts, with a journal on disk.
 
@@ -1985,14 +2129,18 @@ class ReactionVideoProcessor:
             report(0.02, step="rendering")
             if target == "youtube":
                 rect = None
+                camrect = None
                 if layout is not None:
                     rect = {"x": layout.content.x, "y": layout.content.y,
                             "w": layout.content.w, "h": layout.content.h}
+                    camrect = {"x": layout.cam.x, "y": layout.cam.y,
+                               "w": layout.cam.w, "h": layout.cam.h}
                 outs = self.render_passthrough(
                     kept, audio_cloak=audio_cloak, video_cloak=video_cloak,
                     card=card, fast_speed=fast, master_gain_db=master_gain_db,
                     crf=crf, preset=preset, fps=fps, height=height, name=name,
-                    webm=webm, content_rect=rect, stems=stems,
+                    webm=webm, content_rect=rect, cam_rect=camrect, stems=stems,
+                    audio_fade_s=audio_fade_s,
                     stall_min=stall_min, cancel_check=cancel_check,
                     progress_cb=lambda d, t: (beat(), report(
                         0.05 + 0.9 * d / max(1e-6, t),
@@ -2025,7 +2173,8 @@ class ReactionVideoProcessor:
                     segments=kept, fast_speed=fast,
                     mute_solo=bool(lay.muteContentInSolo),
                     master_gain_db=master_gain_db,
-                    cancel_check=cancel_check, stems=single_stems)
+                    cancel_check=cancel_check, stems=single_stems,
+                    fade_s=audio_fade_s)
                 st = dict(self.last_stems) if single_stems else None
                 report(0.95, step="muxing")
                 beat()
@@ -2062,6 +2211,8 @@ class ReactionVideoProcessor:
             self.layout = lay
         rect = {"x": lay.content.x, "y": lay.content.y,
                 "w": lay.content.w, "h": lay.content.h}
+        camrect = {"x": lay.cam.x, "y": lay.cam.y,
+                   "w": lay.cam.w, "h": lay.cam.h}
         hook = (self._cam_hook() if target == "patreon"
                 and self.retouch_cfg.get("enabled") else None)
         pt_streams, pt_used = self._passthrough_streams(stems)
@@ -2184,7 +2335,8 @@ class ReactionVideoProcessor:
                     card=card, fast_speed=fast, master_gain_db=master_gain_db,
                     content_rect=rect, out_fps=(float(fps) if fps else
                                                 float(self.info.get("fps") or 0)),
-                    height=height, audio_inputs=pt_streams)
+                    height=height, audio_inputs=pt_streams, cam_rect=camrect,
+                    audio_fade_s=audio_fade_s)
                 for w in warns:
                     say(f"  (cloak: {w})")
                 _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset,
@@ -2198,7 +2350,8 @@ class ReactionVideoProcessor:
                 beat()
                 self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
                           "-filter_complex",
-                          self._part_audio_chain(part, fast),
+                          self._part_audio_chain(part, fast,
+                                                   fade_s=audio_fade_s),
                           "-map", "[aout]", "-c:a", "pcm_s16le", str(ap)],
                          f"part {i + 1} audio")
                 rec: Dict[str, Any] = {"i": i, "v": vp.name, "a": ap.name}
@@ -2216,7 +2369,8 @@ class ReactionVideoProcessor:
                     segments=part, fast_speed=fast,
                     mute_solo=bool(lay.muteContentInSolo),
                     master_gain_db=master_gain_db, cancel_check=cancel_check,
-                    stems=want_stems, reuse_buses=True)
+                    stems=want_stems, reuse_buses=True,
+                    fade_s=audio_fade_s)
                 rec = {"i": i, "v": vp.name, "a": Path(mix).name}
                 if want_stems:
                     rec["ac"] = Path(self.last_stems["content"]).name
@@ -2285,7 +2439,7 @@ class ReactionVideoProcessor:
                 "chunked": True}
 
     def _part_audio_chain(self, part: List[Dict[str, Any]],
-                          fast_speed: float) -> str:
+                          fast_speed: float, fade_s: float = 0.08) -> str:
         """Audio for one passthrough part (YouTube path).
 
         Same conform math as the single-pass graph: stems are read
@@ -2300,6 +2454,9 @@ class ReactionVideoProcessor:
             outs = []
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
+            states = [((t in ("mute", "card") and j == 0),
+                       (float(fast_speed) if t == "fast" else 1.0))
+                      for t in (s.get("type", "body") for s in part)]
             for i, s in enumerate(part):
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
@@ -2308,6 +2465,11 @@ class ReactionVideoProcessor:
                     af += "," + ",".join(_atempo_chain(fast_speed))
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
+                eff = float(fast_speed) if typ == "fast" else 1.0
+                fi, fo = _fade_edges(part, i, states)
+                fz = _fade_filters((b - a) / eff, fade_s, fi, fo)
+                if fz:
+                    af += "," + ",".join(fz)
                 chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
                 outs.append(f"[j{j}b{i}]")
             chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
@@ -2583,6 +2745,7 @@ class ReactionVideoProcessor:
         max_speech = float(o.get("maxSpeech", o.get("max_speech", 30.0)))
         breaker_dur = float(o.get("breakerDuration", o.get("breaker_duration", 3.0)))
         breaker_action = str(o.get("breakerAction", o.get("breaker_action", "card")))
+        breaker_variant = str(o.get("breakerVariant", o.get("breaker_variant", "short")))
 
         speech = ReactionVideoProcessor.speech_regions_from_words(words, pad, merge_gap)
         rewrite_types = {"body", "lead", "mute", "fast", "card"}
@@ -2668,7 +2831,11 @@ class ReactionVideoProcessor:
                 if a - cursor > 0.02:
                     out.extend(emit_gap(cursor, a))
                 if is_br:
-                    out.append({"type": breaker_action if breaker_action in ("card","cut") else "card", "start": a, "end": b})
+                    btyp = breaker_action if breaker_action in ("card", "cut") else "card"
+                    bout = {"type": btyp, "start": a, "end": b}
+                    if btyp == "card" and breaker_variant == "short":
+                        bout["card"] = {"variant": "short"}
+                    out.append(bout)
                 else:
                     out.append({"type": "body", "start": max(cursor, a), "end": b})
                 cursor = max(cursor, b)
@@ -2677,15 +2844,21 @@ class ReactionVideoProcessor:
         out.sort(key=lambda s: s["start"])
         tidy = []
         for s in out:
-            if tidy and tidy[-1]["type"] == s["type"] and abs(tidy[-1]["end"] - s["start"]) < 0.02:
+            if tidy and tidy[-1]["type"] == s["type"] and abs(tidy[-1]["end"] - s["start"]) < 0.02 and (s["type"] != "card" or _card_variant(tidy[-1]) == _card_variant(s)):
                 tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
             else:
                 tidy.append(dict(s))
         return [s for s in tidy if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
 
     @staticmethod
-    def build_fair_use_limit(segments, duration, opts=None, words=None, body_span=None, detection_regions=None):
-        """Limit reaction body to maxBodySec, keeping most speech-dense parts, plus breaker every maxSpeech.
+    def build_fair_use_limit(segments, duration, opts=None, words=None, body_span=None,
+                             detection_regions=None, fast_speed=4.0):
+        """Limit the reaction part to maxBodySec of kept programme.
+
+        Only rewriteable footage (body/lead/mute/fast) is shortened: cards
+        and cuts left by an earlier step (e.g. the transcript cut) are
+        preserved byte-for-byte, intro/outro never touched. Cards keep their
+        slot in the budget; cuts produce no output so they don't count.
 
         Mirrors src/lib/fairUseCut.ts.
         """
@@ -2698,18 +2871,44 @@ class ReactionVideoProcessor:
         max_speech = float(o.get("maxSpeech", o.get("max_speech", 30.0)))
         breaker_dur = float(o.get("breakerDuration", o.get("breaker_duration", 3.0)))
         breaker_action = str(o.get("breakerAction", o.get("breaker_action", "card")))
+        breaker_variant = str(o.get("breakerVariant", o.get("breaker_variant", "short")))
+        fast = max(1.05, float(fast_speed or 4.0))
 
-        rewrite_types = {"body", "lead", "mute", "fast", "card"}
-        body_segs = [s for s in (segments or []) if s.get("type") in rewrite_types]
+        rewrite_types = {"body", "lead", "mute", "fast"}
+        segs = sorted(segments or [], key=lambda x: float(x.get("start", 0)))
+        rewriteable = [s for s in segs if str(s.get("type", "body")) in rewrite_types]
         if body_span:
             span_start = float(body_span.get("start", 0))
             span_end = float(body_span.get("end", duration))
         else:
-            span_start = float(body_segs[0]["start"]) if body_segs else 0.0
-            span_end = float(body_segs[-1]["end"]) if body_segs else float(duration)
-        body_dur = max(0.0, span_end - span_start)
-        if body_dur <= max_body + 0.01:
+            span_start = float(rewriteable[0]["start"]) if rewriteable else 0.0
+            span_end = float(rewriteable[-1]["end"]) if rewriteable else float(duration)
+
+        def _prog(s, a, b):
+            src = max(0.0, b - a)
+            return src / fast if str(s.get("type")) == "fast" else src
+
+        def _kept_prog(only_rewriteable=False):
+            total = 0.0
+            for s in segs:
+                typ = str(s.get("type", "body"))
+                if typ == "cut":
+                    continue
+                if only_rewriteable and typ not in rewrite_types:
+                    continue
+                a = max(float(s["start"]), span_start)
+                b = min(float(s["end"]), span_end)
+                if b - a > 0.001:
+                    total += _prog(s, a, b)
+            return total
+
+        original = _kept_prog(False)
+        rewrite_prog = _kept_prog(True)
+        preserved = max(0.0, original - rewrite_prog)
+        if original <= max_body + 0.01 or rewrite_prog <= 0.01:
             return segments
+
+        rewrite_budget = max(0.0, max_body - preserved)
 
         speech = []
         if words and len(words):
@@ -2717,104 +2916,101 @@ class ReactionVideoProcessor:
             if isinstance(first, dict) and "text" in first:
                 speech = ReactionVideoProcessor.speech_regions_from_words(words, 0.25, 0.8)
             else:
-                speech = [(float(r.get("start", r[0])), float(r.get("end", r[1]))) if isinstance(r, dict) else (float(r[0]), float(r[1])) for r in words]
-                speech = [(a,b) for a,b in speech if b>a]
+                for r in words:
+                    if isinstance(r, dict):
+                        a, b = float(r.get("start", 0)), float(r.get("end", 0))
+                    else:
+                        a, b = float(r[0]), float(r[1])
+                    if b > a:
+                        speech.append((a, b))
         elif detection_regions:
-            speech = [(float(r.get("start", r[0])), float(r.get("end", r[1]))) if isinstance(r, dict) else (float(r[0]), float(r[1])) for r in detection_regions]
-
+            for r in detection_regions:
+                if isinstance(r, dict):
+                    a, b = float(r.get("start", 0)), float(r.get("end", 0))
+                else:
+                    a, b = float(r[0]), float(r[1])
+                if b > a:
+                    speech.append((a, b))
         speech = sorted(speech, key=lambda x: x[0])
 
-        buckets = []
-        t = span_start
-        while t < span_end - 0.01:
-            be = min(t + bucket_sec, span_end)
-            score = 0.0
-            for a,b in speech:
-                if b <= t: continue
-                if a >= be: break
-                overlap = min(b, be) - max(a, t)
-                if overlap>0: score+=overlap
-            buckets.append((t, be, score))
-            t = be
+        def _score(a, b):
+            sc = 0.0
+            for sa, sb in speech:
+                if sb <= a:
+                    continue
+                if sa >= b:
+                    break
+                ov = min(sb, b) - max(sa, a)
+                if ov > 0:
+                    sc += ov
+            return sc
 
-        target_buckets = int((max_body + bucket_sec - 1e-6)//bucket_sec)
-        if not speech:
-            keep_end = span_start + max_body
-            out=[]
-            for s in sorted(segments or [], key=lambda x: float(x.get("start",0))):
-                typ=str(s.get("type","body"))
-                if typ not in rewrite_types:
-                    out.append(dict(s)); continue
-                ss=float(s["start"]); se=float(s["end"])
-                if se<=span_start or ss>=span_end:
-                    out.append(dict(s)); continue
-                ss=max(ss, span_start); se=min(se, span_end)
-                if se<=keep_end:
-                    if ss<keep_end:
-                        out.append({**s, "start":ss, "end":min(se, keep_end)})
-                elif ss<keep_end:
-                    out.append({**s, "start":ss, "end":keep_end})
-                    if removed_action=="card" and se-keep_end>card_dur:
-                        out.append({"type":"card","start":keep_end,"end":keep_end+card_dur})
-                        out.append({"type":"cut","start":keep_end+card_dur,"end":se})
-                    else:
-                        out.append({"type":removed_action,"start":keep_end,"end":se})
-                else:
-                    if removed_action=="card" and se-ss>card_dur:
-                        out.append({"type":"card","start":ss,"end":ss+card_dur})
-                        out.append({"type":"cut","start":ss+card_dur,"end":se})
-                    else:
-                        out.append({"type":removed_action,"start":ss,"end":se})
-            out.sort(key=lambda x: x["start"])
-            tidy=[]
-            for s in out:
-                if tidy and tidy[-1]["type"]==s["type"] and abs(tidy[-1]["end"]-s["start"])<0.02:
-                    tidy[-1]["end"]=max(tidy[-1]["end"], s["end"])
-                else:
-                    tidy.append(dict(s))
-            return [s for s in tidy if s["end"]-s["start"]>0.08]
+        # buckets cover ONLY rewriteable footage — cards/cuts are holes
+        buckets = []  # (start, end, score, type)
+        for s in rewriteable:
+            ss = max(float(s["start"]), span_start)
+            se = min(float(s["end"]), span_end)
+            t = ss
+            while t < se - 0.01:
+                be = min(t + bucket_sec, se)
+                buckets.append((t, be, _score(t, be) if speech else 0.0,
+                                str(s.get("type", "body"))))
+                t = be
+        if not buckets:
+            return segments
 
-        sorted_buckets = sorted(enumerate(buckets), key=lambda x: (-x[1][2], x[1][0]))
-        selected_idx = [i for i,_ in sorted_buckets[:target_buckets]]
-        pad_n = int((keep_pad + bucket_sec -1e-6)//bucket_sec)
-        keep_set=set()
-        for idx in selected_idx:
-            for d in range(-pad_n, pad_n+1):
-                ni=idx+d
-                if 0 <= ni < len(buckets):
-                    keep_set.add(ni)
-        keep_indices=sorted(keep_set)
-        if len(keep_indices)>target_buckets:
-            scored=[(i, buckets[i][2], buckets[i][0]) for i in keep_indices]
-            scored.sort(key=lambda x: (-x[1], x[2]))
-            keep_indices=sorted([i for i,_,_ in scored[:target_buckets]])
-        keep_mask=set(keep_indices)
-        raw_kept=[]
-        cur=None
-        for i,(bs,be,sc) in enumerate(buckets):
-            if i not in keep_mask:
-                if cur:
-                    raw_kept.append(cur); cur=None
-                continue
-            if not cur:
-                cur=[bs,be]
-            elif abs(cur[1]-bs)<0.02:
-                cur[1]=be
+        prog_per_bucket = rewrite_prog / len(buckets)
+        target = max(0, min(len(buckets),
+                            int(round(rewrite_budget / max(1e-6, prog_per_bucket)))))
+
+        keep_set = set()
+        if target > 0:
+            if speech:
+                ranked = sorted(range(len(buckets)),
+                                key=lambda i: (-buckets[i][2], buckets[i][0]))
             else:
-                raw_kept.append(cur); cur=[bs,be]
-        if cur:
-            raw_kept.append(cur)
-        raw_kept=[(float(a),float(b)) for a,b in raw_kept]
+                ranked = sorted(range(len(buckets)),
+                                key=lambda i: buckets[i][0])
+            pad_n = int((keep_pad + bucket_sec - 1e-6) // bucket_sec)
+            for sel in ranked[:target]:
+                keep_set.add(sel)
+                for d in range(1, pad_n + 1):
+                    for ni in (sel - d, sel + d):
+                        if ni < 0 or ni >= len(buckets) or ni in keep_set:
+                            continue
+                        # padding must not leak across preserved cards/cuts
+                        a, b = buckets[sel], buckets[ni]
+                        gap = (max(0.0, b[0] - a[1]) if ni > sel
+                               else max(0.0, a[0] - b[1]))
+                        if gap < bucket_sec * 1.5 + 0.05:
+                            keep_set.add(ni)
+            if len(keep_set) > target:
+                if speech:
+                    rescored = sorted(keep_set,
+                                      key=lambda i: (-buckets[i][2], buckets[i][0]))
+                else:
+                    rescored = sorted(keep_set, key=lambda i: buckets[i][0])
+                keep_set = set(rescored[:target])
 
-        # Breaker inside long kept intervals
-        kept_intervals=[]
-        breaker_intervals=[]
+        keep_indices = sorted(keep_set)
+        kept_intervals = []  # [start, end, type]
+        for i in keep_indices:
+            bs, be, _, ty = buckets[i]
+            if (kept_intervals and abs(kept_intervals[-1][1] - bs) < 0.05
+                    and kept_intervals[-1][2] == ty):
+                kept_intervals[-1][1] = be
+            else:
+                kept_intervals.append([bs, be, ty])
+
+        # breaker cards inside long kept intervals (maxSpeech <= 1 disables)
+        kept_final = []
+        breaker_intervals = []
         if max_speech > 1 and breaker_dur > 0:
-            for a,b in raw_kept:
+            for a, b, ty in kept_intervals:
                 cur = a
                 while cur < b - 0.01:
                     be = min(b, cur + max_speech)
-                    kept_intervals.append((cur, be))
+                    kept_final.append((cur, be, ty))
                     cur = be
                     if cur < b - 0.01:
                         br_end = min(b, cur + breaker_dur)
@@ -2822,56 +3018,67 @@ class ReactionVideoProcessor:
                             breaker_intervals.append((cur, br_end))
                             cur = br_end
         else:
-            kept_intervals = raw_kept
+            kept_final = [(a, b, ty) for a, b, ty in kept_intervals]
 
-        out=[]
-        for s in sorted(segments or [], key=lambda x: float(x.get("start",0))):
-            typ=str(s.get("type","body"))
+        def _emit_removed(fr, to):
+            if to - fr <= 0.02:
+                return []
+            if removed_action == "card" and to - fr > card_dur:
+                return [{"type": "card", "start": fr, "end": fr + card_dur},
+                        {"type": "cut", "start": fr + card_dur, "end": to}]
+            return [{"type": removed_action, "start": fr, "end": to}]
+
+        out = []
+        for s in segs:
+            typ = str(s.get("type", "body"))
             if typ not in rewrite_types:
-                out.append(dict(s)); continue
-            ss=float(s["start"]); se=float(s["end"])
-            if se<=span_start or ss>=span_end:
-                out.append(dict(s)); continue
-            ss=max(ss, span_start); se=min(se, span_end)
-            # pieces = kept + breaker
-            pieces=[]
-            for a,b in kept_intervals:
-                if b<=ss+0.01 or a>=se-0.01: continue
-                pieces.append((max(a,ss), min(b,se), False))
-            for a,b in breaker_intervals:
-                if b<=ss+0.01 or a>=se-0.01: continue
-                pieces.append((max(a,ss), min(b,se), True))
+                out.append(dict(s))
+                continue
+            ss = float(s["start"])
+            se = float(s["end"])
+            if se <= span_start or ss >= span_end:
+                out.append(dict(s))
+                continue
+            ss = max(ss, span_start)
+            se = min(se, span_end)
+            pieces = []
+            for a, b, ty in kept_final:
+                if b <= ss + 0.01 or a >= se - 0.01:
+                    continue
+                pieces.append((max(a, ss), min(b, se), False, ty))
+            for a, b in breaker_intervals:
+                if b <= ss + 0.01 or a >= se - 0.01:
+                    continue
+                pieces.append((max(a, ss), min(b, se), True, "card"))
             pieces.sort(key=lambda x: x[0])
-            cursor=ss
-            for ks,ke,is_br in pieces:
-                if ke<=cursor+0.01: continue
-                if ks>=se-0.01: break
-                kss=max(ks, ss); kee=min(ke, se)
-                if kss-cursor>0.02:
-                    if removed_action=="card" and kss-cursor>card_dur:
-                        out.append({"type":"card","start":cursor,"end":cursor+card_dur})
-                        out.append({"type":"cut","start":cursor+card_dur,"end":kss})
-                    else:
-                        out.append({"type":removed_action,"start":cursor,"end":kss})
+            cursor = ss
+            for ks, ke, is_br, ty in pieces:
+                if ks - cursor > 0.02:
+                    out.extend(_emit_removed(cursor, ks))
                 if is_br:
-                    out.append({"type": breaker_action if breaker_action in ("card","cut") else "card","start":kss,"end":kee})
+                    btyp = (breaker_action if breaker_action in ("card", "cut")
+                            else "card")
+                    bout = {"type": btyp, "start": ks, "end": ke}
+                    if btyp == "card" and breaker_variant == "short":
+                        bout["card"] = {"variant": "short"}
+                    out.append(bout)
                 else:
-                    out.append({"type":"body","start":kss,"end":kee})
-                cursor=kee
-            if se-cursor>0.02:
-                if removed_action=="card" and se-cursor>card_dur:
-                    out.append({"type":"card","start":cursor,"end":cursor+card_dur})
-                    out.append({"type":"cut","start":cursor+card_dur,"end":se})
-                else:
-                    out.append({"type":removed_action,"start":cursor,"end":se})
+                    out.append({"type": ty, "start": ks, "end": ke})
+                cursor = max(cursor, ke)
+            if se - cursor > 0.02:
+                out.extend(_emit_removed(cursor, se))
         out.sort(key=lambda x: x["start"])
-        tidy=[]
+        tidy = []
         for s in out:
-            if tidy and tidy[-1]["type"]==s["type"] and abs(tidy[-1]["end"]-s["start"])<0.02:
-                tidy[-1]["end"]=max(tidy[-1]["end"], s["end"])
+            if (tidy and tidy[-1]["type"] == s["type"]
+                    and abs(tidy[-1]["end"] - s["start"]) < 0.02
+                    and (s["type"] != "card"
+                         or _card_variant(tidy[-1]) == _card_variant(s))):
+                tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
             else:
                 tidy.append(dict(s))
-        return [s for s in tidy if s["end"]-s["start"]>0.08 and s["end"]<=duration+0.05]
+        return [s for s in tidy
+                if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
 
 
 

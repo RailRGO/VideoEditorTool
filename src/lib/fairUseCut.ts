@@ -13,6 +13,8 @@ export interface FairUseOptions {
   maxSpeech: number;
   breakerDuration: number;
   breakerAction: "card" | "cut";
+  /** breaker card size: short covers the top only (subs stay visible) */
+  breakerVariant: "full" | "short";
 }
 
 export const defaultFairUse: FairUseOptions = {
@@ -24,64 +26,63 @@ export const defaultFairUse: FairUseOptions = {
   maxSpeech: 30,
   breakerDuration: 3,
   breakerAction: "card",
+  breakerVariant: "short",
 };
 
 export interface FairUseReport {
+  /** kept programme (output) seconds inside the reaction span, before limiting */
   originalBody: number;
+  /** kept programme seconds the limiter aims at (<= maxBodySec) */
   limitedBody: number;
   keptBuckets: number;
   totalBuckets: number;
   saved: number;
+  /** programme seconds of preserved cards inside the span (never touched) */
+  preservedCards?: number;
 }
 
-function buildBuckets(
+/**
+ * Only these are candidates for removal. Everything else is preserved:
+ * - intro/outro: never touched (solo full-cam)
+ * - cut: already removed by an earlier step (e.g. the transcript cut) — stays cut,
+ *   and is NOT counted against the budget (it produces no output)
+ * - card: a Patreon card from an earlier step — stays a card, keeps its slot
+ *   in the budget (it produces output)
+ *
+ * So running transcript-cut first and the fair-use limiter second now stacks:
+ * the limiter only shortens the remaining reaction footage.
+ */
+const REWRITE = new Set(["body", "lead", "mute", "fast"]);
+
+function progLen(s: Segment, fastSpeed: number): number {
+  const src = Math.max(0, s.end - s.start);
+  return s.type === "fast" ? src / Math.max(1.05, fastSpeed) : src;
+}
+
+/** Kept (non-cut) programme seconds of `segments` clipped to [spanStart, spanEnd). */
+function keptProgramme(
+  segments: Segment[],
   spanStart: number,
   spanEnd: number,
-  bucketSec: number,
-  speech: Region[]
-): { start: number; end: number; score: number }[] {
-  const buckets: { start: number; end: number; score: number }[] = [];
-  for (let t = spanStart; t < spanEnd - 0.01; t += bucketSec) {
-    const bEnd = Math.min(t + bucketSec, spanEnd);
-    let score = 0;
-    for (const s of speech) {
-      if (s.end <= t) continue;
-      if (s.start >= bEnd) break;
-      const overlap = Math.min(s.end, bEnd) - Math.max(s.start, t);
-      if (overlap > 0) score += overlap;
-    }
-    buckets.push({ start: t, end: bEnd, score });
+  fastSpeed: number,
+  onlyRewriteable = false
+): number {
+  let total = 0;
+  for (const s of segments) {
+    if (s.type === "cut") continue;
+    if (onlyRewriteable && !REWRITE.has(s.type)) continue;
+    const a = Math.max(s.start, spanStart);
+    const b = Math.min(s.end, spanEnd);
+    if (b - a <= 0.001) continue;
+    total += progLen({ ...s, start: a, end: b }, fastSpeed);
   }
-  return buckets;
+  return total;
 }
 
-export function buildFairUseLimit(
-  segments: Segment[],
-  duration: number,
-  opts: FairUseOptions,
+function speechOf(
   speechOrWords: Region[] | Word[] | null,
-  bodySpan?: Region,
   detectionRegions?: Region[] | null
-): { segments: Segment[]; report: FairUseReport } {
-  const rewriteTypes = new Set(["body", "lead", "mute", "fast", "card"]);
-  const bodySegs = segments.filter((s) => rewriteTypes.has(s.type));
-  const spanStart = bodySpan ? bodySpan.start : (bodySegs[0]?.start ?? 0);
-  const spanEnd = bodySpan ? bodySpan.end : (bodySegs[bodySegs.length - 1]?.end ?? duration);
-  const bodyDuration = Math.max(0, spanEnd - spanStart);
-
-  if (bodyDuration <= opts.maxBodySec + 0.01) {
-    return {
-      segments,
-      report: {
-        originalBody: bodyDuration,
-        limitedBody: bodyDuration,
-        keptBuckets: Math.ceil(bodyDuration / opts.bucketSec),
-        totalBuckets: Math.ceil(bodyDuration / opts.bucketSec),
-        saved: 0,
-      },
-    };
-  }
-
+): Region[] {
   let speech: Region[] = [];
   if (speechOrWords && speechOrWords.length) {
     const first = speechOrWords[0] as any;
@@ -93,111 +94,142 @@ export function buildFairUseLimit(
   } else if (detectionRegions && detectionRegions.length) {
     speech = detectionRegions.map((r) => ({ start: r.start, end: r.end }));
   }
+  return speech.sort((a, b) => a.start - b.start);
+}
 
-  if (!speech.length) {
-    const keepEnd = spanStart + opts.maxBodySec;
-    const out: Segment[] = [];
-    for (const s of tidy(segments)) {
-      if (!rewriteTypes.has(s.type)) {
-        out.push(s);
-        continue;
-      }
-      if (s.end <= spanStart || s.start >= spanEnd) {
-        out.push(s);
-        continue;
-      }
-      const ss = Math.max(s.start, spanStart);
-      const se = Math.min(s.end, spanEnd);
-      if (se <= keepEnd) {
-        if (ss < keepEnd) out.push({ ...s, start: ss, end: Math.min(se, keepEnd) });
-      } else if (ss < keepEnd) {
-        out.push({ ...s, start: ss, end: keepEnd });
-        if (opts.removedAction === "card" && se - keepEnd > opts.cardDuration) {
-          out.push({ id: uid(), type: "card", start: keepEnd, end: keepEnd + opts.cardDuration });
-          out.push({ id: uid(), type: "cut", start: keepEnd + opts.cardDuration, end: se });
-        } else {
-          out.push({ id: uid(), type: opts.removedAction, start: keepEnd, end: se });
-        }
-      } else {
-        if (opts.removedAction === "card" && se - ss > opts.cardDuration) {
-          out.push({ id: uid(), type: "card", start: ss, end: ss + opts.cardDuration });
-          out.push({ id: uid(), type: "cut", start: ss + opts.cardDuration, end: se });
-        } else {
-          out.push({ id: uid(), type: opts.removedAction, start: ss, end: se });
-        }
-      }
-    }
-    const final = tidy(out).filter((s) => s.end - s.start > 0.08);
-    return {
-      segments: final,
-      report: {
-        originalBody: bodyDuration,
-        limitedBody: opts.maxBodySec,
-        keptBuckets: Math.ceil(opts.maxBodySec / opts.bucketSec),
-        totalBuckets: Math.ceil(bodyDuration / opts.bucketSec),
-        saved: bodyDuration - opts.maxBodySec,
-      },
-    };
+function overlapScore(speech: Region[], a: number, b: number): number {
+  let score = 0;
+  for (const s of speech) {
+    if (s.end <= a) continue;
+    if (s.start >= b) break;
+    const overlap = Math.min(s.end, b) - Math.max(s.start, a);
+    if (overlap > 0) score += overlap;
+  }
+  return score;
+}
+
+export function buildFairUseLimit(
+  segments: Segment[],
+  duration: number,
+  opts: FairUseOptions,
+  speechOrWords: Region[] | Word[] | null,
+  bodySpan?: Region,
+  detectionRegions?: Region[] | null,
+  fastSpeed = 4
+): { segments: Segment[]; report: FairUseReport } {
+  const tidied = tidy(segments);
+  const rewriteable = tidied.filter((s) => REWRITE.has(s.type));
+  const spanStart = bodySpan ? bodySpan.start : (rewriteable[0]?.start ?? 0);
+  const spanEnd = bodySpan ? bodySpan.end : (rewriteable[rewriteable.length - 1]?.end ?? duration);
+
+  // Programme (output) accounting: cuts produce no output, so they neither
+  // consume the budget nor get rewritten. Cards produce output, so they keep
+  // their slot — but are never rewritten either.
+  const originalBody = keptProgramme(tidied, spanStart, spanEnd, fastSpeed, false);
+  const rewriteableProg = keptProgramme(tidied, spanStart, spanEnd, fastSpeed, true);
+  const preservedProg = Math.max(0, originalBody - rewriteableProg);
+
+  const emptyReport = (limited: number): FairUseReport => ({
+    originalBody,
+    limitedBody: limited,
+    keptBuckets: 0,
+    totalBuckets: 0,
+    saved: Math.max(0, originalBody - limited),
+    preservedCards: preservedProg,
+  });
+
+  if (originalBody <= opts.maxBodySec + 0.01 || rewriteableProg <= 0.01) {
+    return { segments, report: emptyReport(originalBody) };
   }
 
-  speech.sort((a, b) => a.start - b.start);
-  const buckets = buildBuckets(spanStart, spanEnd, opts.bucketSec, speech);
-  const targetBuckets = Math.ceil(opts.maxBodySec / opts.bucketSec);
-  const sorted = [...buckets].sort((a, b) => b.score - a.score || a.start - b.start);
-  const selected = sorted.slice(0, targetBuckets);
+  // The rewriteable footage must shrink to whatever the preserved cards left.
+  const rewriteBudget = Math.max(0, opts.maxBodySec - preservedProg);
+  const speech = speechOf(speechOrWords, detectionRegions);
 
-  const bucketIndex = new Map<number, number>();
-  buckets.forEach((b, i) => bucketIndex.set(b.start, i));
+  // Buckets cover ONLY rewriteable footage — cards/cuts are holes in the map.
+  interface Bucket { start: number; end: number; score: number; type: Segment["type"] }
+  const buckets: Bucket[] = [];
+  for (const s of rewriteable) {
+    const ss = Math.max(s.start, spanStart);
+    const se = Math.min(s.end, spanEnd);
+    for (let t = ss; t < se - 0.01; t += opts.bucketSec) {
+      const bEnd = Math.min(t + opts.bucketSec, se);
+      buckets.push({
+        start: t,
+        end: bEnd,
+        score: speech.length ? overlapScore(speech, t, bEnd) : 0,
+        type: s.type,
+      });
+    }
+  }
+  if (!buckets.length) {
+    return { segments, report: emptyReport(originalBody) };
+  }
+
+  const progPerBucket = rewriteableProg / buckets.length;
+  const targetBuckets = Math.max(
+    0,
+    Math.min(buckets.length, Math.round(rewriteBudget / Math.max(1e-6, progPerBucket)))
+  );
+
   const keepSet = new Set<number>();
-  const padBuckets = Math.ceil(opts.keepPad / opts.bucketSec);
-  for (const b of selected) {
-    const idx = bucketIndex.get(b.start)!;
-    for (let d = -padBuckets; d <= padBuckets; d++) {
-      const ni = idx + d;
-      if (ni >= 0 && ni < buckets.length) keepSet.add(ni);
-    }
-  }
-  let keepIndices = Array.from(keepSet).sort((a, b) => a - b);
-  if (keepIndices.length > targetBuckets) {
-    const scored = keepIndices.map((i) => ({ i, score: buckets[i].score, start: buckets[i].start }));
-    scored.sort((a, b) => b.score - a.score || a.start - b.start);
-    const trimmed = scored.slice(0, targetBuckets).map((s) => s.i).sort((a, b) => a - b);
-    keepIndices = trimmed;
-  }
-
-  const keepMask = new Set(keepIndices);
-  const rawKept: Region[] = [];
-  let cur: Region | null = null;
-  for (let i = 0; i < buckets.length; i++) {
-    if (!keepMask.has(i)) {
-      if (cur) {
-        rawKept.push(cur);
-        cur = null;
+  if (targetBuckets > 0) {
+    // No speech info: keep chronologically (first N). Otherwise keep densest.
+    const ranked = buckets
+      .map((b, i) => ({ i, score: b.score, start: b.start }))
+      .sort((a, b) => (speech.length ? b.score - a.score || a.start - b.start : a.start - b.start));
+    const selected = ranked.slice(0, targetBuckets);
+    const padBuckets = Math.ceil(opts.keepPad / opts.bucketSec);
+    // Context padding must not leak across preserved cards/cuts: only pad
+    // into buckets adjacent in time (gap <= ~1 bucket).
+    for (const sel of selected) {
+      keepSet.add(sel.i);
+      for (let d = 1; d <= padBuckets; d++) {
+        for (const ni of [sel.i - d, sel.i + d]) {
+          if (ni < 0 || ni >= buckets.length || keepSet.has(ni)) continue;
+          const a = buckets[sel.i];
+          const b = buckets[ni];
+          const gap =
+            ni > sel.i
+              ? Math.max(0, b.start - a.end)
+              : Math.max(0, a.start - b.end);
+          if (gap < opts.bucketSec * 1.5 + 0.05) keepSet.add(ni);
+        }
       }
-      continue;
     }
-    const b = buckets[i];
-    if (!cur) cur = { start: b.start, end: b.end };
-    else if (Math.abs(cur.end - b.start) < 0.02) cur.end = b.end;
-    else {
-      rawKept.push(cur);
-      cur = { start: b.start, end: b.end };
+    if (keepSet.size > targetBuckets) {
+      const scored = [...keepSet].map((i) => ({ i, score: buckets[i].score, start: buckets[i].start }));
+      scored.sort((a, b) => (speech.length ? b.score - a.score || a.start - b.start : a.start - b.start));
+      const trimmed = new Set(scored.slice(0, targetBuckets).map((s) => s.i));
+      keepSet.clear();
+      for (const i of trimmed) keepSet.add(i);
     }
   }
-  if (cur) rawKept.push(cur);
 
-  // Insert breaker cards inside long kept intervals every maxSpeech
-  const maxSpeech = (opts as any).maxSpeech ?? 30;
-  const breakerDur = (opts as any).breakerDuration ?? 3;
-  const breakerAction = (opts as any).breakerAction ?? "card";
-  const keptIntervals: Region[] = [];
+  // Merge kept buckets into intervals (only across adjacent buckets).
+  const keepIndices = [...keepSet].sort((a, b) => a - b);
+  const keptIntervals: { start: number; end: number; type: Segment["type"] }[] = [];
+  for (const i of keepIndices) {
+    const b = buckets[i];
+    const last = keptIntervals[keptIntervals.length - 1];
+    if (last && Math.abs(last.end - b.start) < 0.05 && last.type === b.type) last.end = b.end;
+    else keptIntervals.push({ start: b.start, end: b.end, type: b.type });
+  }
+
+  // Breaker cards inside long kept intervals (Content ID disruption).
+  // maxSpeech <= 1 (slider "off") disables them entirely.
+  const maxSpeech = opts.maxSpeech ?? 30;
+  const breakerDur = opts.breakerDuration ?? 3;
+  const breakerAction = opts.breakerAction ?? "card";
+  const breakerVariant = opts.breakerVariant ?? "short";
+  const keptFinal: { start: number; end: number; type: Segment["type"] }[] = [];
   const breakerIntervals: Region[] = [];
   if (maxSpeech > 1 && breakerDur > 0) {
-    for (const r of rawKept) {
+    for (const r of keptIntervals) {
       let c = r.start;
       while (c < r.end - 0.01) {
         const bodyEnd = Math.min(r.end, c + maxSpeech);
-        keptIntervals.push({ start: c, end: bodyEnd });
+        keptFinal.push({ start: c, end: bodyEnd, type: r.type });
         c = bodyEnd;
         if (c < r.end - 0.01) {
           const brEnd = Math.min(r.end, c + breakerDur);
@@ -209,13 +241,24 @@ export function buildFairUseLimit(
       }
     }
   } else {
-    keptIntervals.push(...rawKept);
+    keptFinal.push(...keptIntervals);
   }
 
+  const emitRemoved = (from: number, to: number): Segment[] => {
+    if (to - from <= 0.02) return [];
+    if (opts.removedAction === "card" && to - from > opts.cardDuration) {
+      return [
+        { id: uid(), type: "card", start: from, end: from + opts.cardDuration },
+        { id: uid(), type: "cut", start: from + opts.cardDuration, end: to },
+      ];
+    }
+    return [{ id: uid(), type: opts.removedAction, start: from, end: to }];
+  };
+
   const out: Segment[] = [];
-  for (const s of tidy(segments)) {
-    if (!rewriteTypes.has(s.type)) {
-      out.push(s);
+  for (const s of tidied) {
+    if (!REWRITE.has(s.type)) {
+      out.push(s); // intro/outro/card/cut: preserved byte-for-byte
       continue;
     }
     if (s.end <= spanStart || s.start >= spanEnd) {
@@ -224,55 +267,50 @@ export function buildFairUseLimit(
     }
     const ss = Math.max(s.start, spanStart);
     const se = Math.min(s.end, spanEnd);
-    // Collect overlapping kept + breaker pieces
-    const pieces: { start: number; end: number; isBreaker: boolean }[] = [];
-    for (const k of keptIntervals) {
+    const pieces: { start: number; end: number; isBreaker: boolean; type: Segment["type"] }[] = [];
+    for (const k of keptFinal) {
       if (k.end <= ss + 0.01 || k.start >= se - 0.01) continue;
-      pieces.push({ start: Math.max(k.start, ss), end: Math.min(k.end, se), isBreaker: false });
+      pieces.push({ start: Math.max(k.start, ss), end: Math.min(k.end, se), isBreaker: false, type: k.type });
     }
     for (const b of breakerIntervals) {
       if (b.end <= ss + 0.01 || b.start >= se - 0.01) continue;
-      pieces.push({ start: Math.max(b.start, ss), end: Math.min(b.end, se), isBreaker: true });
+      pieces.push({ start: Math.max(b.start, ss), end: Math.min(b.end, se), isBreaker: true, type: "card" });
     }
     pieces.sort((a, b) => a.start - b.start);
 
     let cursor = ss;
     for (const p of pieces) {
-      if (p.start - cursor > 0.02) {
-        if (opts.removedAction === "card" && p.start - cursor > opts.cardDuration) {
-          out.push({ id: uid(), type: "card", start: cursor, end: cursor + opts.cardDuration });
-          out.push({ id: uid(), type: "cut", start: cursor + opts.cardDuration, end: p.start });
-        } else {
-          out.push({ id: uid(), type: opts.removedAction, start: cursor, end: p.start });
-        }
-      }
+      if (p.start - cursor > 0.02) out.push(...emitRemoved(cursor, p.start));
       if (p.isBreaker) {
-        out.push({ id: uid(), type: breakerAction as any, start: p.start, end: p.end });
+        out.push({
+          id: uid(),
+          type: breakerAction as Segment["type"],
+          start: p.start,
+          end: p.end,
+          ...(breakerAction === "card" && breakerVariant === "short"
+            ? { card: { variant: "short" as const } }
+            : {}),
+        });
       } else {
-        out.push({ id: uid(), type: "body", start: p.start, end: p.end });
+        // kept footage keeps its original type (a muted stretch stays muted…)
+        out.push({ id: uid(), type: p.type, start: p.start, end: p.end });
       }
       cursor = Math.max(cursor, p.end);
     }
-    if (se - cursor > 0.02) {
-      if (opts.removedAction === "card" && se - cursor > opts.cardDuration) {
-        out.push({ id: uid(), type: "card", start: cursor, end: cursor + opts.cardDuration });
-        out.push({ id: uid(), type: "cut", start: cursor + opts.cardDuration, end: se });
-      } else {
-        out.push({ id: uid(), type: opts.removedAction, start: cursor, end: se });
-      }
-    }
+    if (se - cursor > 0.02) out.push(...emitRemoved(cursor, se));
   }
 
   const final = tidy(out).filter((s) => s.end - s.start > 0.08 && s.end <= duration + 0.05);
-  const limitedBody = keptIntervals.reduce((a, r) => a + (r.end - r.start), 0);
+  const limitedBody = keptProgramme(final, spanStart, spanEnd, fastSpeed, false);
   return {
     segments: final,
     report: {
-      originalBody: bodyDuration,
+      originalBody,
       limitedBody,
       keptBuckets: keepIndices.length,
       totalBuckets: buckets.length,
-      saved: bodyDuration - limitedBody,
+      saved: Math.max(0, originalBody - limitedBody),
+      preservedCards: preservedProg,
     },
   };
 }

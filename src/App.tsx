@@ -29,6 +29,7 @@ import { buildEnvelope, detectSpeech, type Detection, type Envelope } from "./li
 import {
   buildPassthroughScene,
   buildScene,
+  cardImageEpoch,
   pickRecorderMime,
   renderScene,
   sourceHalves,
@@ -178,6 +179,7 @@ export default function App() {
     cloak: null as VideoCloak | null,
     retouch: null as Retouch | null,
     face: false,
+    img: -1,
   });
   /** when the proxy transcode made its first measurable progress */
   const proxyStartRef = useRef(0);
@@ -213,6 +215,7 @@ export default function App() {
   const [partTarget, setPartTarget] = useState(0);
   /** Patreon master: also publish content-only + mic-only audio tracks */
   const [stems, setStems] = useState(true);
+  const [audioFadeMs, setAudioFadeMs] = useState(80);
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<{ url: string; size: number } | null>(null);
@@ -858,12 +861,14 @@ export default function App() {
       const timeChanged = Math.abs(v.currentTime - lastDrawRef.current.t) > 1e-4;
       // reference compare: every edit produces a fresh object, so a paused
       // edit (split / drag / undo / polish / project load) always repaints
+      const imgEpoch = cardImageEpoch();
       const editChanged =
         segs !== lastDrawRef.current.segs ||
         lay !== lastDrawRef.current.layout ||
         videoCloakRef.current !== lastDrawRef.current.cloak ||
         retouchRef.current !== lastDrawRef.current.retouch ||
-        showFaceBoxRef.current !== lastDrawRef.current.face;
+        showFaceBoxRef.current !== lastDrawRef.current.face ||
+        imgEpoch !== lastDrawRef.current.img;
       const busy = exportingRef.current || scanningRef.current;
       const throttled =
         (continuous || busy) && !exportingRef.current && !scanningRef.current &&
@@ -877,6 +882,7 @@ export default function App() {
         lastDrawRef.current.cloak = videoCloakRef.current;
         lastDrawRef.current.retouch = retouchRef.current;
         lastDrawRef.current.face = showFaceBoxRef.current;
+        lastDrawRef.current.img = imgEpoch;
 
         if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
         const scratch = scratchRef.current;
@@ -914,9 +920,11 @@ export default function App() {
               halves.full,
               lay.fastSpeed,
               videoCloakRef.current,
-              // the card covers the content rect this file was composed with,
-              // so the camera corner stays visible
-              lay.content
+              // the card covers the content rect this file was composed with…
+              lay.content,
+              // …and the camera corner is restored on top of it, so the card
+              // can never bury the camera even when the rects overlap
+              lay.cam
             )
           : buildScene(lay, segs, v.currentTime, halves);
         const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
@@ -1382,6 +1390,7 @@ export default function App() {
         height: passthrough ? 0 : res === 1080 ? 1080 : 720,
         partTarget,
         stems: passthrough ? false : stems,
+        audioFadeMs,
       });
       setRemoteJob(job);
       setRightTab("export");
@@ -1389,7 +1398,7 @@ export default function App() {
     } catch (e) {
       setRemoteError(e instanceof Error ? e.message : String(e));
     }
-  }, [duration, fileName, fps, res, remoteJob?.state, partTarget, stems]);
+  }, [duration, fileName, fps, res, remoteJob?.state, partTarget, stems, audioFadeMs]);
 
   const cancelRemoteExport = useCallback(async () => {
     const client = remoteRef.current;
@@ -1682,7 +1691,8 @@ export default function App() {
       fairUseOpts,
       speech as any,
       span,
-      detection?.regions ?? null
+      detection?.regions ?? null,
+      layoutRef.current.fastSpeed
     );
     withTxn(next);
     setSelectedId(null);
@@ -1786,7 +1796,7 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 3,
+    version: 4,
     savedAt: new Date().toISOString(),
     sourceFile: fileName,
     sourceDuration: duration,
@@ -2355,6 +2365,8 @@ export default function App() {
                 trError={trError}
                 onApplyTranscriptCut={applyTranscriptCut}
                 bodySpan={bodySpan}
+                segments={segments}
+                fastSpeed={layout.fastSpeed}
                 fairUseOpts={fairUseOpts}
                 setFairUseOpts={setFairUseOptsH}
                 onApplyFairUse={applyFairUseLimit}
@@ -2770,6 +2782,8 @@ export default function App() {
                 setPartTarget={setPartTarget}
                 stems={stems}
                 setStems={setStems}
+                audioFadeMs={audioFadeMs}
+                setAudioFadeMs={setAudioFadeMs}
                 remote={
                   isRemote
                     ? {

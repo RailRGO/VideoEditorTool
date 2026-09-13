@@ -931,6 +931,8 @@ class App:
                 v = c.get(k)
                 if isinstance(v, str) and v.strip():
                     out[k] = v.strip()
+            if str(c.get("variant") or "").strip().lower() == "short":
+                out["variant"] = "short"
             return out or None
 
         raw_segs = body.get("segments") or []
@@ -943,6 +945,8 @@ class App:
         ]
         layout_d = body.get("layout") or {}
         fast = float(layout_d.get("fastSpeed", 4.0) or 4.0)
+        _fade_ms = body.get("audioFadeMs", 80)
+        audio_fade_s = 0.08 if _fade_ms is None else max(0.0, float(_fade_ms) / 1000.0)
 
         # optional knobs from the Export panel
         try:
@@ -1020,6 +1024,7 @@ class App:
                     or int(body.get("height", 0) or 0) >= 1080 else 1280,
                     webm=bool(body.get("webm", False)),
                     stems=want_stems, part_target=part_target,
+                    audio_fade_s=audio_fade_s,
                     stall_min=stall_min, budget_min=budget_min,
                     progress_cb=prog, log=log, resume_body=dict(body),
                     cancel_check=lambda: self.cancel_requested)

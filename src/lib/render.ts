@@ -31,8 +31,10 @@ export interface Scene {
   speed: number;
   /** rect the placeholder card covers — layout.content unless overridden */
   cardRect?: Rect;
+  /** camera corner in the source frame — restored on top of YouTube cards */
+  camRect?: Rect;
   /** per-segment card text; empty fields fall back to layout.card */
-  cardText?: { title?: string; sub?: string; accent?: string };
+  cardText?: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" };
   /** anti-fingerprint frame treatment (YouTube passthrough only) */
   cloak?: VideoCloak | null;
 }
@@ -151,7 +153,14 @@ export function buildPassthroughScene(
    * when it made that file — a full-frame card also buries the camera
    * corner, which is the only thing viewers came for.
    */
-  cardRect?: Rect
+  cardRect?: Rect,
+  /**
+   * Where the camera corner sits in the finished file. The card pixels are
+   * painted first and the camera region is then restored on top, so the card
+   * covers 100% of the content yet can never touch the camera — whatever the
+   * two rects do (they overlap by a hair in the default layout).
+   */
+  camRect?: Rect
 ): Scene {
   const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
   const type = active?.type ?? "body";
@@ -171,6 +180,7 @@ export function buildPassthroughScene(
       mode: "card",
       speed: 1,
       cardRect: cardRect ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
+      camRect,
       cardText: active?.card,
       cloak: c,
     };
@@ -259,13 +269,40 @@ export function drawInto(
   ctx.restore();
 }
 
+/** Custom card backgrounds, decoded once and shared by every draw. */
+const cardImgCache = new Map<string, { img: HTMLImageElement; ready: boolean }>();
+let cardImgEpoch = 0;
+/** Bumped whenever a card image finishes loading — the preview loop repaints. */
+export function cardImageEpoch(): number {
+  return cardImgEpoch;
+}
+function getCardImage(url: string): HTMLImageElement | null {
+  let e = cardImgCache.get(url);
+  if (!e) {
+    const img = new Image();
+    e = { img, ready: false };
+    cardImgCache.set(url, e);
+    img.onload = () => {
+      const cur = cardImgCache.get(url);
+      if (cur) cur.ready = true;
+      cardImgEpoch++;
+    };
+    img.onerror = () => {
+      cardImgCache.delete(url);
+      cardImgEpoch++;
+    };
+    img.src = url;
+  }
+  return e.ready && e.img.naturalWidth > 0 ? e.img : null;
+}
+
 function drawCard(
   ctx: CanvasRenderingContext2D,
   layout: LayoutState,
   W: number,
   H: number,
   rect?: Rect,
-  cardText?: { title?: string; sub?: string; accent?: string }
+  cardText?: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" }
 ) {
   const k = H / 1080;
   const r = rect ?? layout.content;
@@ -277,23 +314,68 @@ function drawCard(
   const x = r.x * W;
   const y = r.y * H;
   const w = r.w * W;
-  const h = r.h * H;
+  const variant = cardText?.variant ?? "full";
+  const shortH = Math.max(0.2, Math.min(1, layout.card.shortHeight ?? 0.62));
+  // short cards anchor to the top of the content — the bottom (subtitles) stays visible
+  const h = (variant === "short" ? r.h * shortH : r.h) * H;
+  // background opacity — the content ghosts through, the text stays solid
+  const opacity = Math.max(0.05, Math.min(1, layout.card.opacity ?? 0.9));
   // Use the same shape/radius as the content layer so the card fully covers it
   // (old fixed 28px radius left tiny gaps in the corners)
   const contentRadius = layout.contentStyle?.radius ?? 10;
   const contentShape = layout.contentStyle?.shape ?? "rounded";
   const radius = contentShape === "rect" ? 0 : Math.min(contentRadius * k, Math.min(w, h) / 2);
 
+  // Custom background image (cover-fit, clipped to the card shape). While it
+  // is still decoding we fall through to the generated gradient, so the card
+  // is never blank.
+  const imgUrl = (layout.card.image ?? "").trim();
+  const showText = layout.card.showText !== false;
+  const bgImg = imgUrl ? getCardImage(imgUrl) : null;
+
   ctx.save();
   ctx.filter = "none";
   // Match content layer shape so card fully covers content (no corner gaps)
   shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x, y, w, h, radius);
   ctx.clip();
-  const g = ctx.createLinearGradient(x, y, x, y + h);
-  g.addColorStop(0, "rgba(11,15,26,0.94)");
-  g.addColorStop(1, "rgba(4,6,12,0.96)");
-  ctx.fillStyle = g;
-  ctx.fillRect(x, y, w, h);
+  // background only — the text and ring below stay fully opaque
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  if (bgImg) {
+    const iw = bgImg.naturalWidth;
+    const ih = bgImg.naturalHeight;
+    const s = Math.max(w / iw, h / ih);
+    const dw = iw * s;
+    const dh = ih * s;
+    try {
+      ctx.drawImage(bgImg, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    } catch {
+      /* fall through to the gradient below on a bad frame */
+    }
+    if (showText) {
+      // gentle dim so the headline stays readable on any photo
+      ctx.fillStyle = "rgba(2,4,10,0.45)";
+      ctx.fillRect(x, y, w, h);
+    }
+  } else {
+    const g = ctx.createLinearGradient(x, y, x, y + h);
+    g.addColorStop(0, "rgba(11,15,26,0.94)");
+    g.addColorStop(1, "rgba(4,6,12,0.96)");
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y, w, h);
+  }
+  ctx.restore(); // back to full alpha for text + ring
+
+  if (bgImg && !showText) {
+    // photo-only card: just the accent ring, no words
+    ctx.strokeStyle = accent;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 2 * k;
+    shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x + 1, y + 1, w - 2, h - 2, radius);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
 
   // accent bar
   ctx.fillStyle = accent;
@@ -396,8 +478,9 @@ function getNoiseTile(): HTMLCanvasElement {
  * brightness/grain/flipContent affect only the content area, leaving the
  * camera corner untouched. That fixes "reaction cuts my camera / black lines":
  * the camera stays full quality, only the watched video gets disguised.
- * Full-frame flip (flip) still flips everything; content flip (flipContent)
- * flips only the content rect.
+ * Mirroring is always content-only (`flip` is a legacy alias of flipContent):
+ * the camera corner and the card text stay readable. The ffmpeg export does
+ * the same (crop + hflip + paste back), so preview and render agree.
  */
 function drawCloakedFrame(
   ctx: CanvasRenderingContext2D,
@@ -446,16 +529,14 @@ function drawCloakedFrame(
       ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
       ctx.translate(-W / 2, -H / 2);
     }
-    if (c.flip) {
-      ctx.translate(W, 0);
-      ctx.scale(-1, 1);
-    }
     const f = buildFilters();
     ctx.filter = f.length ? f.join(" ") : "none";
     try {
       ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);
     } catch {}
     ctx.filter = "none";
+    // legacy path mirrors the content rect too — never the whole frame
+    if (c.flipContent || c.flip) mirrorContentRect(ctx, W, H, cr);
 
     if (c.grain > 0.5) {
       ctx.save();
@@ -493,16 +574,11 @@ function drawCloakedFrame(
   }
 
   // Content-only path (default): camera stays untouched, content gets disguised
-  // 1) Base full frame (possibly full-flipped, no other filters)
-  ctx.save();
-  if (c.flip) {
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-  }
+  // 1) Base full frame, unflipped (the full-frame mirror goes on the
+  // finished frame at the end of renderScene, like the ffmpeg export)
   try {
     ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, W, H);
   } catch {}
-  ctx.restore();
 
   // 2) Content area cloaked
   const cx = cr.x * W;
@@ -546,15 +622,13 @@ function drawCloakedFrame(
     ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
   }
 
-  // Handle full flip for content position: if full flip is on, content rect is mirrored
-  let drawX = cx;
-  let drawY = cy;
-  if (c.flip) {
-    drawX = W - cx - cw;
-  }
+  // The content draws at its own rect — the full-frame mirror (flip) is
+  // applied to the finished frame at the end of renderScene, never here.
+  const drawX = cx;
+  const drawY = cy;
 
-  // Content flip (mirror only content)
-  if (c.flipContent) {
+  // Content mirror (`flip` is a legacy alias — all mirroring is content-only)
+  if (c.flipContent || c.flip) {
     ctx.translate(drawX * 2 + cw, 0);
     ctx.scale(-1, 1);
   }
@@ -581,11 +655,6 @@ function drawCloakedFrame(
   ctx.restore();
 
   // 3) Full-frame overlays (bars, border, vignette) — always on top, not content-only
-  ctx.save();
-  if (c.flip) {
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-  }
   if (c.vignette > 0.5) {
     const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.36, W / 2, H / 2, Math.max(W, H) * 0.72);
     g.addColorStop(0, "rgba(0,0,0,0)");
@@ -605,7 +674,6 @@ function drawCloakedFrame(
     const o = ctx.lineWidth / 2;
     ctx.strokeRect(o, o, W - ctx.lineWidth, H - ctx.lineWidth);
   }
-  ctx.restore();
 }
 
 /**
@@ -613,6 +681,39 @@ function drawCloakedFrame(
  * scratch canvas — blurring a small bitmap and scaling it back up is an order of
  * magnitude cheaper than blurring the full frame every tick.
  */
+/** Mirror just the content rect in place (legacy cloak path — the
+ * content-only path mirrors while drawing; the ffmpeg export crops the
+ * rect, hflips it and pastes it back). */
+let mirrorScratch: HTMLCanvasElement | null = null;
+function mirrorContentRect(ctx: CanvasRenderingContext2D, W: number, H: number, cr: Rect) {
+  const cx = Math.round(cr.x * W);
+  const cy = Math.round(cr.y * H);
+  const cw = Math.round(cr.w * W);
+  const ch = Math.round(cr.h * H);
+  if (cw < 2 || ch < 2) return;
+  if (!mirrorScratch) mirrorScratch = document.createElement("canvas");
+  if (mirrorScratch.width !== cw || mirrorScratch.height !== ch) {
+    mirrorScratch.width = cw;
+    mirrorScratch.height = ch;
+  }
+  const tctx = mirrorScratch.getContext("2d");
+  if (!tctx) return;
+  tctx.save();
+  tctx.filter = "none";
+  tctx.globalAlpha = 1;
+  tctx.globalCompositeOperation = "source-over";
+  tctx.drawImage(ctx.canvas, cx, cy, cw, ch, 0, 0, cw, ch);
+  tctx.restore();
+  ctx.save();
+  ctx.filter = "none";
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.translate(cx * 2 + cw, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(mirrorScratch, 0, 0, cw, ch, cx, cy, cw, ch);
+  ctx.restore();
+}
+
 export function renderScene(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
@@ -655,6 +756,12 @@ export function renderScene(
       ctx.restore();
     }
   }
+
+  // Patreon card: the placeholder goes down FIRST so the camera layer paints
+  // over it — the card then covers the content 100% yet can never touch the
+  // camera, even when the two rects overlap (they do, by a hair, by default).
+  const cardFirst = scene.mode === "card" && scene.bg != null;
+  if (cardFirst) drawCard(ctx, layout, W, H, scene.cardRect, scene.cardText);
 
   // radius / border are authored in 1080p pixels, scale them for this canvas
   const k = H / 1080;
@@ -706,8 +813,39 @@ export function renderScene(
     }
   }
 
-  if (scene.mode === "card")
+  if (scene.mode === "card" && !cardFirst) {
+    // YouTube card: the source is one flat composited frame, so there is no
+    // camera layer to paint over the card — snapshot the camera corner first
+    // (post-cloak pixels) and restore it after the card. Same guarantee as
+    // the Patreon path above: full content cover, camera never touched.
+    const cr = scene.camRect;
+    let snap: ImageData | null = null;
+    let sx = 0;
+    let sy = 0;
+    let sw = 0;
+    let sh = 0;
+    if (cr && cr.w > 0.001 && cr.h > 0.001) {
+      sx = Math.max(0, Math.min(W - 1, Math.round(cr.x * W)));
+      sy = Math.max(0, Math.min(H - 1, Math.round(cr.y * H)));
+      sw = Math.max(0, Math.min(W - sx, Math.round(cr.w * W)));
+      sh = Math.max(0, Math.min(H - sy, Math.round(cr.h * H)));
+      if (sw > 1 && sh > 1) {
+        try {
+          snap = ctx.getImageData(sx, sy, sw, sh);
+        } catch {
+          snap = null;
+        }
+      }
+    }
     drawCard(ctx, layout, W, H, scene.cardRect, scene.cardText);
+    if (snap) {
+      try {
+        ctx.putImageData(snap, sx, sy);
+      } catch {
+        /* canvas tainted or detached — the card stays, camera covered */
+      }
+    }
+  }
   if (scene.mode === "lead") drawLeadBlock(ctx, layout, W, H);
   if (scene.mode === "fast") drawSpeedBadge(ctx, scene.speed, W, H);
   ctx.restore();

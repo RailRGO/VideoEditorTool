@@ -41,7 +41,10 @@ export function tidy(segs: Segment[]): Segment[] {
     .filter((s) => s.end - s.start > 0.02)
     .sort((a, b) => a.start - b.start)) {
     const prev = out[out.length - 1];
-    if (prev && prev.type === s.type && Math.abs(prev.end - s.start) < 0.02) {
+    // full and short cards cover different rects — never merge them
+    const sameVariant =
+      s.type !== "card" || (prev?.card?.variant ?? "full") === (s.card?.variant ?? "full");
+    if (prev && prev.type === s.type && Math.abs(prev.end - s.start) < 0.02 && sameVariant) {
       prev.end = Math.max(prev.end, s.end);
     } else {
       out.push({ ...s });

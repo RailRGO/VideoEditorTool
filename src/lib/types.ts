@@ -19,7 +19,13 @@ export interface Segment {
   start: number;
   end: number;
   /** per-card override — empty fields inherit the global card (layout.card) */
-  card?: { title?: string; sub?: string; accent?: string };
+  card?: {
+    title?: string;
+    sub?: string;
+    accent?: string;
+    /** full = whole content rect, short = top only so subtitles stay visible */
+    variant?: "full" | "short";
+  };
 }
 
 export interface Claim {
@@ -109,7 +115,24 @@ export interface LayoutState {
   fastGainDb: number;
   /** pitch rises with speed (classic fast-forward sound) instead of being preserved */
   chipmunk: boolean;
-  card: { title: string; sub: string; accent: string };
+  card: CardStyle;
+}
+
+/** What a CARD segment shows over the content area. By default a generated
+ * gradient card (title/sub/accent); optionally a custom image (data URL or
+ * http(s) URL) with the text drawn on top of it. */
+export interface CardStyle {
+  title: string;
+  sub: string;
+  accent: string;
+  /** custom card background — empty = the generated gradient card */
+  image?: string;
+  /** draw the title/sub/accent bar over the custom image (default true) */
+  showText?: boolean;
+  /** short-card height as a fraction of the content height (default 0.62) */
+  shortHeight?: number;
+  /** card background opacity 0..1 (default 0.9) — the content ghosts through */
+  opacity?: number;
 }
 
 export interface Compressor {
@@ -342,6 +365,10 @@ export const defaultLayout: LayoutState = {
     title: "Full uncut reaction on Patreon",
     sub: "link in the description",
     accent: "#e879f9",
+    image: "",
+    showText: true,
+    shortHeight: 0.62,
+    opacity: 0.9,
   },
 };
 
@@ -395,7 +422,7 @@ export interface AudioCloak {
 }
 
 export const defaultAudioCloak: AudioCloak = {
-  on: true,
+  on: false,
   pitch: 0.5,
   chorus: 25,
   reverb: 18,
@@ -432,7 +459,8 @@ export interface VideoCloak {
   grain: number;
   /** edge darkening 0..100 */
   vignette: number;
-  /** horizontal mirror — strongest single Content ID evasion (full frame) */
+  /** legacy whole-frame mirror — behaves exactly like flipContent now.
+   * All mirroring is content-only: the camera and the card text stay readable. */
   flip: boolean;
   /** mirror only the content area — keeps camera readable */
   flipContent: boolean;
@@ -494,6 +522,8 @@ export interface TranscriptCutOptions {
   breakerDuration: number;
   /** what the breaker does: card covers content, mute silences content audio */
   breakerAction: "card" | "mute";
+  /** breaker card size: short covers the top only (subs stay visible) */
+  breakerVariant: "full" | "short";
 }
 
 export const defaultTranscriptCut: TranscriptCutOptions = {
@@ -506,6 +536,7 @@ export const defaultTranscriptCut: TranscriptCutOptions = {
   maxSpeech: 30,
   breakerDuration: 3,
   breakerAction: "card",
+  breakerVariant: "short",
 };
 
 export type LayoutPreset = {
