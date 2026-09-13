@@ -278,11 +278,16 @@ function drawCard(
   const y = r.y * H;
   const w = r.w * W;
   const h = r.h * H;
-  const radius = Math.min(28 * k, Math.min(w, h) / 2);
+  // Use the same shape/radius as the content layer so the card fully covers it
+  // (old fixed 28px radius left tiny gaps in the corners)
+  const contentRadius = layout.contentStyle?.radius ?? 10;
+  const contentShape = layout.contentStyle?.shape ?? "rounded";
+  const radius = contentShape === "rect" ? 0 : Math.min(contentRadius * k, Math.min(w, h) / 2);
 
   ctx.save();
   ctx.filter = "none";
-  shapePath(ctx, "rounded", x, y, w, h, radius);
+  // Match content layer shape so card fully covers content (no corner gaps)
+  shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x, y, w, h, radius);
   ctx.clip();
   const g = ctx.createLinearGradient(x, y, x, y + h);
   g.addColorStop(0, "rgba(11,15,26,0.94)");
@@ -308,7 +313,7 @@ function drawCard(
   ctx.strokeStyle = accent;
   ctx.globalAlpha = 0.5;
   ctx.lineWidth = 2 * k;
-  shapePath(ctx, "rounded", x + 1, y + 1, w - 2, h - 2, radius);
+  shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x + 1, y + 1, w - 2, h - 2, radius);
   ctx.stroke();
   ctx.restore();
 }
@@ -386,6 +391,13 @@ function getNoiseTile(): HTMLCanvasElement {
 /**
  * Full-frame draw with the anti-fingerprint treatment: slight punch-in,
  * colour shift, animated grain, vignette, cover bars and an optional frame.
+ *
+ * When contentOnly=true (default), zoom/blur/rotate/hue/saturate/contrast/
+ * brightness/grain/flipContent affect only the content area, leaving the
+ * camera corner untouched. That fixes "reaction cuts my camera / black lines":
+ * the camera stays full quality, only the watched video gets disguised.
+ * Full-frame flip (flip) still flips everything; content flip (flipContent)
+ * flips only the content rect.
  */
 function drawCloakedFrame(
   ctx: CanvasRenderingContext2D,
@@ -393,48 +405,165 @@ function drawCloakedFrame(
   src: SrcRect,
   W: number,
   H: number,
-  c: VideoCloak
+  c: VideoCloak,
+  contentRect?: Rect,
+  layout?: LayoutState
 ) {
   const k = H / 1080;
-  // cover the (zoomed) frame from the source rect
-  const zw = W * c.zoom;
-  const zh = H * c.zoom;
-  const sAsp = src.w / Math.max(1, src.h);
-  const dAsp = zw / Math.max(1, zh);
-  let sx = src.x;
-  let sy = src.y;
-  let sw = src.w;
-  let sh = src.h;
-  if (sAsp > dAsp) {
-    sw = src.h * dAsp;
-    sx = src.x + (src.w - sw) / 2;
-  } else {
-    sh = src.w / dAsp;
-    sy = src.y + (src.h - sh) / 2;
+  const cr = contentRect ?? layout?.content ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 };
+  const contentOnly = c.contentOnly ?? true;
+
+  const buildFilters = () => {
+    const f: string[] = [];
+    if (Math.abs(c.saturate - 100) > 0.5) f.push(`saturate(${(c.saturate / 100).toFixed(3)})`);
+    if (Math.abs(c.contrast - 100) > 0.5) f.push(`contrast(${(c.contrast / 100).toFixed(3)})`);
+    if (Math.abs(c.brightness - 100) > 0.5) f.push(`brightness(${(c.brightness / 100).toFixed(3)})`);
+    if (Math.abs(c.hue) > 0.5) f.push(`hue-rotate(${c.hue.toFixed(1)}deg)`);
+    if ((c.blur ?? 0) > 0.05) f.push(`blur(${c.blur!.toFixed(2)}px)`);
+    return f;
+  };
+
+  // Full-frame legacy path when contentOnly is off and no contentFlip
+  if (!contentOnly && !c.flipContent) {
+    const zw = W * c.zoom;
+    const zh = H * c.zoom;
+    const sAsp = src.w / Math.max(1, src.h);
+    const dAsp = zw / Math.max(1, zh);
+    let sx = src.x;
+    let sy = src.y;
+    let sw = src.w;
+    let sh = src.h;
+    if (sAsp > dAsp) {
+      sw = src.h * dAsp;
+      sx = src.x + (src.w - sw) / 2;
+    } else {
+      sh = src.w / dAsp;
+      sy = src.y + (src.h - sh) / 2;
+    }
+    ctx.save();
+    if (Math.abs(c.rotate ?? 0) > 0.05) {
+      ctx.translate(W / 2, H / 2);
+      ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+      ctx.translate(-W / 2, -H / 2);
+    }
+    if (c.flip) {
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+    }
+    const f = buildFilters();
+    ctx.filter = f.length ? f.join(" ") : "none";
+    try {
+      ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);
+    } catch {}
+    ctx.filter = "none";
+
+    if (c.grain > 0.5) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+      const tile = getNoiseTile();
+      const pat = ctx.createPattern(tile, "repeat");
+      if (pat) {
+        ctx.fillStyle = pat;
+        ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+        ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+      }
+      ctx.restore();
+    }
+    if (c.vignette > 0.5) {
+      const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.36, W / 2, H / 2, Math.max(W, H) * 0.72);
+      g.addColorStop(0, "rgba(0,0,0,0)");
+      g.addColorStop(1, `rgba(0,0,0,${((c.vignette / 100) * 0.55).toFixed(3)})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (c.bars > 0.05) {
+      const bh = (H * c.bars) / 100;
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, W, Math.ceil(bh));
+      ctx.fillRect(0, H - Math.ceil(bh), W, Math.ceil(bh));
+    }
+    if (c.border > 0.5) {
+      ctx.lineWidth = Math.max(1, c.border * k);
+      ctx.strokeStyle = c.borderColor;
+      const o = ctx.lineWidth / 2;
+      ctx.strokeRect(o, o, W - ctx.lineWidth, H - ctx.lineWidth);
+    }
+    ctx.restore();
+    return;
   }
+
+  // Content-only path (default): camera stays untouched, content gets disguised
+  // 1) Base full frame (possibly full-flipped, no other filters)
   ctx.save();
-  // global transforms: rotate around center, then optional flip
-  if (Math.abs(c.rotate ?? 0) > 0.05) {
-    ctx.translate(W / 2, H / 2);
-    ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
-    ctx.translate(-W / 2, -H / 2);
-  }
   if (c.flip) {
     ctx.translate(W, 0);
     ctx.scale(-1, 1);
   }
-  const f: string[] = [];
-  if (Math.abs(c.saturate - 100) > 0.5) f.push(`saturate(${(c.saturate / 100).toFixed(3)})`);
-  if (Math.abs(c.contrast - 100) > 0.5) f.push(`contrast(${(c.contrast / 100).toFixed(3)})`);
-  if (Math.abs(c.brightness - 100) > 0.5) f.push(`brightness(${(c.brightness / 100).toFixed(3)})`);
-  if (Math.abs(c.hue) > 0.5) f.push(`hue-rotate(${c.hue.toFixed(1)}deg)`);
-  if ((c.blur ?? 0) > 0.05) f.push(`blur(${c.blur!.toFixed(2)}px)`);
+  try {
+    ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, W, H);
+  } catch {}
+  ctx.restore();
+
+  // 2) Content area cloaked
+  const cx = cr.x * W;
+  const cy = cr.y * H;
+  const cw = cr.w * W;
+  const ch = cr.h * H;
+
+  // Source content area inside the Patreon render (same normalized position)
+  const sxc0 = src.x + src.w * cr.x;
+  const syc0 = src.y + src.h * cr.y;
+  const swc0 = src.w * cr.w;
+  const shc0 = src.h * cr.h;
+
+  let csx = sxc0;
+  let csy = syc0;
+  let csw = swc0;
+  let csh = shc0;
+  if (c.zoom > 1.001) {
+    csw = swc0 / c.zoom;
+    csh = shc0 / c.zoom;
+    csx = sxc0 + (swc0 - csw) / 2;
+    csy = syc0 + (shc0 - csh) / 2;
+  }
+
+  ctx.save();
+  // Clip to content rect with same shape as content layer if available
+  if (layout?.contentStyle) {
+    const rad = (layout.contentStyle.radius ?? 10) * k;
+    shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
+    ctx.clip();
+  } else {
+    ctx.beginPath();
+    ctx.rect(cx, cy, cw, ch);
+    ctx.clip();
+  }
+
+  // Rotate around content center
+  if (Math.abs(c.rotate ?? 0) > 0.05) {
+    ctx.translate(cx + cw / 2, cy + ch / 2);
+    ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+    ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
+  }
+
+  // Handle full flip for content position: if full flip is on, content rect is mirrored
+  let drawX = cx;
+  let drawY = cy;
+  if (c.flip) {
+    drawX = W - cx - cw;
+  }
+
+  // Content flip (mirror only content)
+  if (c.flipContent) {
+    ctx.translate(drawX * 2 + cw, 0);
+    ctx.scale(-1, 1);
+  }
+
+  const f = buildFilters();
   ctx.filter = f.length ? f.join(" ") : "none";
   try {
-    ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);
-  } catch {
-    /* frame not ready yet */
-  }
+    ctx.drawImage(video, csx, csy, csw, csh, drawX, drawY, cw, ch);
+  } catch {}
   ctx.filter = "none";
 
   if (c.grain > 0.5) {
@@ -444,31 +573,32 @@ function drawCloakedFrame(
     const pat = ctx.createPattern(tile, "repeat");
     if (pat) {
       ctx.fillStyle = pat;
-      // random offset every frame so the grain crawls instead of sitting still
       ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
-      ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+      ctx.fillRect(drawX, drawY, cw + tile.width, ch + tile.height);
     }
     ctx.restore();
   }
+  ctx.restore();
 
+  // 3) Full-frame overlays (bars, border, vignette) — always on top, not content-only
+  ctx.save();
+  if (c.flip) {
+    ctx.translate(W, 0);
+    ctx.scale(-1, 1);
+  }
   if (c.vignette > 0.5) {
-    const g = ctx.createRadialGradient(
-      W / 2, H / 2, Math.min(W, H) * 0.36,
-      W / 2, H / 2, Math.max(W, H) * 0.72
-    );
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.36, W / 2, H / 2, Math.max(W, H) * 0.72);
     g.addColorStop(0, "rgba(0,0,0,0)");
     g.addColorStop(1, `rgba(0,0,0,${((c.vignette / 100) * 0.55).toFixed(3)})`);
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
   }
-
   if (c.bars > 0.05) {
     const bh = (H * c.bars) / 100;
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, W, Math.ceil(bh));
     ctx.fillRect(0, H - Math.ceil(bh), W, Math.ceil(bh));
   }
-
   if (c.border > 0.5) {
     ctx.lineWidth = Math.max(1, c.border * k);
     ctx.strokeStyle = c.borderColor;
@@ -531,7 +661,7 @@ export function renderScene(
   for (const l of scene.layers) {
     // cloaked full-frame layer (YouTube passthrough) takes its own path
     if (scene.cloak && !l.isCam) {
-      drawCloakedFrame(ctx, video, l.src, W, H, scene.cloak);
+      drawCloakedFrame(ctx, video, l.src, W, H, scene.cloak, scene.cardRect, layout);
       continue;
     }
     const style: LayerStyle =

@@ -208,7 +208,7 @@ export default function App() {
   const [rate, setRate] = useState(1);
   const [res, setRes] = useState<720 | 1080>(1080);
   const [fps, setFps] = useState<24 | 30 | 60>(30);
-  const [bitrate, setBitrate] = useState(12);
+  const [bitrate, setBitrate] = useState(8);
   /** seconds of programme per server part — 0 = automatic (short = 1 pass) */
   const [partTarget, setPartTarget] = useState(0);
   /** Patreon master: also publish content-only + mic-only audio tracks */
@@ -1376,7 +1376,7 @@ export default function App() {
         retouch: retouchRef.current,
         audioCloak: audioCloakRef.current,
         videoCloak: videoCloakRef.current,
-        crf: 18,
+        crf: 23,
         webm: false,
         fps: passthrough ? null : fps,
         height: passthrough ? 0 : res === 1080 ? 1080 : 720,
@@ -1949,6 +1949,8 @@ export default function App() {
       rec = new MediaRecorder(stream, {
         mimeType: mime || undefined,
         videoBitsPerSecond: bitrate * 1_000_000,
+        // Constrain maxrate/bufsize to avoid bloat: 8M max, 16M buf
+
         audioBitsPerSecond: 192_000,
       });
     } catch {

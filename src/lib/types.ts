@@ -406,6 +406,12 @@ export const defaultAudioCloak: AudioCloak = {
 /**
  * Frame-level changes for the YouTube cut. Applied to the full frame in
  * passthrough mode — zoom/crop, cover bars, colour and grain.
+ *
+ * contentOnly = true (default) means zoom/blur/rotate/hue/saturate/contrast/
+ * brightness/grain/flipContent affect only the content area (where the
+ * watched video lives), leaving the camera corner untouched. That fixes the
+ * "reaction cuts my camera / black lines" complaint: the camera stays full
+ * quality, only the potentially-claimed content gets disguised.
  */
 export interface VideoCloak {
   on: boolean;
@@ -426,32 +432,38 @@ export interface VideoCloak {
   grain: number;
   /** edge darkening 0..100 */
   vignette: number;
-  /** horizontal mirror — strongest single Content ID evasion */
+  /** horizontal mirror — strongest single Content ID evasion (full frame) */
   flip: boolean;
+  /** mirror only the content area — keeps camera readable */
+  flipContent: boolean;
   /** subtle blur 0..10 (px at 1080p) — breaks pixel hashes */
   blur: number;
   /** slight rotation -5..5 deg — breaks frame hash, adds black edges */
   rotate: number;
   /** playback speed tweak 0.95..1.05 — breaks audio fingerprint when combined with pitch */
   speed: number;
+  /** when true (default), zoom/blur/rotate/hue/saturate/contrast/brightness/grain/flipContent affect only the content rect */
+  contentOnly: boolean;
 }
 
 export const defaultVideoCloak: VideoCloak = {
   on: true,
-  zoom: 1.03,
-  bars: 3,
+  zoom: 1.0,
+  bars: 0,
   border: 0,
   borderColor: "#0ea5e9",
-  saturate: 108,
-  contrast: 104,
+  saturate: 100,
+  contrast: 100,
   brightness: 100,
   hue: 0,
-  grain: 12,
-  vignette: 25,
+  grain: 0,
+  vignette: 0,
   flip: false,
+  flipContent: false,
   blur: 0,
   rotate: 0,
   speed: 1,
+  contentOnly: true,
 };
 
 export const defaultCut: CutOptions = {
@@ -476,6 +488,12 @@ export interface TranscriptCutOptions {
   pad: number;
   /** max gap between words to still count as continuous speech */
   mergeGap: number;
+  /** max continuous speech before we insert a breaker to disrupt Content ID */
+  maxSpeech: number;
+  /** breaker duration when maxSpeech exceeded */
+  breakerDuration: number;
+  /** what the breaker does: card covers content, mute silences content audio */
+  breakerAction: "card" | "mute";
 }
 
 export const defaultTranscriptCut: TranscriptCutOptions = {
@@ -485,6 +503,9 @@ export const defaultTranscriptCut: TranscriptCutOptions = {
   tinyAction: "keep",
   pad: 0.25,
   mergeGap: 0.8,
+  maxSpeech: 30,
+  breakerDuration: 3,
+  breakerAction: "card",
 };
 
 export type LayoutPreset = {

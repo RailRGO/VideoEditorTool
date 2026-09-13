@@ -250,9 +250,9 @@ def ensure_proxy(proc, width: int = 960,
     # the runtime has a GPU (paid Colab) — else the fastest x264 preset. Both
     # are far quicker than the old `veryfast` CPU encode.
     if _ffmpeg_has_encoder("h264_nvenc"):
-        vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", "-b:v", "0"]
+        vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "28", "-b:v", "0", "-maxrate", "3M", "-bufsize", "6M"]
     else:
-        vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
+        vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-maxrate", "3M", "-bufsize", "6M"]
     cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
            *audio_args, *vcodec, "-c:a", "aac", "-b:a", "96k",
            "-movflags", "+faststart", str(out)]
@@ -954,9 +954,9 @@ class App:
         except (TypeError, ValueError):
             budget_min = 0.0
         try:
-            stall_min = float(body.get("stallMin") or 15.0)
+            stall_min = float(body.get("stallMin") or 30.0)
         except (TypeError, ValueError):
-            stall_min = 15.0
+            stall_min = 30.0
         want_stems = body.get("stems")
         want_stems = None if want_stems is None else bool(want_stems)
 
@@ -1013,7 +1013,7 @@ class App:
                     video_cloak=body.get("videoCloak"),
                     card=layout_d.get("card") or body.get("card") or {},
                     fast_speed=fast, master_gain_db=master,
-                    crf=int(body.get("crf", 18)),
+                    crf=int(body.get("crf", 23)),
                     fps=body.get("fps") or None,
                     height=int(body.get("height", 0) or 0),
                     width=1920 if not int(body.get("height", 0) or 0)
@@ -1453,7 +1453,7 @@ class Handler(BaseHTTPRequestHandler):
                             "size": Path(outs["mp4"]).stat().st_size})
             elif path == "/api/render_full":
                 job = app.start_render(str(body.get("name", "youtube_final")),
-                                       int(body.get("crf", 18)),
+                                       int(body.get("crf", 23)),
                                        bool(body.get("webm", True)))
                 self._json(job)
             elif path == "/api/job/render":

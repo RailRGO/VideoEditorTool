@@ -81,6 +81,29 @@ def _run(cmd, check=True):
 def _has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
+def _backup_existing(p: Path) -> Optional[Path]:
+    """On Drive, overwriting a file can move old version to trash. Backup instead."""
+    try:
+        pp = Path(p)
+        if pp.exists() and pp.is_file():
+            # rename existing to _prev_timestamp to avoid trash
+            bak = pp.with_name(f"{pp.stem}_prev_{int(time.time())}{pp.suffix}")
+            pp.rename(bak)
+            return bak
+    except Exception:
+        pass
+    return None
+
+def _restore_backup(bak: Optional[Path], target: Path) -> None:
+    if bak and bak.exists():
+        try:
+            # if target was deleted (cancel), restore backup
+            if not target.exists():
+                bak.rename(target)
+        except Exception:
+            pass
+
+
 
 _filter_cache: Dict[str, bool] = {}
 
@@ -227,10 +250,15 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     The browser draws its vignette over the colour/grain and under the
     cover bars + frame, so the passthrough graph inserts the gradient PNG
     between these two halves.
+
+    When contentOnly is True (default), zoom/blur/eq/hue/grain/flipContent/rotate
+    are NOT applied full-frame here — they are applied only to the content rect
+    in _passthrough_graph via _content_cloak_filters. This preserves camera.
     """
     c = cfg or {}
     if not c.get("on", False):
         return [], []
+    content_only = bool(c.get("contentOnly", True))
     zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
     bars = max(0.0, min(12.0, float(c.get("bars", 0.0))))
     border = max(0.0, min(24.0, float(c.get("border", 0.0))))
@@ -241,33 +269,38 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     hue = float(c.get("hue", 0.0))
     grain = float(c.get("grain", 0.0))
     flip = bool(c.get("flip", False))
+    flip_content = bool(c.get("flipContent", False))
     blur = float(c.get("blur", 0.0))
     rotate = float(c.get("rotate", 0.0))
 
     pre: List[str] = []
-    if flip:
-        pre.append("hflip")
-    if abs(rotate) > 0.05:
-        # rotate adds black edges, keep same size, fill black
-        # ffmpeg rotate angle in radians
-        pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
-    if zoom > 1.001:
-        pre.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
-        pre.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
-        pre.append(f"scale={W}:{H}")
-    if abs(saturate - 1.0) > 0.005 or abs(contrast - 1.0) > 0.005 \
-            or abs(brightness) > 0.005:
-        pre.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
-                   f"brightness={brightness:.3f}")
-    if abs(hue) > 0.5:
-        pre.append(f"hue=h={hue:.1f}")
-    if blur > 0.05:
-        # subtle blur breaks pixel hash, keep it small
-        pre.append(f"gblur=sigma={min(3.0, blur):.2f}")
-    if grain > 0.5:
-        pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
-
     post: List[str] = []
+
+    if content_only:
+        # Full-frame part only: full flip, bars, border
+        if flip:
+            pre.append("hflip")
+        # zoom/rotate/eq/hue/blur/grain/flipContent are content-only, handled separately
+    else:
+        if flip or flip_content:
+            pre.append("hflip")
+        if abs(rotate) > 0.05:
+            pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
+        if zoom > 1.001:
+            pre.append(f"scale=iw*{zoom:.4f}:-2:flags=lanczos")
+            pre.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
+            pre.append(f"scale={W}:{H}")
+        if abs(saturate - 1.0) > 0.005 or abs(contrast - 1.0) > 0.005 \
+                or abs(brightness) > 0.005:
+            pre.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
+                       f"brightness={brightness:.3f}")
+        if abs(hue) > 0.5:
+            pre.append(f"hue=h={hue:.1f}")
+        if blur > 0.05:
+            pre.append(f"gblur=sigma={min(3.0, blur):.2f}")
+        if grain > 0.5:
+            pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+
     if bars > 0.05:
         bh = max(1, int(round(H * bars / 100.0)))
         post.append(f"drawbox=y=0:w=iw:h={bh}:c=black:t=fill")
@@ -278,6 +311,45 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
         post.append(f"drawbox=x={o}:y={o}:w=iw-{2 * o}:h=ih-{2 * o}:"
                     f"c=0x{border_color}:t={bw}")
     return pre, post
+
+
+def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
+                           content_rect: Optional[Dict[str, float]] = None) -> List[str]:
+    """Filters that apply ONLY to the content area when contentOnly=True."""
+    c = cfg or {}
+    if not c.get("on", False):
+        return []
+    if not c.get("contentOnly", True):
+        return []
+    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
+    saturate = float(c.get("saturate", 100.0)) / 100.0
+    contrast = float(c.get("contrast", 100.0)) / 100.0
+    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
+    hue = float(c.get("hue", 0.0))
+    grain = float(c.get("grain", 0.0))
+    blur = float(c.get("blur", 0.0))
+    rotate = float(c.get("rotate", 0.0))
+    flip_content = bool(c.get("flipContent", False))
+
+    f: List[str] = []
+    if flip_content:
+        f.append("hflip")
+    if abs(rotate) > 0.05:
+        f.append(f"rotate={rotate}*PI/180:fillcolor=black")
+    if zoom > 1.001:
+        f.append(f"scale=iw*{zoom:.4f}:ih*{zoom:.4f}:flags=lanczos")
+        f.append(f"crop=trunc(iw/{zoom:.4f}/2)*2:trunc(ih/{zoom:.4f}/2)*2")
+    if abs(saturate - 1.0) > 0.005 or abs(contrast - 1.0) > 0.005 \
+            or abs(brightness) > 0.005:
+        f.append(f"eq=saturation={saturate:.3f}:contrast={contrast:.3f}:"
+                 f"brightness={brightness:.3f}")
+    if abs(hue) > 0.5:
+        f.append(f"hue=h={hue:.1f}")
+    if blur > 0.05:
+        f.append(f"gblur=sigma={min(3.0, blur):.2f}")
+    if grain > 0.5:
+        f.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+    return f
 
 
 def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[str]:
@@ -478,7 +550,7 @@ class _EncoderRun:
     """
 
     def __init__(self, cmd: List[str], total: float, what: str,
-                 progress_cb=None, cancel_check=None, stall_min: float = 15.0,
+                 progress_cb=None, cancel_check=None, stall_min: float = 30.0,
                  out_path: Optional[Path] = None,
                  heartbeat: Optional[Callable[[], None]] = None):
         self.cmd = cmd
@@ -972,9 +1044,9 @@ class ReactionVideoProcessor:
                       "[0:v]crop=w=1920:h=1080:x=0:y=0[cam];"
                       "[0:v]crop=w=1920:h=1080:x=1920:y=0[content]",
                       "-map", "[cam]", "-c:v", "libx264", "-preset", "fast",
-                      "-crf", "18", str(self.cam_path),
+                      "-crf", "23", str(self.cam_path),
                       "-map", "[content]", "-c:v", "libx264", "-preset", "fast",
-                      "-crf", "18", str(self.content_path)], "input split")
+                      "-crf", "23", str(self.content_path)], "input split")
         else:
             shutil.copy(str(self.input), str(self.cam_path))
             shutil.copy(str(self.input), str(self.content_path))
@@ -986,7 +1058,7 @@ class ReactionVideoProcessor:
                          intro_mode=False,
                          layout: Optional[L.LayoutState] = None,
                          segments: Optional[List[Dict[str, Any]]] = None,
-                         crf: int = 18, fps: Optional[float] = None,
+                         crf: int = 23, fps: Optional[float] = None,
                          width: int = 1920, height: int = 1080,
                          cancel_check=None) -> str:
         """Render composited VIDEO (no audio) through the WYSIWYG compositor.
@@ -1332,6 +1404,7 @@ class ReactionVideoProcessor:
             print("ffmpeg missing — keeping silent video only.")
             return {"mp4": str(video_path)}
         out_mp4 = Path(out_mp4)
+        _backup_existing(out_mp4)
         dur = float(video_dur) if video_dur else \
             self._media_duration(str(video_path))
         cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path)]
@@ -1399,6 +1472,10 @@ class ReactionVideoProcessor:
         never desync. With two *audio_inputs* the first is the content bus
         (silenced on mute/card) and the second the mic (never silenced).
 
+        When video_cloak contentOnly=True (default), zoom/blur/eq/hue/grain/
+        flipContent/rotate affect ONLY the content rect — camera stays clean.
+        That fixes \"reaction cuts video up/down, black lines, camera cropped\".
+
         Returns (chain, warnings, extra_inputs): the card and the vignette
         gradient arrive as single-frame PNG stills the caller must add to
         the command as plain inputs (`overlay` repeats their one frame for
@@ -1419,6 +1496,28 @@ class ReactionVideoProcessor:
             return inputs.index(p) + 1      # input 0 is the source
 
         pre, post = _video_cloak_split(video_cloak, W, H)
+        content_filters = _content_cloak_filters(video_cloak, W, H, content_rect)
+        is_content_only = bool((video_cloak or {}).get("contentOnly", True)) and bool((video_cloak or {}).get("on", False))
+        # Resolve content rect in pixels
+        cr = content_rect or {}
+        try:
+            crx = float(cr.get("x", 0.294))
+            cry = float(cr.get("y", 0.289))
+            crw = float(cr.get("w", 0.7))
+            crh = float(cr.get("h", 0.7))
+        except Exception:
+            crx, cry, crw, crh = 0.294, 0.289, 0.7, 0.7
+        cx = int(round(W * crx))
+        cy = int(round(H * cry))
+        cw = int(round(W * crw))
+        ch = int(round(H * crh))
+        # clamp
+        cx = max(0, min(W - 1, cx))
+        cy = max(0, min(H - 1, cy))
+        cw = max(1, min(W - cx, cw))
+        ch = max(1, min(H - cy, ch))
+        flip_full = bool((video_cloak or {}).get("flip", False)) and bool((video_cloak or {}).get("on", False))
+
         want_vig = bool((video_cloak or {}).get("on", False)) and \
             float((video_cloak or {}).get("vignette", 0.0)) > 0.5
         vig_png: Optional[Path] = None
@@ -1434,19 +1533,51 @@ class ReactionVideoProcessor:
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
-            # effective speed = fast_speed * global_speed for fast, else global_speed
             eff_speed = float(fast_speed) * global_speed if typ == "fast" else global_speed
             if abs(eff_speed - 1.0) > 0.001:
-                vf = f"trim=start={a:.3f}:end={b:.3f}," \
-                     f"setpts=(PTS-STARTPTS)/{eff_speed:.6f}"
+                base_vf = f"trim=start={a:.3f}:end={b:.3f}," \
+                          f"setpts=(PTS-STARTPTS)/{eff_speed:.6f}"
             else:
-                vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
+                base_vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
             if pre:
-                vf += "," + ",".join(pre)
-            cur = f"vp{i}"
-            chain.append(f"[vin{i}]{vf}[{cur}]")
+                base_vf += "," + ",".join(pre)
+
+            if is_content_only and content_filters:
+                # Split trimmed frame into base and content crop
+                tmp_label = f"vtmp{i}"
+                chain.append(f"[vin{i}]{base_vf}[{tmp_label}]")
+                # base stays full frame
+                base_label = f"vbase{i}"
+                content_src_label = f"vcsrc{i}"
+                chain.append(f"[{tmp_label}]split=2[{base_label}][{content_src_label}]")
+                # content crop + filters
+                # Note: if full flip is on, base is already flipped; content crop is from flipped base,
+                # but overlay position must be mirrored. We handle x mirroring below.
+                crop_vf = f"crop={cw}:{ch}:{cx}:{cy}"
+                cf = list(content_filters)
+                # ensure final size matches content rect
+                cf_vf = ",".join([crop_vf] + cf + [f"scale={cw}:{ch}:flags=lanczos"])
+                content_filt_label = f"vcf{i}"
+                chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
+                # overlay filtered content back onto base
+                if flip_full:
+                    # when full frame is flipped, content x mirrors
+                    ov_x = W - cx - cw
+                else:
+                    ov_x = cx
+                ov_y = cy
+                cloaked_label = f"vp{i}"
+                chain.append(f"[{base_label}][{content_filt_label}]overlay=x={ov_x}:y={ov_y}:format=auto[{cloaked_label}]")
+                cur = cloaked_label
+            else:
+                cur = f"vp{i}"
+                vf = base_vf
+                if not is_content_only and content_filters:
+                    # legacy path shouldn't happen, but include
+                    pass
+                chain.append(f"[vin{i}]{vf}[{cur}]")
+
             if typ == "card":
-                # per-segment override; empty fields inherit the global card
                 png = self._card_png({**(card or {}), **(s.get("card") or {})},
                                      W, H, content=content_rect)
                 if png is not None and _ffmpeg_has_filter("overlay"):
@@ -1461,10 +1592,6 @@ class ReactionVideoProcessor:
             vouts.append(f"[v{i}]")
         chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
 
-        # The vignette gradient and the cover bars/frame are properties of
-        # the programme, not of a segment, so they run once over the joined
-        # stream — except on card spans, where the preview shows the bare
-        # card (enable=… skips exactly those spans, in programme time).
         spans: List[Tuple[float, float]] = []
         t_acc = 0.0
         for s in kept:
@@ -1476,8 +1603,6 @@ class ReactionVideoProcessor:
             t_acc += pd
         en = ""
         if spans:
-            # half-open spans: between() would also swallow the first frame
-            # of the segment that follows a card
             terms = "+".join(f"gte(t,{a:.3f})*lt(t,{b:.3f})" for a, b in spans)
             en = f":enable='1-({terms})'"
         cur = "vcat"
@@ -1494,7 +1619,6 @@ class ReactionVideoProcessor:
             cur = nxt
 
         cats: List[str] = []
-        # global speed already extracted above, reuse
         try:
             gs = global_speed
         except NameError:
@@ -1508,14 +1632,11 @@ class ReactionVideoProcessor:
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
                 af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                # combine fast_speed and global speed
                 eff = float(fast_speed) * gs if typ == "fast" else gs
                 if abs(eff - 1.0) > 0.001:
                     af += "," + ",".join(_atempo_chain(eff))
                 elif typ == "fast":
                     af += "," + ",".join(_atempo_chain(fast_speed))
-                # single mixed track: everything goes quiet. Stems: only the
-                # content bus (j == 0) — the mic keeps talking.
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
                 chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
@@ -1538,10 +1659,6 @@ class ReactionVideoProcessor:
             "aformat=channel_layouts=stereo[aout]"
         )
 
-        # trim/setpts leaves the link without a frame rate, and the muxer
-        # then guesses 25 fps — which silently drops every sixth frame of a
-        # 30 fps capture. State the rate explicitly (a no-op when it already
-        # matches, a real re-time when the caller asked for another one).
         vtail = f"[{cur}]"
         if out_fps and float(out_fps) > 0:
             chain.append(f"[{cur}]fps={float(out_fps):.6f}[vfps]")
@@ -1566,9 +1683,9 @@ class ReactionVideoProcessor:
         enc, _ = _pick_video_encoder(prefer_gpu=True)
         if enc == "h264_nvenc":
             vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
-                      "-cq", str(int(crf)), "-b:v", "0"]
+                      "-cq", str(int(crf)), "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M"]
         else:
-            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf))]
+            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)), "-maxrate", "8M", "-bufsize", "16M"]
         cmd += ["-filter_complex", ";".join(chain),
                 "-map", "[vout]", "-map", "[aout]"] + vcodec + [
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
@@ -1583,7 +1700,7 @@ class ReactionVideoProcessor:
         card: Optional[Dict[str, Any]] = None,
         fast_speed: float = 4.0,
         master_gain_db: float = 0.0,
-        crf: int = 18,
+        crf: int = 23,
         preset: str = "fast",
         fps: Optional[float] = None,
         height: int = 0,
@@ -1593,7 +1710,7 @@ class ReactionVideoProcessor:
         cancel_check=None,
         content_rect: Optional[Dict[str, float]] = None,
         stems: Optional[bool] = None,
-        stall_min: float = 15.0,
+        stall_min: float = 30.0,
     ) -> Dict[str, str]:
         """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
 
@@ -1629,6 +1746,7 @@ class ReactionVideoProcessor:
             print(f"  (cloak: {w})")
 
         out = self.out / f"{name}.mp4"
+        _backup_existing(out)
         _EncoderRun(self._passthrough_cmd(chain, out, crf, preset, extra),
                     total,
                     "passthrough render", progress_cb=progress_cb,
@@ -1718,7 +1836,7 @@ class ReactionVideoProcessor:
                   "-c:a", "pcm_s16le", str(out)], f"fit {tag or wav.name}")
         return out
 
-    def _concat_video(self, parts: List[Path], out: Path, crf: int = 18,
+    def _concat_video(self, parts: List[Path], out: Path, crf: int = 23,
                       preset: str = "fast", what: str = "concat") -> Path:
         """Join picture parts: stream-copy first, re-encode if that fails."""
         lst = out.with_name(out.stem + "_list.txt")
@@ -1738,9 +1856,9 @@ class ReactionVideoProcessor:
         enc, _ = _pick_video_encoder(prefer_gpu=True)
         if enc == "h264_nvenc":
             vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
-                      "-cq", str(int(crf)), "-b:v", "0"]
+                      "-cq", str(int(crf)), "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M"]
         else:
-            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf))]
+            vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)), "-maxrate", "8M", "-bufsize", "16M"]
         cmd += ["-filter_complex",
                 "".join(f"[{i}:v]" for i in range(n))
                 + f"concat=n={n}:v=1:a=0[v]",
@@ -1791,12 +1909,12 @@ class ReactionVideoProcessor:
                        video_cloak: Optional[Dict[str, Any]] = None,
                        card: Optional[Dict[str, Any]] = None,
                        fast_speed: float = 4.0, master_gain_db: float = 0.0,
-                       crf: int = 18, preset: str = "fast",
+                       crf: int = 23, preset: str = "fast",
                        fps: Optional[float] = None, height: int = 0,
                        width: int = 1920, webm: bool = False,
                        stems: Optional[bool] = None,
                        part_target: float = 0.0, min_part: float = 20.0,
-                       stall_min: float = 15.0, budget_min: float = 0.0,
+                       stall_min: float = 30.0, budget_min: float = 0.0,
                        progress_cb=None, cancel_check=None,
                        log: Optional[Callable[[str], None]] = None,
                        resume_body: Optional[Dict[str, Any]] = None
@@ -2448,14 +2566,11 @@ class ReactionVideoProcessor:
 
     @staticmethod
     def build_transcript_cut(segments, words, duration, opts=None, body_span=None):
-        """YouTube-style: speech stays, long silences -> card (fixed) + cut.
+        """YouTube-style: speech stays, long silences -> card + cut, plus breaker every maxSpeech.
 
-        Mirrors src/lib/transcriptCut.ts so browser and server produce the
-        same timeline. Only body/lead/mute/fast/card spans are rewritten;
-        intro/outro stay whole. body_span optionally limits the rewrite.
-        opts: {minSilence, cardDuration, minGap, tinyAction, pad, mergeGap}
+        Mirrors src/lib/transcriptCut.ts. Breaker inserts card over content for breakerDuration
+        when continuous mic speech exceeds maxSpeech, keeping voice (card silences content bus only).
         """
-        import copy
         if not words or duration <= 0:
             return segments
         o = opts or {}
@@ -2465,10 +2580,12 @@ class ReactionVideoProcessor:
         tiny_action = str(o.get("tinyAction", o.get("tiny_action", "keep")))
         pad = float(o.get("pad", 0.25))
         merge_gap = float(o.get("mergeGap", o.get("merge_gap", 0.8)))
+        max_speech = float(o.get("maxSpeech", o.get("max_speech", 30.0)))
+        breaker_dur = float(o.get("breakerDuration", o.get("breaker_duration", 3.0)))
+        breaker_action = str(o.get("breakerAction", o.get("breaker_action", "card")))
 
         speech = ReactionVideoProcessor.speech_regions_from_words(words, pad, merge_gap)
         rewrite_types = {"body", "lead", "mute", "fast", "card"}
-        # determine rewrite window
         body_segs = [s for s in (segments or []) if s.get("type") in rewrite_types]
         if body_span:
             span_start = float(body_span.get("start", 0))
@@ -2477,7 +2594,6 @@ class ReactionVideoProcessor:
             span_start = float(body_segs[0]["start"]) if body_segs else 0.0
             span_end = float(body_segs[-1]["end"]) if body_segs else float(duration)
 
-        # clip speech to window
         clipped = []
         for a, b in speech:
             a = max(a, span_start)
@@ -2485,6 +2601,23 @@ class ReactionVideoProcessor:
             if b - a > 0.02:
                 clipped.append((a, b))
         clipped.sort(key=lambda x: x[0])
+
+        # Breaker: split long speech into body + breaker card
+        breaker_regions = []
+        if max_speech > 1 and breaker_dur > 0:
+            new_clipped = []
+            for a, b in clipped:
+                cur = a
+                while cur < b - 0.01:
+                    be = min(b, cur + max_speech)
+                    new_clipped.append((cur, be))
+                    cur = be
+                    if cur < b - 0.01:
+                        br_end = min(b, cur + breaker_dur)
+                        if br_end - cur > 0.05:
+                            breaker_regions.append((cur, br_end))
+                            cur = br_end
+            clipped = new_clipped
 
         def emit_gap(gs, ge):
             dur = ge - gs
@@ -2506,37 +2639,41 @@ class ReactionVideoProcessor:
             ]
 
         out = []
-        # tidy-ish: sort and assume no overlaps in input
         segs = sorted(segments or [], key=lambda s: float(s.get("start", 0)))
         for s in segs:
             typ = str(s.get("type", "body"))
             if typ not in rewrite_types:
                 out.append(dict(s))
                 continue
-            ss = float(s["start"])
-            se = float(s["end"])
+            ss = float(s["start"]); se = float(s["end"])
             if se <= span_start or ss >= span_end:
-                out.append(dict(s))
-                continue
-            seg_start = max(ss, span_start)
-            seg_end = min(se, span_end)
+                out.append(dict(s)); continue
+            seg_start = max(ss, span_start); seg_end = min(se, span_end)
             if seg_end - seg_start <= 0.02:
                 continue
-            overlapping = [(a, b) for a, b in clipped if b > seg_start + 0.01 and a < seg_end - 0.01]
-            if not overlapping:
+            # gather overlapping speech and breakers
+            pieces = []
+            for a,b in clipped:
+                if b > seg_start + 0.01 and a < seg_end - 0.01:
+                    pieces.append((max(a, seg_start), min(b, seg_end), False))
+            for a,b in breaker_regions:
+                if b > seg_start + 0.01 and a < seg_end - 0.01:
+                    pieces.append((max(a, seg_start), min(b, seg_end), True))
+            pieces.sort(key=lambda x: x[0])
+            if not pieces:
                 out.extend(emit_gap(seg_start, seg_end))
                 continue
             cursor = seg_start
-            for a, b in overlapping:
-                a = max(a, seg_start)
-                b = min(b, seg_end)
+            for a,b,is_br in pieces:
                 if a - cursor > 0.02:
                     out.extend(emit_gap(cursor, a))
-                out.append({"type": "body", "start": max(cursor, a), "end": b})
-                cursor = b
+                if is_br:
+                    out.append({"type": breaker_action if breaker_action in ("card","cut") else "card", "start": a, "end": b})
+                else:
+                    out.append({"type": "body", "start": max(cursor, a), "end": b})
+                cursor = max(cursor, b)
             if seg_end - cursor > 0.02:
                 out.extend(emit_gap(cursor, seg_end))
-        # final tidy: merge neighbours of same type
         out.sort(key=lambda s: s["start"])
         tidy = []
         for s in out:
@@ -2548,21 +2685,19 @@ class ReactionVideoProcessor:
 
     @staticmethod
     def build_fair_use_limit(segments, duration, opts=None, words=None, body_span=None, detection_regions=None):
-        """Limit reaction body to maxBodySec, keeping most speech-dense parts.
+        """Limit reaction body to maxBodySec, keeping most speech-dense parts, plus breaker every maxSpeech.
 
         Mirrors src/lib/fairUseCut.ts.
-        - words: list of {start,end,text} or regions [{start,end}]
-        - detection_regions: fallback speech regions
-        - body_span: {start,end} or None
-        - opts: {maxBodySec, removedAction, cardDuration, bucketSec, keepPad}
         """
-        import copy
         o = opts or {}
         max_body = float(o.get("maxBodySec", o.get("max_body_sec", 600)))
         removed_action = str(o.get("removedAction", o.get("removed_action", "cut")))
         card_dur = float(o.get("cardDuration", o.get("card_duration", 3.0)))
         bucket_sec = float(o.get("bucketSec", o.get("bucket_sec", 1.0)))
         keep_pad = float(o.get("keepPad", o.get("keep_pad", 0.5)))
+        max_speech = float(o.get("maxSpeech", o.get("max_speech", 30.0)))
+        breaker_dur = float(o.get("breakerDuration", o.get("breaker_duration", 3.0)))
+        breaker_action = str(o.get("breakerAction", o.get("breaker_action", "card")))
 
         rewrite_types = {"body", "lead", "mute", "fast", "card"}
         body_segs = [s for s in (segments or []) if s.get("type") in rewrite_types]
@@ -2576,14 +2711,12 @@ class ReactionVideoProcessor:
         if body_dur <= max_body + 0.01:
             return segments
 
-        # Normalize speech regions
         speech = []
         if words and len(words):
             first = words[0]
             if isinstance(first, dict) and "text" in first:
                 speech = ReactionVideoProcessor.speech_regions_from_words(words, 0.25, 0.8)
             else:
-                # assume regions
                 speech = [(float(r.get("start", r[0])), float(r.get("end", r[1]))) if isinstance(r, dict) else (float(r[0]), float(r[1])) for r in words]
                 speech = [(a,b) for a,b in speech if b>a]
         elif detection_regions:
@@ -2591,7 +2724,6 @@ class ReactionVideoProcessor:
 
         speech = sorted(speech, key=lambda x: x[0])
 
-        # Build buckets
         buckets = []
         t = span_start
         while t < span_end - 0.01:
@@ -2606,7 +2738,6 @@ class ReactionVideoProcessor:
             t = be
 
         target_buckets = int((max_body + bucket_sec - 1e-6)//bucket_sec)
-        # If no speech, keep first max_body chronologically
         if not speech:
             keep_end = span_start + max_body
             out=[]
@@ -2634,7 +2765,6 @@ class ReactionVideoProcessor:
                         out.append({"type":"cut","start":ss+card_dur,"end":se})
                     else:
                         out.append({"type":removed_action,"start":ss,"end":se})
-            # tidy merge same type
             out.sort(key=lambda x: x["start"])
             tidy=[]
             for s in out:
@@ -2644,7 +2774,6 @@ class ReactionVideoProcessor:
                     tidy.append(dict(s))
             return [s for s in tidy if s["end"]-s["start"]>0.08]
 
-        # Score buckets
         sorted_buckets = sorted(enumerate(buckets), key=lambda x: (-x[1][2], x[1][0]))
         selected_idx = [i for i,_ in sorted_buckets[:target_buckets]]
         pad_n = int((keep_pad + bucket_sec -1e-6)//bucket_sec)
@@ -2660,22 +2789,40 @@ class ReactionVideoProcessor:
             scored.sort(key=lambda x: (-x[1], x[2]))
             keep_indices=sorted([i for i,_,_ in scored[:target_buckets]])
         keep_mask=set(keep_indices)
-        kept_intervals=[]
+        raw_kept=[]
         cur=None
         for i,(bs,be,sc) in enumerate(buckets):
             if i not in keep_mask:
                 if cur:
-                    kept_intervals.append(cur); cur=None
+                    raw_kept.append(cur); cur=None
                 continue
             if not cur:
                 cur=[bs,be]
             elif abs(cur[1]-bs)<0.02:
                 cur[1]=be
             else:
-                kept_intervals.append(cur); cur=[bs,be]
+                raw_kept.append(cur); cur=[bs,be]
         if cur:
-            kept_intervals.append(cur)
-        kept_intervals=[(float(a),float(b)) for a,b in kept_intervals]
+            raw_kept.append(cur)
+        raw_kept=[(float(a),float(b)) for a,b in raw_kept]
+
+        # Breaker inside long kept intervals
+        kept_intervals=[]
+        breaker_intervals=[]
+        if max_speech > 1 and breaker_dur > 0:
+            for a,b in raw_kept:
+                cur = a
+                while cur < b - 0.01:
+                    be = min(b, cur + max_speech)
+                    kept_intervals.append((cur, be))
+                    cur = be
+                    if cur < b - 0.01:
+                        br_end = min(b, cur + breaker_dur)
+                        if br_end - cur > 0.05:
+                            breaker_intervals.append((cur, br_end))
+                            cur = br_end
+        else:
+            kept_intervals = raw_kept
 
         out=[]
         for s in sorted(segments or [], key=lambda x: float(x.get("start",0))):
@@ -2686,8 +2833,17 @@ class ReactionVideoProcessor:
             if se<=span_start or ss>=span_end:
                 out.append(dict(s)); continue
             ss=max(ss, span_start); se=min(se, span_end)
+            # pieces = kept + breaker
+            pieces=[]
+            for a,b in kept_intervals:
+                if b<=ss+0.01 or a>=se-0.01: continue
+                pieces.append((max(a,ss), min(b,se), False))
+            for a,b in breaker_intervals:
+                if b<=ss+0.01 or a>=se-0.01: continue
+                pieces.append((max(a,ss), min(b,se), True))
+            pieces.sort(key=lambda x: x[0])
             cursor=ss
-            for ks,ke in kept_intervals:
+            for ks,ke,is_br in pieces:
                 if ke<=cursor+0.01: continue
                 if ks>=se-0.01: break
                 kss=max(ks, ss); kee=min(ke, se)
@@ -2697,7 +2853,10 @@ class ReactionVideoProcessor:
                         out.append({"type":"cut","start":cursor+card_dur,"end":kss})
                     else:
                         out.append({"type":removed_action,"start":cursor,"end":kss})
-                out.append({"type":"body","start":kss,"end":kee})
+                if is_br:
+                    out.append({"type": breaker_action if breaker_action in ("card","cut") else "card","start":kss,"end":kee})
+                else:
+                    out.append({"type":"body","start":kss,"end":kee})
                 cursor=kee
             if se-cursor>0.02:
                 if removed_action=="card" and se-cursor>card_dur:
@@ -2713,6 +2872,7 @@ class ReactionVideoProcessor:
             else:
                 tidy.append(dict(s))
         return [s for s in tidy if s["end"]-s["start"]>0.08 and s["end"]<=duration+0.05]
+
 
 
 
@@ -2840,7 +3000,7 @@ class ReactionVideoProcessor:
     def render_with_layout(self, name: str,
                            layout: Optional[L.LayoutState] = None,
                            segments: Optional[List[Dict[str, Any]]] = None,
-                           crf: int = 18, webm: bool = True,
+                           crf: int = 23, webm: bool = True,
                            stems: bool = False) -> Dict[str, str]:
         """Full render: composed video + conformed audio + mux (+ webm)."""
         layout = layout or self.layout

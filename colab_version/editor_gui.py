@@ -423,7 +423,7 @@ class ReactionEditor:
 
         # ---- export --------------------------------------------------------
         self.name_txt = widgets.Text(value="youtube_final", description="Name:")
-        self.crf_slider = widgets.IntSlider(value=18, min=16, max=28, step=1,
+        self.crf_slider = widgets.IntSlider(value=23, min=16, max=28, step=1,
                                             description="CRF (quality)")
         self.webm_chk = widgets.Checkbox(value=True, description="Also WebM (VP9)")
         self.sample_btn = widgets.Button(description="🎬 Render 12s sample at playhead",

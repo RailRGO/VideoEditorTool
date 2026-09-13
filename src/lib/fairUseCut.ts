@@ -4,27 +4,15 @@ import type { Word } from "./polish";
 import { tidy, uid } from "./timeline";
 import { speechRegionsFromWords } from "./transcriptCut";
 
-/**
- * Fair-use limiter: ensure the reaction (body) part does not exceed `maxBodySec`.
- * Keeps the most speech-rich portions of the body, preserving order.
- *
- * - rewriteTypes = body/lead/mute/fast/card (intro/outro untouched)
- * - bodySpan optionally limits the operation to a sub-range (usually bodySpan)
- * - speechRegions: from transcript words (preferred) or from detection.regions
- * - scoring: 1s buckets scored by speech overlap, plus small bonus for being near speech
- * - kept buckets merged into body segments, gaps become cut (or card+cut if large? we use cut for simplicity)
- * - If no speech info, keeps the first maxBodySec (chronological trim).
- */
 export interface FairUseOptions {
-  maxBodySec: number; // e.g. 600 = 10 min
-  /** how to treat removed parts: cut or card+cut (for YT) */
+  maxBodySec: number;
   removedAction: "cut" | "card";
-  /** card duration when removedAction=card and gap large */
   cardDuration: number;
-  /** bucket size for scoring, seconds */
   bucketSec: number;
-  /** keep at least this much context around kept speech */
   keepPad: number;
+  maxSpeech: number;
+  breakerDuration: number;
+  breakerAction: "card" | "cut";
 }
 
 export const defaultFairUse: FairUseOptions = {
@@ -33,6 +21,9 @@ export const defaultFairUse: FairUseOptions = {
   cardDuration: 3,
   bucketSec: 1,
   keepPad: 0.5,
+  maxSpeech: 30,
+  breakerDuration: 3,
+  breakerAction: "card",
 };
 
 export interface FairUseReport {
@@ -91,10 +82,8 @@ export function buildFairUseLimit(
     };
   }
 
-  // Normalize speech regions
   let speech: Region[] = [];
   if (speechOrWords && speechOrWords.length) {
-    // Check if Word[]
     const first = speechOrWords[0] as any;
     if (first && typeof first.text === "string" && typeof first.start === "number") {
       speech = speechRegionsFromWords(speechOrWords as Word[], 0.25, 0.8);
@@ -105,7 +94,6 @@ export function buildFairUseLimit(
     speech = detectionRegions.map((r) => ({ start: r.start, end: r.end }));
   }
 
-  // If no speech info, fallback to chronological first N seconds
   if (!speech.length) {
     const keepEnd = spanStart + opts.maxBodySec;
     const out: Segment[] = [];
@@ -124,7 +112,6 @@ export function buildFairUseLimit(
         if (ss < keepEnd) out.push({ ...s, start: ss, end: Math.min(se, keepEnd) });
       } else if (ss < keepEnd) {
         out.push({ ...s, start: ss, end: keepEnd });
-        // remainder becomes cut/card
         if (opts.removedAction === "card" && se - keepEnd > opts.cardDuration) {
           out.push({ id: uid(), type: "card", start: keepEnd, end: keepEnd + opts.cardDuration });
           out.push({ id: uid(), type: "cut", start: keepEnd + opts.cardDuration, end: se });
@@ -132,7 +119,6 @@ export function buildFairUseLimit(
           out.push({ id: uid(), type: opts.removedAction, start: keepEnd, end: se });
         }
       } else {
-        // beyond limit -> cut
         if (opts.removedAction === "card" && se - ss > opts.cardDuration) {
           out.push({ id: uid(), type: "card", start: ss, end: ss + opts.cardDuration });
           out.push({ id: uid(), type: "cut", start: ss + opts.cardDuration, end: se });
@@ -154,16 +140,12 @@ export function buildFairUseLimit(
     };
   }
 
-  // Score buckets
   speech.sort((a, b) => a.start - b.start);
   const buckets = buildBuckets(spanStart, spanEnd, opts.bucketSec, speech);
-  // Sort by score desc, keep top N
   const targetBuckets = Math.ceil(opts.maxBodySec / opts.bucketSec);
   const sorted = [...buckets].sort((a, b) => b.score - a.score || a.start - b.start);
   const selected = sorted.slice(0, targetBuckets);
-  // If we have less speech than target, fill with chronological early buckets to reach limit?
-  // Already selected top scoring; but we need to ensure we keep contiguous context.
-  // Add pad: for each selected bucket, also select neighbours within keepPad
+
   const bucketIndex = new Map<number, number>();
   buckets.forEach((b, i) => bucketIndex.set(b.start, i));
   const keepSet = new Set<number>();
@@ -175,10 +157,8 @@ export function buildFairUseLimit(
       if (ni >= 0 && ni < buckets.length) keepSet.add(ni);
     }
   }
-  // If keepSet exceeds targetBuckets, trim lowest scoring among padded set
   let keepIndices = Array.from(keepSet).sort((a, b) => a - b);
   if (keepIndices.length > targetBuckets) {
-    // Keep highest scoring among keepSet
     const scored = keepIndices.map((i) => ({ i, score: buckets[i].score, start: buckets[i].start }));
     scored.sort((a, b) => b.score - a.score || a.start - b.start);
     const trimmed = scored.slice(0, targetBuckets).map((s) => s.i).sort((a, b) => a - b);
@@ -186,13 +166,12 @@ export function buildFairUseLimit(
   }
 
   const keepMask = new Set(keepIndices);
-  // Build kept intervals in time order
-  const keptIntervals: Region[] = [];
+  const rawKept: Region[] = [];
   let cur: Region | null = null;
   for (let i = 0; i < buckets.length; i++) {
     if (!keepMask.has(i)) {
       if (cur) {
-        keptIntervals.push(cur);
+        rawKept.push(cur);
         cur = null;
       }
       continue;
@@ -201,13 +180,38 @@ export function buildFairUseLimit(
     if (!cur) cur = { start: b.start, end: b.end };
     else if (Math.abs(cur.end - b.start) < 0.02) cur.end = b.end;
     else {
-      keptIntervals.push(cur);
+      rawKept.push(cur);
       cur = { start: b.start, end: b.end };
     }
   }
-  if (cur) keptIntervals.push(cur);
+  if (cur) rawKept.push(cur);
 
-  // Now rebuild segments: intro/outro untouched, body replaced by keptIntervals as body, gaps as removedAction
+  // Insert breaker cards inside long kept intervals every maxSpeech
+  const maxSpeech = (opts as any).maxSpeech ?? 30;
+  const breakerDur = (opts as any).breakerDuration ?? 3;
+  const breakerAction = (opts as any).breakerAction ?? "card";
+  const keptIntervals: Region[] = [];
+  const breakerIntervals: Region[] = [];
+  if (maxSpeech > 1 && breakerDur > 0) {
+    for (const r of rawKept) {
+      let c = r.start;
+      while (c < r.end - 0.01) {
+        const bodyEnd = Math.min(r.end, c + maxSpeech);
+        keptIntervals.push({ start: c, end: bodyEnd });
+        c = bodyEnd;
+        if (c < r.end - 0.01) {
+          const brEnd = Math.min(r.end, c + breakerDur);
+          if (brEnd - c > 0.05) {
+            breakerIntervals.push({ start: c, end: brEnd });
+            c = brEnd;
+          }
+        }
+      }
+    }
+  } else {
+    keptIntervals.push(...rawKept);
+  }
+
   const out: Segment[] = [];
   for (const s of tidy(segments)) {
     if (!rewriteTypes.has(s.type)) {
@@ -220,24 +224,34 @@ export function buildFairUseLimit(
     }
     const ss = Math.max(s.start, spanStart);
     const se = Math.min(s.end, spanEnd);
-    // Intersect ss-se with keptIntervals
-    let cursor = ss;
+    // Collect overlapping kept + breaker pieces
+    const pieces: { start: number; end: number; isBreaker: boolean }[] = [];
     for (const k of keptIntervals) {
-      if (k.end <= cursor + 0.01) continue;
-      if (k.start >= se - 0.01) break;
-      const ks = Math.max(k.start, ss);
-      const ke = Math.min(k.end, se);
-      if (ks - cursor > 0.02) {
-        // gap -> removed
-        if (opts.removedAction === "card" && ks - cursor > opts.cardDuration) {
+      if (k.end <= ss + 0.01 || k.start >= se - 0.01) continue;
+      pieces.push({ start: Math.max(k.start, ss), end: Math.min(k.end, se), isBreaker: false });
+    }
+    for (const b of breakerIntervals) {
+      if (b.end <= ss + 0.01 || b.start >= se - 0.01) continue;
+      pieces.push({ start: Math.max(b.start, ss), end: Math.min(b.end, se), isBreaker: true });
+    }
+    pieces.sort((a, b) => a.start - b.start);
+
+    let cursor = ss;
+    for (const p of pieces) {
+      if (p.start - cursor > 0.02) {
+        if (opts.removedAction === "card" && p.start - cursor > opts.cardDuration) {
           out.push({ id: uid(), type: "card", start: cursor, end: cursor + opts.cardDuration });
-          out.push({ id: uid(), type: "cut", start: cursor + opts.cardDuration, end: ks });
+          out.push({ id: uid(), type: "cut", start: cursor + opts.cardDuration, end: p.start });
         } else {
-          out.push({ id: uid(), type: opts.removedAction, start: cursor, end: ks });
+          out.push({ id: uid(), type: opts.removedAction, start: cursor, end: p.start });
         }
       }
-      out.push({ id: uid(), type: "body", start: ks, end: ke });
-      cursor = ke;
+      if (p.isBreaker) {
+        out.push({ id: uid(), type: breakerAction as any, start: p.start, end: p.end });
+      } else {
+        out.push({ id: uid(), type: "body", start: p.start, end: p.end });
+      }
+      cursor = Math.max(cursor, p.end);
     }
     if (se - cursor > 0.02) {
       if (opts.removedAction === "card" && se - cursor > opts.cardDuration) {

@@ -110,6 +110,10 @@ export default function CloakPanel({
         }
       >
         <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => setV({ contentOnly: !video.contentOnly })} className={video.contentOnly ? "rounded border border-emerald-400/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-semibold text-emerald-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.contentOnly ? "Content-only ON" : "Content-only OFF"}</button>
+            <span className="text-[10px] text-slate-500 pt-1">When ON, zoom/blur/hue affect only content, camera stays clean (fixes black bars/crop)</span>
+          </div>
           <Slider
             label="Punch-in zoom"
             value={video.zoom}
@@ -118,7 +122,7 @@ export default function CloakPanel({
             step={0.005}
             display={`${Math.round((video.zoom - 1) * 1000) / 10}%`}
             onChange={(v) => setV({ zoom: v })}
-            hint="crops away edge pixels that fingerprints rely on"
+            hint={video.contentOnly ? "zooms only content rect" : "crops away edge pixels that fingerprints rely on"}
           />
           <Slider
             label="Cover bars"
@@ -160,9 +164,15 @@ export default function CloakPanel({
             <Slider label="Subtle blur" value={video.blur} min={0} max={3} step={0.1} display={video.blur ? `${video.blur.toFixed(1)}px` : "off"} onChange={(v) => setV({ blur: v })} hint="breaks pixel hashes, keep low" />
             <Slider label="Rotate" value={video.rotate} min={-5} max={5} step={0.25} display={`${video.rotate > 0 ? "+" : ""}${video.rotate.toFixed(2)}°`} onChange={(v) => setV({ rotate: v })} hint="slight tilt adds black edges" />
           </div>
-          <div className="mt-3 flex items-center gap-2">
-            <button type="button" onClick={() => setV({ flip: !video.flip })} className={video.flip ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flip ? "Mirror ON (hflip)" : "Mirror off"}</button>
-            <span className="text-[10px] text-slate-500">Strongest single Content ID evasion — flips whole frame</span>
+          <div className="mt-3 space-y-2">
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => setV({ flip: !video.flip })} className={video.flip ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flip ? "Mirror whole ON" : "Mirror whole off"}</button>
+              <span className="text-[10px] text-slate-500">Flips entire frame — strongest evasion, but mirrors camera</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => setV({ flipContent: !video.flipContent })} className={video.flipContent ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flipContent ? "Mirror content ON" : "Mirror content off"}</button>
+              <span className="text-[10px] text-slate-500">Mirrors only watched video, camera stays readable (recommended)</span>
+            </div>
           </div>
           <div className="mt-2">
             <Slider label="Global speed tweak" value={video.speed} min={0.95} max={1.05} step={0.01} display={`${video.speed.toFixed(2)}×`} onChange={(v) => setV({ speed: v })} hint="breaks audio fingerprint when combined with pitch; re-times video+audio together" />
@@ -175,7 +185,7 @@ export default function CloakPanel({
           Start gentle and check after upload — these are a starting point, push further only where
           claims actually land. Preview before rendering: pitch and chorus are audible, zoom and
           bars are visible. Small values already move the needle; large values annoy viewers faster
-          than they fool matchers.
+          than they fool matchers. Content-only ON is now default — it keeps your camera intact.
         </p>
       </Section>
 

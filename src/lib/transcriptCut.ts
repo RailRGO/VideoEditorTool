@@ -25,7 +25,6 @@ export function speechRegionsFromWords(
     start: Math.max(0, w.start - pad),
     end: w.end + pad,
   }));
-  // merge
   const merged: Region[] = [];
   let cur = { ...expanded[0] };
   for (let i = 1; i < expanded.length; i++) {
@@ -41,7 +40,6 @@ export function speechRegionsFromWords(
   return merged.filter((r) => r.end - r.start > 0.05);
 }
 
-/** Inverse of speech regions inside [spanStart, spanEnd) */
 export function gapsFromSpeech(
   speech: Region[],
   spanStart: number,
@@ -67,11 +65,8 @@ export interface TranscriptCutReport {
   largeGaps: Region[];
   tinyGaps: Region[];
   keptGaps: Region[];
-  /** output segments that would replace body (for stats) */
   outSegments: Segment[];
-  /** how much time is saved by cutting */
   saved: number;
-  /** total card time inserted */
   cardTime: number;
 }
 
@@ -79,11 +74,9 @@ export interface TranscriptCutReport {
  * Build the YouTube timeline from transcript gaps:
  * - speech -> body
  * - tiny gaps (< minSilence) -> keep/fast/mute per tinyAction
- * - large gaps (>= minSilence) -> card (cardDuration) + cut (rest)
- *
- * Only the reaction part (body/lead/mute/fast/card) is rewritten;
- * intro/outro are preserved. If bodySpan is given, gaps are computed
- * only inside that span (the usual case).
+ * - large gaps (>= minSilence) -> card + cut
+ * Plus breaker: long continuous speech > maxSpeech -> insert card over content
+ * (keeps voice, breaks ContentID).
  */
 export function buildTranscriptCut(
   segments: Segment[],
@@ -96,20 +89,51 @@ export function buildTranscriptCut(
 
   const speech = speechRegionsFromWords(words, opts.pad, opts.mergeGap);
 
-  // Determine the spans we are allowed to rewrite
   const rewriteTypes = new Set(["body", "lead", "mute", "fast", "card"]);
   const bodySegs = segments.filter((s) => rewriteTypes.has(s.type));
   const spanStart = bodySpan ? bodySpan.start : (bodySegs[0]?.start ?? 0);
   const spanEnd = bodySpan ? bodySpan.end : (bodySegs[bodySegs.length - 1]?.end ?? duration);
 
-  // Clip speech to the rewrite span for gap computation
-  const clippedSpeech = speech
+  let clippedSpeech = speech
     .map((r) => ({
       start: Math.max(r.start, spanStart),
       end: Math.min(r.end, spanEnd),
     }))
     .filter((r) => r.end - r.start > 0.02)
     .sort((a, b) => a.start - b.start);
+
+  const maxSpeech = (opts as any).maxSpeech ?? 30;
+  const breakerDur = (opts as any).breakerDuration ?? 3;
+  const breakerAction = (opts as any).breakerAction ?? "card";
+
+  let breakerRegions: Region[] = [];
+  if (maxSpeech > 1 && breakerDur > 0) {
+    type Piece = { start: number; end: number; isBreaker: boolean };
+    const pieces: Piece[] = [];
+    for (const r of clippedSpeech) {
+      let cur = r.start;
+      while (cur < r.end - 0.01) {
+        const bodyEnd = Math.min(r.end, cur + maxSpeech);
+        pieces.push({ start: cur, end: bodyEnd, isBreaker: false });
+        cur = bodyEnd;
+        if (cur < r.end - 0.01) {
+          const brEnd = Math.min(r.end, cur + breakerDur);
+          if (brEnd - cur > 0.05) {
+            pieces.push({ start: cur, end: brEnd, isBreaker: true });
+            cur = brEnd;
+          }
+        }
+      }
+    }
+    const newSpeech: Region[] = [];
+    const br: Region[] = [];
+    for (const p of pieces) {
+      if (p.isBreaker) br.push({ start: p.start, end: p.end });
+      else newSpeech.push({ start: p.start, end: p.end });
+    }
+    breakerRegions = br;
+    clippedSpeech = newSpeech;
+  }
 
   const out: Segment[] = [];
 
@@ -118,7 +142,6 @@ export function buildTranscriptCut(
       out.push(s);
       continue;
     }
-    // Outside the bodySpan? keep as is (defensive)
     if (s.end <= spanStart || s.start >= spanEnd) {
       out.push(s);
       continue;
@@ -127,35 +150,49 @@ export function buildTranscriptCut(
     const segEnd = Math.min(s.end, spanEnd);
     if (segEnd - segStart <= 0.02) continue;
 
-    // Speech overlapping this segment
     const overlapping = clippedSpeech.filter(
       (r) => r.end > segStart + 0.01 && r.start < segEnd - 0.01
     );
+    const overlappingBreakers = breakerRegions.filter(
+      (r) => r.end > segStart + 0.01 && r.start < segEnd - 0.01
+    );
 
-    if (!overlapping.length) {
-      // Whole segment is a gap
+    const allPieces: { start: number; end: number; isBreaker: boolean }[] = [];
+    for (const r of overlapping) {
+      allPieces.push({ start: Math.max(r.start, segStart), end: Math.min(r.end, segEnd), isBreaker: false });
+    }
+    for (const r of overlappingBreakers) {
+      allPieces.push({ start: Math.max(r.start, segStart), end: Math.min(r.end, segEnd), isBreaker: true });
+    }
+    allPieces.sort((a, b) => a.start - b.start);
+
+    if (!allPieces.length) {
       out.push(...emitGap(segStart, segEnd, opts));
       continue;
     }
 
     let cursor = segStart;
-    for (const sr of overlapping) {
-      const a = Math.max(sr.start, segStart);
-      const b = Math.min(sr.end, segEnd);
-      if (a - cursor > 0.02) {
-        out.push(...emitGap(cursor, a, opts));
+    for (const p of allPieces) {
+      if (p.start - cursor > 0.02) {
+        out.push(...emitGap(cursor, p.start, opts));
       }
-      // speech itself -> body (preserve original type if it was mute? but for YT we want body)
-      out.push({ id: uid(), type: "body", start: cursor < a ? a : cursor, end: b });
-      cursor = b;
+      if (p.isBreaker) {
+        out.push({
+          id: uid(),
+          type: breakerAction === "cut" ? "cut" : "card",
+          start: p.start,
+          end: p.end,
+        });
+      } else {
+        out.push({ id: uid(), type: "body", start: p.start, end: p.end });
+      }
+      cursor = Math.max(cursor, p.end);
     }
     if (segEnd - cursor > 0.02) {
       out.push(...emitGap(cursor, segEnd, opts));
     }
   }
 
-  // Preserve any leading/trailing bits outside bodySpan that were body but not iterated?
-  // tidy will merge same-type neighbours.
   const final = tidy(out).filter((s) => s.end - s.start > 0.08 && s.end <= duration + 0.05);
   return final;
 }
@@ -170,7 +207,6 @@ function emitGap(start: number, end: number, opts: TranscriptCutOptions): Segmen
     if (opts.tinyAction === "fast") return [{ id: uid(), type: "fast", start, end }];
     return [{ id: uid(), type: "mute", start, end }];
   }
-  // large gap -> card + cut
   if (dur <= opts.cardDuration) {
     return [{ id: uid(), type: "card", start, end }];
   }
@@ -212,7 +248,6 @@ export function analyseTranscriptCut(
     if (s.type === "cut") saved += s.end - s.start;
     if (s.type === "card") cardTime += s.end - s.start;
   }
-  // Also count gaps that become cut inside body
   return {
     speech: clipped,
     gaps,
