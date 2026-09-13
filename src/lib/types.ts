@@ -25,6 +25,12 @@ export interface Segment {
     accent?: string;
     /** full = whole content rect, short = top only so subtitles stay visible */
     variant?: "full" | "short";
+    /**
+     * Playback speed while the card is on screen (1 = normal). The card covers
+     * the content anyway, so nudging it to ~1.25× makes a breaker card cost a
+     * quarter less programme time; the voice speeds up with it.
+     */
+    speed?: number;
   };
 }
 
@@ -129,9 +135,14 @@ export interface CardStyle {
   image?: string;
   /** draw the title/sub/accent bar over the custom image (default true) */
   showText?: boolean;
-  /** short-card height as a fraction of the content height (default 0.62) */
+  /** short-card height as a fraction of the content height (default 0.75) */
   shortHeight?: number;
-  /** card background opacity 0..1 (default 0.9) — the content ghosts through */
+  /**
+   * Card opacity 0..1 (default 0.9). Exact, not a hint:
+   *   1   = fully opaque — the content is completely hidden,
+   *   0.5 = half see-through,
+   *   0   = the card is not drawn at all.
+   */
   opacity?: number;
 }
 
@@ -367,7 +378,7 @@ export const defaultLayout: LayoutState = {
     accent: "#e879f9",
     image: "",
     showText: true,
-    shortHeight: 0.62,
+    shortHeight: 0.75,
     opacity: 0.9,
   },
 };

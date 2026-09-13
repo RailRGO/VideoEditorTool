@@ -331,6 +331,42 @@ def test_card_covers_content_only():
     again = proc._card_png({}, W, H, content={"x": 0.1, "y": 0.2,
                                               "w": 0.5, "h": 0.4})
     check(again[0] == got2[0], "identical cards share one PNG")
+
+    # ---- opacity is literal: 0 = no card at all, 1 = fully opaque --------
+    proc.layout.card.opacity = 0.0
+    check(proc._card_png({}, W, H) is None,
+          "opacity 0 renders no card at all")
+    proc.layout.card.opacity = 0.9
+    img9, _, _ = C.card_overlay({}, proc.layout, W, H)
+    check(int(img9[..., 3].max()) == 229,
+          f"opacity 0.9 lands on 229 ({int(img9[..., 3].max())})")
+    proc.layout.card.opacity = 1.0
+    img1, _, _ = C.card_overlay({}, proc.layout, W, H)
+    check(int(img1[..., 3].max()) == 255, "opacity 1 is fully opaque")
+    proc.layout.card.opacity = 0.9
+
+    # ---- short cards: 75 % of the content by default ---------------------
+    short, sx, sy = C.card_overlay({"variant": "short"}, proc.layout, W, H)
+    ch = int(round(proc.layout.content.h * H))
+    check(abs(short.shape[0] - round(ch * 0.75)) <= 1,
+          f"short card is 75 % of the content ({short.shape[0]} of {ch})")
+    check(sy == int(round(proc.layout.content.y * H)),
+          "short card anchors to the top (subtitles stay visible)")
+
+    # ---- the card follows the drawn content picture ----------------------
+    for sw, sh in ((3840, 1080), (1920, 1080), (1920, 2160)):
+        src = np.full((sh, sw, 3), 255, np.uint8)
+        canvas = np.zeros((H, W, 3), np.uint8)
+        C.draw_layer(canvas, src, proc.layout.content, proc.layout.contentStyle)
+        ys, xs = np.where(canvas[..., 0] > 200)
+        drawn = (int(xs.min()), int(ys.min()),
+                 int(xs.max()) + 1, int(ys.max()) + 1)
+        r = C.content_picture_rect(proc.layout, sw, sh, W, H)
+        px = r.px(W, H)
+        want = (int(round(px[0])), int(round(px[1])),
+                int(round(px[0] + px[2])), int(round(px[1] + px[3])))
+        check(all(abs(a - b) <= 2 for a, b in zip(drawn, want)),
+              f"content picture {sw}x{sh}: card rect {want} == drawn {drawn}")
     # browser parity: the React passthrough must not hardcode a full-frame box
     ts = (HERE.parent.parent.parent / "src" / "lib" / "render.ts").read_text()
     body = ts.split("export function buildPassthroughScene")[1].split("\n}")[0]
@@ -339,6 +375,102 @@ def test_card_covers_content_only():
     check("cardRect" in body and "content" in body,
           "buildPassthroughScene takes the card rect from the layout")
     check("scene.cardText" in ts, "renderScene passes per-segment card text")
+
+
+def test_card_speed():
+    """A card may carry its own playback speed — the render must obey it.
+
+    Cards hide the picture anyway, so the limiter is allowed to play them a
+    little faster (the browser does the same through segSpeed()).
+    """
+    print("card speed")
+    segs = [
+        {"type": "body", "start": 0, "end": 30},
+        {"type": "card", "start": 30, "end": 34,
+         "card": {"variant": "short", "speed": 1.25}},
+    ]
+    check(abs(C.seg_speed(segs[1], 4.0) - 1.25) < 1e-9,
+          "seg_speed returns the card's own speed")
+    check(abs(C.render_duration(segs, 4.0) - 33.2) < 1e-6,
+          f"render_duration shortens the programme "
+          f"({C.render_duration(segs, 4.0):.2f}s)")
+    parts = V.plan_parts(segs, 4.0, 100.0, min_part=1.0)
+    check(len(parts) == 1, "a sped card does not break part planning")
+    # a card at 2x halves its own programme time
+    fast_card = [{"type": "card", "start": 0, "end": 10,
+                  "card": {"speed": 2.0}}]
+    check(abs(C.render_duration(fast_card, 4.0) - 5.0) < 1e-6,
+          "a 2x card contributes half its source length")
+    check(abs(C.render_duration(
+        [{"type": "card", "start": 0, "end": 10, "card": {}}], 4.0) - 10.0)
+        < 1e-6, "a plain card is real time")
+
+
+def test_fair_use_cards():
+    """The Content-ID limiter: short cards over long talk, or a spread trim.
+
+    Mirrors src/lib/fairUseCut.ts. The old build kept the first N minutes of
+    the reaction and cut everything after; these checks pin the behaviour the
+    browser now has (and the render has to match).
+    """
+    print("fair-use limiter")
+    build = V.ReactionVideoProcessor.build_fair_use_limit
+    segs = [
+        {"type": "intro", "start": 0, "end": 10},
+        {"type": "body", "start": 10, "end": 40},
+        {"type": "outro", "start": 40, "end": 50},
+    ]
+    span = {"start": 10, "end": 40}
+    words = [{"text": "w", "start": 10.5 + i * 0.5, "end": 11.1 + i * 0.5}
+             for i in range(0, 58, 2)]      # near-continuous talking
+
+    out = build(segs, 50, {"mode": "cards"}, words, span)
+    cards = [s for s in out if s["type"] == "card"]
+    check(len(cards) == 2, f"30 s of talk gets 2 cards ({len(cards)})")
+    check(all(_variant(s) == "short" for s in cards),
+          "every card is short — never a long one")
+    check(all(abs(c["start"] - (10 + 8.0)) < 0.6 or
+              abs(c["start"] - (10 + 20.0)) < 0.6 for c in cards),
+          "cards land 8 s into the talk and 8 s later "
+          f"({[round(c['start'] - 10, 1) for c in cards]})")
+    check(not [s for s in out if s["type"] == "cut"],
+          "cards mode removes nothing — the reaction stays in one piece")
+    check(all(out[i]["start"] >= out[i - 1]["end"] - 0.02
+              for i in range(1, len(out))), "the result stays chronological")
+    check([s["type"] for s in out][0] == "intro",
+          "intro is untouched")
+
+    # a card that runs faster than real time keeps its speed in the segment
+    out_sp = build(segs, 50, {"mode": "cards", "cardSpeed": 1.25}, words, span)
+    sped = [s for s in out_sp if s["type"] == "card"]
+    check(all(abs(float(s["card"].get("speed", 1.0)) - 1.25) < 1e-6
+              for s in sped), "cardSpeed is written into every card")
+
+    # short stretches get no card at all
+    quiet = [{"type": "body", "start": 0, "end": 4}]
+    out_q = build(quiet, 4, {"mode": "cards"}, None, {"start": 0, "end": 4})
+    check(not [s for s in out_q if s["type"] == "card"],
+          "a stretch under minRunSec is left alone")
+
+    # ---- trim: budget respected, spread over the whole reaction ----------
+    long_body = [{"type": "body", "start": 0, "end": 120}]
+    speech = [{"start": t, "end": t + 1.2} for t in range(0, 120, 2)]
+    opts = {"mode": "trim", "maxBodySec": 40, "keepPad": 0.25}
+    trimmed = build(long_body, 120, opts, speech, {"start": 0, "end": 120})
+    kept = [s for s in trimmed if s["type"] != "cut"]
+    kept_s = sum(s["end"] - s["start"] for s in kept)
+    check(abs(kept_s - 40) <= 3, f"trim keeps ~40 s ({kept_s:.1f} s)")
+    check(any(s["start"] > 90 for s in kept) and any(s["end"] < 20 for s in kept),
+          "trim keeps the start AND the end of the reaction, not the head")
+    # no speech info: same spread, no crash
+    trimmed2 = build(long_body, 120, opts, None, {"start": 0, "end": 120})
+    kept2 = [s for s in trimmed2 if s["type"] != "cut"]
+    check(any(s["start"] > 90 for s in kept2),
+          "without speech info the trim still samples the whole reaction")
+
+
+def _variant(s):
+    return V._card_variant(s)
 
 
 def test_vignette_matches_preview():
@@ -917,9 +1049,6 @@ def frame_pixel_1080(path: Path, t: float, x: float, y: float) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    if not shutil.which("ffmpeg"):
-        print("ffmpeg not found on PATH — cannot run these tests")
-        return 2
     fast_only = len(sys.argv) > 1 and sys.argv[1] == "fast"
     root = Path(os.environ.get("RENDER_TEST_DIR")
                 or Path(tempfile.mkdtemp(prefix="render_parts_")))
@@ -927,14 +1056,21 @@ def main() -> int:
     t0 = time.time()
     print(f"workspace: {root}\n")
 
+    # pure math first — no ffmpeg, no fixtures, so this part runs anywhere
     test_plan_parts()
     test_auto_part_target()
     test_card_covers_content_only()
+    test_card_speed()
+    test_fair_use_cards()
     test_vignette_matches_preview()
     if fast_only:
         print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed "
               f"({time.time() - t0:.0f}s)")
         return 1 if FAILS else 0
+
+    if not shutil.which("ffmpeg"):
+        print("ffmpeg not found on PATH — cannot run the render tests")
+        return 2
 
     if not (root / "raw.mp4").exists():
         print("building fixtures …")

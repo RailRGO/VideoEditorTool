@@ -23,9 +23,15 @@ export function fmtTime(t: number, ms = false): string {
   return ms ? `${core}.${String(cs).padStart(2, "0")}` : core;
 }
 
-/** Media-time consumed by a segment, taking fast-forward into account. */
+/**
+ * Playback speed of a segment: `fast` uses the layout multiplier, a `card`
+ * may carry its own (the card covers the content, so a breaker card can be
+ * nudged through faster), everything else plays at 1×.
+ */
 export function segSpeed(s: Segment, fastSpeed: number): number {
-  return s.type === "fast" ? Math.max(1.05, fastSpeed) : 1;
+  if (s.type === "fast") return Math.max(1.05, fastSpeed);
+  if (s.type === "card") return Math.max(1, s.card?.speed ?? 1);
+  return 1;
 }
 
 export const isKept = (s: Segment) => s.type !== "cut";
@@ -41,9 +47,12 @@ export function tidy(segs: Segment[]): Segment[] {
     .filter((s) => s.end - s.start > 0.02)
     .sort((a, b) => a.start - b.start)) {
     const prev = out[out.length - 1];
-    // full and short cards cover different rects — never merge them
+    // full and short cards cover different rects, and cards at different
+    // speeds play differently — never merge those
     const sameVariant =
-      s.type !== "card" || (prev?.card?.variant ?? "full") === (s.card?.variant ?? "full");
+      s.type !== "card" ||
+      ((prev?.card?.variant ?? "full") === (s.card?.variant ?? "full") &&
+        Math.abs((prev?.card?.speed ?? 1) - (s.card?.speed ?? 1)) < 0.001);
     if (prev && prev.type === s.type && Math.abs(prev.end - s.start) < 0.02 && sameVariant) {
       prev.end = Math.max(prev.end, s.end);
     } else {

@@ -10,6 +10,12 @@ interface Props {
   layout: LayoutState;
   onRect: (key: "content" | "cam", rect: Rect) => void;
   layers: StageLayer[];
+  /**
+   * Read-only outline for a rect the render derives (the card's real rect in
+   * a card span — the drawn content picture, which is not always the content
+   * box). Shown so the preview never hides where the card will land.
+   */
+  guide?: { rect: Rect; name: string } | null;
   editLayer: "content" | "cam";
   setEditLayer: (k: "content" | "cam") => void;
   sceneMode: "body" | "solo" | "cut" | "fast" | "card" | "lead";
@@ -30,6 +36,7 @@ export default function Stage({
   layout,
   onRect,
   layers,
+  guide = null,
   editLayer,
   setEditLayer,
   sceneMode,
@@ -94,8 +101,14 @@ export default function Stage({
 
   return (
     <div ref={outer} className="relative min-h-0 flex-1">
+      {/*
+        No rounded / clipping here on purpose: the preview must show the exact
+        frame that gets exported. A rounded-corner clip shaved the bottom-right
+        of the content box (the card's corner sits ~0.6 % from the frame edge),
+        which looked like the card was misplaced — the render itself is square.
+      */}
       <div
-        className="absolute overflow-hidden rounded-xl bg-[#04060c] shadow-2xl ring-1 ring-white/10"
+        className="absolute bg-[#04060c] shadow-2xl ring-1 ring-white/10"
         style={{
           left: box.x,
           top: box.y,
@@ -138,6 +151,23 @@ export default function Stage({
               </svg>
             </span>
           </button>
+        )}
+
+        {guide && guide.rect.w > 0 && (
+          <div
+            className="pointer-events-none absolute z-30"
+            style={{
+              left: `${guide.rect.x * 100}%`,
+              top: `${guide.rect.y * 100}%`,
+              width: `${guide.rect.w * 100}%`,
+              height: `${guide.rect.h * 100}%`,
+            }}
+          >
+            <div className="absolute inset-0 rounded-[4px] border border-fuchsia-300/80 bg-fuchsia-400/5" />
+            <span className="absolute -top-[9px] left-0 rounded bg-fuchsia-400 px-1 text-[9px] font-semibold uppercase tracking-wider text-slate-900">
+              {guide.name}
+            </span>
+          </div>
         )}
 
         <div

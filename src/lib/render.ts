@@ -39,6 +39,74 @@ export interface Scene {
   cloak?: VideoCloak | null;
 }
 
+/**
+ * Where the content picture actually lands inside its layout box.
+ *
+ * `content` is a box, not a promise: the layer is drawn with fit/zoom/offset
+ * (see fitRect), so a 16:9 source in a 16:9 box fills it exactly, while a
+ * mismatched aspect (single-file mode, a hand-resized content box) letterboxes
+ * the picture with margins on two sides. The card and the content cloak must
+ * follow the *picture*, otherwise they cover the letterbox padding and the
+ * content area looks shifted — that is the "card goes over the content frame
+ * and leaves a gap on the right and bottom" bug.
+ *
+ * Works in normalised units, so it does not need the canvas size.
+ */
+export function contentPicture(
+  layout: LayoutState,
+  src: SrcRect,
+  /**
+   * Canvas aspect (width / height). Both previews and every Patreon export
+   * are 16:9; the YouTube path never needs this (its card is the file's own
+   * content rect). The normalised box has to be measured against *this*, not
+   * against its own w/h: a 0.7 x 0.7 box is 16:9 on screen, not square.
+   */
+  aspect = 16 / 9
+): Rect {
+  const box = layout.content;
+  const style = layout.contentStyle;
+  const sAsp = src.w / Math.max(1e-6, src.h);
+  const dAsp = (box.w * aspect) / Math.max(1e-9, box.h);
+  let x = box.x;
+  let y = box.y;
+  let w = box.w;
+  let h = box.h;
+  if (style.fit === "contain") {
+    // fitRect picks whichever axis is the constraint, then centres the result
+    if (sAsp > dAsp) {
+      h = (box.w * aspect) / sAsp;
+      y = box.y + (box.h - h) / 2;
+    } else {
+      w = (box.h * sAsp) / aspect;
+      x = box.x + (box.w - w) / 2;
+    }
+  } else {
+    // cover: the picture bleeds out of the box, the visible part is the box
+    w = box.w;
+    h = box.h;
+  }
+  // zoom/offset move the *picture* inside the box the same way fitRect does
+  const zw = w * Math.max(0.01, style.zoom);
+  const zh = h * Math.max(0.01, style.zoom);
+  return {
+    x: x + (w - zw) / 2 + style.offsetX * w,
+    y: y + (h - zh) / 2 + style.offsetY * h,
+    w: zw,
+    h: zh,
+  };
+}
+
+/** Same, in device pixels of a W×H canvas. */
+export function contentPicturePx(
+  layout: LayoutState,
+  src: SrcRect,
+  W: number,
+  H: number
+): Rect {
+  const n = contentPicture(layout, src, W / Math.max(1, H));
+  return { x: n.x * W, y: n.y * H, w: n.w * W, h: n.h * H };
+}
+
 export function sourceHalves(
   vw: number,
   vh: number,
@@ -107,9 +175,18 @@ export function buildScene(
     };
   }
 
-  // Placeholder card: camera stays in its corner, the content area becomes the card
+  // Placeholder card: camera stays in its corner, the content picture becomes
+  // the card. The card follows the *drawn* content (fit/zoom/offset applied),
+  // so it can never spill over the letterbox padding around the picture.
   if (type === "card") {
-    return { bg: bgOf(), layers: [camLayer()], mode: "card", speed: 1, cardText: active?.card };
+    return {
+      bg: bgOf(),
+      layers: [camLayer()],
+      mode: "card",
+      speed: Math.max(1, active?.card?.speed ?? 1),
+      cardRect: contentPicture(layout, halves.content),
+      cardText: active?.card,
+    };
   }
 
   // lead-in: reaction layout, but the content block is still black
@@ -146,14 +223,12 @@ export function buildPassthroughScene(
   srcTime: number,
   full: SrcRect,
   speed: number,
-  cloak?: VideoCloak | null,
   /**
-   * Where the card goes. This file is a cut of the finished Patreon render,
-   * so the card has to cover the same content rect the compositor covered
-   * when it made that file — a full-frame card also buries the camera
-   * corner, which is the only thing viewers came for.
+   * The card rect — always the layout's own content rect (see below), which
+   * is what the compositor covered when it made this file.
    */
-  cardRect?: Rect,
+  cardRect: Rect,
+  cloak?: VideoCloak | null,
   /**
    * Where the camera corner sits in the finished file. The card pixels are
    * painted first and the camera region is then restored on top, so the card
@@ -172,14 +247,17 @@ export function buildPassthroughScene(
   };
   const c = cloak && cloak.on ? cloak : null;
   if (type === "card") {
-    // YouTube card: keep the full composited frame (camera corner stays visible),
-    // cover only the content area with the Patreon card — no blurred plate.
+    // YouTube card: keep the full composited frame (camera corner stays
+    // visible), cover only the content area of the finished file — the layout
+    // rect the compositor used. A hardcoded fallback box here used to sit a
+    // hair inside the real content rect, which is what left a gap on the
+    // right and bottom of the card in the YouTube tab.
     return {
       bg: null,
       layers: [layer],
       mode: "card",
-      speed: 1,
-      cardRect: cardRect ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
+      speed: Math.max(1, active?.card?.speed ?? 1),
+      cardRect,
       camRect,
       cardText: active?.card,
       cloak: c,
@@ -315,11 +393,14 @@ function drawCard(
   const y = r.y * H;
   const w = r.w * W;
   const variant = cardText?.variant ?? "full";
-  const shortH = Math.max(0.2, Math.min(1, layout.card.shortHeight ?? 0.62));
+  const shortH = Math.max(0.2, Math.min(1, layout.card.shortHeight ?? 0.75));
   // short cards anchor to the top of the content — the bottom (subtitles) stays visible
   const h = (variant === "short" ? r.h * shortH : r.h) * H;
-  // background opacity — the content ghosts through, the text stays solid
-  const opacity = Math.max(0.05, Math.min(1, layout.card.opacity ?? 0.9));
+  // Opacity is exact: 1 = fully opaque, 0 = the card isn't drawn at all.
+  // (The old code clamped it to 0.05 and the gradient carried its own 0.94 /
+  // 0.96 alpha, so 0 % still showed a card and 100 % was never opaque.)
+  const opacity = Math.max(0, Math.min(1, layout.card.opacity ?? 0.9));
+  if (opacity <= 0.001 || w <= 1 || h <= 1) return;
   // Use the same shape/radius as the content layer so the card fully covers it
   // (old fixed 28px radius left tiny gaps in the corners)
   const contentRadius = layout.contentStyle?.radius ?? 10;
@@ -335,12 +416,13 @@ function drawCard(
 
   ctx.save();
   ctx.filter = "none";
+  // The whole card — backdrop, bar, words and ring — is painted at the same
+  // alpha, so `opacity` means exactly what it says. The backdrop is opaque
+  // at 100 %, which is what finally makes the slider read correctly.
+  ctx.globalAlpha *= opacity;
   // Match content layer shape so card fully covers content (no corner gaps)
   shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x, y, w, h, radius);
   ctx.clip();
-  // background only — the text and ring below stay fully opaque
-  ctx.save();
-  ctx.globalAlpha = opacity;
   if (bgImg) {
     const iw = bgImg.naturalWidth;
     const ih = bgImg.naturalHeight;
@@ -359,17 +441,17 @@ function drawCard(
     }
   } else {
     const g = ctx.createLinearGradient(x, y, x, y + h);
-    g.addColorStop(0, "rgba(11,15,26,0.94)");
-    g.addColorStop(1, "rgba(4,6,12,0.96)");
+    // opaque stops: at 100 % the content is gone, at 50 % it ghosts through
+    g.addColorStop(0, "rgb(11,15,26)");
+    g.addColorStop(1, "rgb(4,6,12)");
     ctx.fillStyle = g;
     ctx.fillRect(x, y, w, h);
   }
-  ctx.restore(); // back to full alpha for text + ring
 
   if (bgImg && !showText) {
     // photo-only card: just the accent ring, no words
     ctx.strokeStyle = accent;
-    ctx.globalAlpha = 0.5;
+    ctx.globalAlpha *= 0.5;
     ctx.lineWidth = 2 * k;
     shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x + 1, y + 1, w - 2, h - 2, radius);
     ctx.stroke();
@@ -393,7 +475,7 @@ function drawCard(
   ctx.fillText(sub, x + w / 2, y + h * 0.58, w * 0.88);
 
   ctx.strokeStyle = accent;
-  ctx.globalAlpha = 0.5;
+  ctx.globalAlpha *= 0.5;
   ctx.lineWidth = 2 * k;
   shapePath(ctx, layout.contentStyle?.shape ?? "rounded", x + 1, y + 1, w - 2, h - 2, radius);
   ctx.stroke();
@@ -529,14 +611,22 @@ function drawCloakedFrame(
       ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
       ctx.translate(-W / 2, -H / 2);
     }
+    // Mirror about the picture we are about to draw (never a fixed rect —
+    // the old code flipped the content rect of the *unzoomed* frame, so the
+    // mirrored pixels landed somewhere else: overrun on one side, gap on the
+    // other). `flip` is a legacy alias of flipContent.
+    const dx = (W - zw) / 2;
+    const dy = (H - zh) / 2;
+    if (c.flipContent || c.flip) {
+      ctx.translate(dx * 2 + zw, 0);
+      ctx.scale(-1, 1);
+    }
     const f = buildFilters();
     ctx.filter = f.length ? f.join(" ") : "none";
     try {
-      ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);
+      ctx.drawImage(video, sx, sy, sw, sh, dx, dy, zw, zh);
     } catch {}
     ctx.filter = "none";
-    // legacy path mirrors the content rect too — never the whole frame
-    if (c.flipContent || c.flip) mirrorContentRect(ctx, W, H, cr);
 
     if (c.grain > 0.5) {
       ctx.save();
@@ -681,39 +771,6 @@ function drawCloakedFrame(
  * scratch canvas — blurring a small bitmap and scaling it back up is an order of
  * magnitude cheaper than blurring the full frame every tick.
  */
-/** Mirror just the content rect in place (legacy cloak path — the
- * content-only path mirrors while drawing; the ffmpeg export crops the
- * rect, hflips it and pastes it back). */
-let mirrorScratch: HTMLCanvasElement | null = null;
-function mirrorContentRect(ctx: CanvasRenderingContext2D, W: number, H: number, cr: Rect) {
-  const cx = Math.round(cr.x * W);
-  const cy = Math.round(cr.y * H);
-  const cw = Math.round(cr.w * W);
-  const ch = Math.round(cr.h * H);
-  if (cw < 2 || ch < 2) return;
-  if (!mirrorScratch) mirrorScratch = document.createElement("canvas");
-  if (mirrorScratch.width !== cw || mirrorScratch.height !== ch) {
-    mirrorScratch.width = cw;
-    mirrorScratch.height = ch;
-  }
-  const tctx = mirrorScratch.getContext("2d");
-  if (!tctx) return;
-  tctx.save();
-  tctx.filter = "none";
-  tctx.globalAlpha = 1;
-  tctx.globalCompositeOperation = "source-over";
-  tctx.drawImage(ctx.canvas, cx, cy, cw, ch, 0, 0, cw, ch);
-  tctx.restore();
-  ctx.save();
-  ctx.filter = "none";
-  ctx.globalAlpha = 1;
-  ctx.globalCompositeOperation = "source-over";
-  ctx.translate(cx * 2 + cw, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(mirrorScratch, 0, 0, cw, ch, cx, cy, cw, ch);
-  ctx.restore();
-}
-
 export function renderScene(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,

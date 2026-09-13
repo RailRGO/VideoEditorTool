@@ -297,6 +297,42 @@ class ReactionEditor:
                          lambda v: setattr(lay.soloStyle, "zoom", v), fmt="{:.2f}×"),
         ])
 
+        # ---- card ----------------------------------------------------------
+        def card_text(desc, key, placeholder=""):
+            w = widgets.Text(value=str(getattr(lay.card, key, "") or ""),
+                             description=desc, placeholder=placeholder,
+                             layout=widgets.Layout(width="340px"))
+
+            def on_change(ch):
+                setattr(lay.card, key, str(ch["new"]))
+                self.refresh_soon()
+
+            w.observe(on_change, "value")
+            return w
+
+        card_show = widgets.Checkbox(value=bool(getattr(lay.card, "showText", True)),
+                                     description="Draw title + subtitle")
+        card_show.observe(lambda ch: (setattr(lay.card, "showText", bool(ch["new"])),
+                                      self.refresh_soon()), "value")
+        card_box = widgets.VBox([
+            widgets.HTML("<b>Card (Patreon placeholder)</b>"),
+            # 0 % hides the card completely, 100 % is fully opaque
+            self._slider("Opacity", 0.0, 1.0, 0.01,
+                         lambda: getattr(lay.card, "opacity", 0.9),
+                         lambda v: setattr(lay.card, "opacity", v), fmt="{:.0%}"),
+            self._slider("Short height", 0.3, 1.0, 0.01,
+                         lambda: getattr(lay.card, "shortHeight", 0.75),
+                         lambda v: setattr(lay.card, "shortHeight", v), fmt="{:.0%}"),
+            card_text("Title", "title", "Full uncut reaction on Patreon"),
+            card_text("Sub", "sub", "link in the description"),
+            card_text("Accent", "accent", "#e879f9"),
+            card_text("Image", "image", "custom background URL"),
+            card_show,
+            widgets.HTML("<i>Short cards cover the top of the content only "
+                         "(subtitles stay visible). The card is pinned to the "
+                         "content picture — fit/zoom/offset included.</i>"),
+        ])
+
         layout_tab = widgets.VBox([
             widgets.HBox([self.preset_dd, apply_preset]),
             widgets.HTML("<i>Tip: drag any slider and watch the Preview tab — "
@@ -307,6 +343,7 @@ class ReactionEditor:
                           style_sliders("Content style", lambda: lay.contentStyle)]),
             widgets.HBox([bg_box, widgets.VBox([solo_box, hide_content,
                                                  mute_solo, cam_side, src_mode])]),
+            card_box,
         ])
 
         # ---- retouch -------------------------------------------------------

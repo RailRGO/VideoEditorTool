@@ -7,9 +7,16 @@ Two suites. Neither needs a browser or a GPU.
 ```bash
 cd colab_version
 python3 webapp/tests/test_render_parts.py        # ~126 checks, ~2.5 min
-python3 webapp/tests/test_render_parts.py fast   # planning + card only, <1 s
+python3 webapp/tests/test_render_parts.py fast   # planning + card + limiter, <1 s, no ffmpeg
+python3 webapp/tests/parity_browser_vs_colab.py  # preview == render (node + esbuild)
 RENDER_TEST_DIR=/tmp/rt python3 webapp/tests/test_render_parts.py  # reuse fixtures
 ```
+
+The `fast` half (part planning, card geometry, card speed, the fair-use
+limiter, vignette parity) is pure math and needs no ffmpeg.
+`parity_browser_vs_colab.py` bundles the browser's `src/lib/*.ts` with esbuild
+and checks `contentPicture()`/`content_picture_rect()` and both limiter modes
+against the Python twins, so the preview and the render cannot drift apart.
 
 Builds its own fixtures (a 3840×1080 two-track capture and a 16:9
 three-track master of pure sine tones), then proves on the finished files:

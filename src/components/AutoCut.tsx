@@ -6,7 +6,7 @@ import { fmtTime } from "../lib/timeline";
 import { Btn, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { analyseTranscriptCut } from "../lib/transcriptCut";
 import type { FairUseOptions } from "../lib/fairUseCut";
-import { buildFairUseLimit } from "../lib/fairUseCut";
+import { buildFairUseLimit, defaultFairUse } from "../lib/fairUseCut";
 
 function EnvelopeChart({
   env,
@@ -249,6 +249,9 @@ export default function AutoCut({
   // don't count — this is what the limiter actually shortens).
   const bodyCurrent = fairUsePreview?.originalBody ?? (bodySpan.end - bodySpan.start);
   const preservedCards = fairUsePreview?.preservedCards ?? 0;
+  // A project saved before the "cards" mode existed has no mode/everySec/…,
+  // so fill the gaps here: the panel must never render `undefined.toFixed`.
+  const fu: FairUseOptions = { ...defaultFairUse, ...fairUseOpts };
 
   return (
     <div className="space-y-2.5">
@@ -730,121 +733,207 @@ export default function AutoCut({
         )}
       </Section>
 
-      <Section title="6 · Fair-use limiter (10 min rule)">
+      <Section title="6 · Fair-use limiter (Content ID)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          YouTube fair-use: keep the reaction part ≤10 min. Only shortens actual reaction footage —
-          cards and cuts left by the transcript step are preserved as-is, intro/outro never touched.
-          Keeps the most speech-dense parts (transcript or audio scan) and removes the rest. Run it
-          <em> after</em> the transcript cut for the shortest honest result.
+          Two different jobs, pick one. <strong className="text-slate-300">Short cards</strong> keeps
+          every second of the reaction and covers long talking stretches with short cards — nothing
+          is cut, Content ID just never gets an uninterrupted run.{" "}
+          <strong className="text-slate-300">Trim to limit</strong> is the harder tool that drops
+          footage until the reaction fits the budget.
         </p>
-        <div className="space-y-2">
-          <Slider
-            label="Max reaction time"
-            value={fairUseOpts.maxBodySec}
-            min={60}
-            max={900}
-            step={30}
-            display={fmtTime(fairUseOpts.maxBodySec)}
-            onChange={(v) => setFairUseOpts((o) => ({ ...o, maxBodySec: v }))}
-            hint="target duration for reaction part only"
+        <div className="mb-2">
+          <Segmented
+            value={fu.mode}
+            onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, mode: v as "cards" | "trim" }))}
+            options={[
+              { value: "cards", label: "Short cards (cut nothing)" },
+              { value: "trim", label: "Trim to limit" },
+            ]}
           />
-          <div className="grid grid-cols-2 gap-x-3">
-            <div>
-              <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">Removed parts</p>
-              <Segmented
-                value={fairUseOpts.removedAction}
-                onChange={(v) => setFairUseOpts((o) => ({ ...o, removedAction: v as any }))}
-                options={[
-                  { value: "cut", label: "Cut" },
-                  { value: "card", label: "Card" },
-                ]}
+        </div>
+
+        {fu.mode === "cards" ? (
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-x-3">
+              <Slider
+                label="Card every"
+                value={fu.everySec}
+                min={4}
+                max={30}
+                step={1}
+                display={`${fu.everySec} s of talk`}
+                onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, everySec: v }))}
+                hint="after this much continuous talking, a card goes up"
+              />
+              <Slider
+                label="Card length"
+                value={fu.cardSec}
+                min={1}
+                max={10}
+                step={0.5}
+                display={`${fu.cardSec.toFixed(1)} s`}
+                onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, cardSec: v }))}
               />
             </div>
-            <Slider
-              label="Keep context"
-              value={fairUseOpts.keepPad}
-              min={0}
-              max={3}
-              step={0.25}
-              display={`${fairUseOpts.keepPad.toFixed(2)} s`}
-              onChange={(v) => setFairUseOpts((o) => ({ ...o, keepPad: v }))}
-              hint="extra context around kept speech"
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-x-3">
-            <Slider
-              label="Breaker every (fair-use)"
-              value={fairUseOpts.maxSpeech}
-              min={0}
-              max={60}
-              step={5}
-              display={fairUseOpts.maxSpeech > 1 ? `${fairUseOpts.maxSpeech}s` : "off"}
-              onChange={(v) => setFairUseOpts((o) => ({ ...o, maxSpeech: v }))}
-              hint="long kept body chunks > this get a card breaker (keeps voice); 0 = off"
-            />
-            <Slider
-              label="Breaker duration"
-              value={fairUseOpts.breakerDuration}
-              min={1}
-              max={5}
-              step={0.5}
-              display={`${fairUseOpts.breakerDuration.toFixed(1)}s`}
-              onChange={(v) => setFairUseOpts((o) => ({ ...o, breakerDuration: v }))}
-            />
-          </div>
-          <div>
-            <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
-              Breaker card size
-            </p>
-            <Segmented
-              value={fairUseOpts.breakerVariant ?? "short"}
-              onChange={(v) => setFairUseOpts((o) => ({ ...o, breakerVariant: v as "full" | "short" }))}
-              options={[
-                { value: "short", label: "Short (subs visible)" },
-                { value: "full", label: "Full" },
-              ]}
-            />
-          </div>
-          <div className="rounded-lg border border-white/10 bg-black/25 p-2">
-            <div className="grid grid-cols-3 gap-1.5 text-center">
-              <div className="rounded border border-white/10 bg-black/30 p-1">
-                <p className="text-[8px] uppercase tracking-wider text-slate-500">reaction now</p>
-                <p className="font-mono text-[11px] text-slate-200">{fmtTime(bodyCurrent)}</p>
-              </div>
-              <div className="rounded border border-emerald-400/20 bg-emerald-500/10 p-1">
-                <p className="text-[8px] uppercase tracking-wider text-slate-400">target</p>
-                <p className="font-mono text-[11px] text-emerald-200">{fmtTime(fairUseOpts.maxBodySec)}</p>
-              </div>
-              <div className="rounded border border-amber-400/20 bg-amber-500/10 p-1">
-                <p className="text-[8px] uppercase tracking-wider text-slate-400">will save</p>
-                <p className="font-mono text-[11px] text-amber-200">{fmtTime(Math.max(0, bodyCurrent - fairUseOpts.maxBodySec))}</p>
-              </div>
+            <div className="grid grid-cols-2 gap-x-3">
+              <Slider
+                label="Only long talk"
+                value={fu.minRunSec}
+                min={0}
+                max={60}
+                step={2}
+                display={fu.minRunSec > 0 ? `≥ ${fu.minRunSec}s` : "any"}
+                onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, minRunSec: v }))}
+                hint="stretches shorter than this get no card"
+              />
+              <Slider
+                label="Speed under card"
+                value={fu.cardSpeed}
+                min={1}
+                max={2}
+                step={0.05}
+                display={fu.cardSpeed > 1.001 ? `${fu.cardSpeed.toFixed(2)}×` : "1× (off)"}
+                onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, cardSpeed: v }))}
+                hint="the card hides the picture, so it can play a little faster"
+              />
             </div>
-            {fairUsePreview && (
+            <p className="rounded border border-fuchsia-400/20 bg-fuchsia-500/10 px-2 py-1 text-[10px] leading-relaxed text-fuchsia-200/90">
+              Every card this step inserts is a <strong>short</strong> card — the bottom of the
+              content stays visible, so the subtitles and the reaction still read. The limiter
+              never places a full-height card.
+            </p>
+            <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+              <div className="grid grid-cols-3 gap-1.5 text-center">
+                <div className="rounded border border-white/10 bg-black/30 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-500">reaction</p>
+                  <p className="font-mono text-[11px] text-slate-200">{fmtTime(bodyCurrent)}</p>
+                </div>
+                <div className="rounded border border-fuchsia-400/20 bg-fuchsia-500/10 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-400">cards</p>
+                  <p className="font-mono text-[11px] text-fuchsia-200">
+                    {fairUsePreview?.cards ?? 0} × {fu.cardSec.toFixed(1)}s
+                  </p>
+                </div>
+                <div className="rounded border border-amber-400/20 bg-amber-500/10 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-400">under card</p>
+                  <p className="font-mono text-[11px] text-amber-200">
+                    {fmtTime(fairUsePreview?.cardTime ?? 0)}
+                  </p>
+                </div>
+              </div>
               <p className="mt-1.5 font-mono text-[9px] text-slate-500">
-                {fairUsePreview.totalBuckets} sec of reaction footage · keeping most speech-dense {fairUsePreview.keptBuckets}
-                {preservedCards > 0.5 ? ` · ${fmtTime(preservedCards)} of cards preserved` : ""}
-                {" · "}{transcript?.timed ? "transcript" : detection ? "audio scan" : "no speech info (keeps earliest)"}
+                keeps everything · {fairUsePreview?.mode === "cards" && (fairUsePreview?.cards ?? 0) === 0
+                  ? "no stretch is long enough for a card yet"
+                  : transcript?.timed
+                  ? "cards follow the transcript"
+                  : detection
+                  ? "cards follow the audio scan"
+                  : "no speech info — cards go over every long stretch"}
               </p>
-            )}
+            </div>
+            <Btn variant="primary" className="w-full py-1.5" onClick={onApplyFairUse} disabled={!hasSource}>
+              {fairUsePreview?.mode === "cards" && (fairUsePreview?.cards ?? 0) === 0
+                ? "Lay short cards over the long talk"
+                : `Lay ${fairUsePreview?.cards ?? 0} short card${(fairUsePreview?.cards ?? 0) === 1 ? "" : "s"} over the long talk`}
+            </Btn>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Nothing is removed: every kept second of the reaction stays, short cards are only laid
+              on top of the content. Default 8 s of talking → 4 s card, repeating, only inside
+              stretches at least {fu.minRunSec}s long — a 30 s talking stretch gets cards at 8–12 s
+              and 20–24 s. Play a touch faster under the card to claw back some of that time.
+            </p>
           </div>
-          <Btn
-            variant="primary"
-            className="w-full py-1.5"
-            onClick={onApplyFairUse}
-            disabled={!hasSource || bodyCurrent <= fairUseOpts.maxBodySec + 0.5}
-          >
-            {bodyCurrent > fairUseOpts.maxBodySec + 0.5
-              ? `Limit reaction to ${fmtTime(fairUseOpts.maxBodySec)} (keep speech-rich)`
-              : "Reaction already within limit"}
-          </Btn>
-          <p className="text-[10px] leading-relaxed text-slate-500">
-            Only rewrites reaction footage — cards, cuts, intro/outro preserved. Keeps the
-            highest-scoring seconds (speech overlap), preserves order, merges neighbours. Cards
-            already on the timeline keep their slot in the {fmtTime(fairUseOpts.maxBodySec)} budget.
-            “Card” for removed parts keeps a {fairUseOpts.cardDuration}s pointer to Patreon before cutting the rest.
-          </p>
-        </div>
+        ) : (
+          <div className="space-y-2">
+            <Slider
+              label="Max reaction time"
+              value={fu.maxBodySec}
+              min={60}
+              max={900}
+              step={30}
+              display={fmtTime(fu.maxBodySec)}
+              onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, maxBodySec: v }))}
+              hint="target duration for reaction part only"
+            />
+            <div className="grid grid-cols-2 gap-x-3">
+              <div>
+                <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">Removed parts</p>
+                <Segmented
+                  value={fu.removedAction}
+                  onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, removedAction: v as any }))}
+                  options={[
+                    { value: "cut", label: "Cut" },
+                    { value: "card", label: "Card pointer" },
+                  ]}
+                />
+              </div>
+              <Slider
+                label="Keep context"
+                value={fu.keepPad}
+                min={0}
+                max={3}
+                step={0.25}
+                display={`${fu.keepPad.toFixed(2)} s`}
+                onChange={(v) => setFairUseOpts((o) => ({ ...defaultFairUse, ...o, keepPad: v }))}
+                hint="extra context around kept speech"
+              />
+            </div>
+            <p className="rounded border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200/90">
+              This mode <strong>drops footage</strong> — it is the only way to hit a hard duration
+              target. Pointers it leaves behind are short cards, never full-height ones. Use{" "}
+              <em>Short cards</em> above if you would rather keep every second.
+            </p>
+            <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+              <div className="grid grid-cols-3 gap-1.5 text-center">
+                <div className="rounded border border-white/10 bg-black/30 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-500">reaction now</p>
+                  <p className="font-mono text-[11px] text-slate-200">{fmtTime(bodyCurrent)}</p>
+                </div>
+                <div className="rounded border border-emerald-400/20 bg-emerald-500/10 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-400">target</p>
+                  <p className="font-mono text-[11px] text-emerald-200">{fmtTime(fu.maxBodySec)}</p>
+                </div>
+                <div className="rounded border border-amber-400/20 bg-amber-500/10 p-1">
+                  <p className="text-[8px] uppercase tracking-wider text-slate-400">will save</p>
+                  <p className="font-mono text-[11px] text-amber-200">
+                    {fmtTime(Math.max(0, bodyCurrent - fu.maxBodySec))}
+                  </p>
+                </div>
+              </div>
+              {fairUsePreview && (
+                <p className="mt-1.5 font-mono text-[9px] text-slate-500">
+                  {fairUsePreview.totalBuckets} sec of reaction footage · keeping the most speech-dense{" "}
+                  {fairUsePreview.keptBuckets} (spread over the whole reaction)
+                  {preservedCards > 0.5 ? ` · ${fmtTime(preservedCards)} of cards preserved` : ""}
+                  {" · "}
+                  {transcript?.timed
+                    ? "transcript"
+                    : detection
+                    ? "audio scan"
+                    : "no speech info — samples the whole reaction evenly"}
+                </p>
+              )}
+            </div>
+            <Btn
+              variant="primary"
+              className="w-full py-1.5"
+              onClick={onApplyFairUse}
+              disabled={!hasSource || bodyCurrent <= fu.maxBodySec + 0.5}
+            >
+              {bodyCurrent > fu.maxBodySec + 0.5
+                ? `Drop footage to reach ${fmtTime(fu.maxBodySec)}`
+                : "Reaction already within limit"}
+            </Btn>
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Only rewrites reaction footage — cards, cuts and intro/outro are preserved. The
+              reaction is split into equal windows and the most speech-dense moment of each window
+              is kept, so start, middle and end all survive in order — the reaction stays the same
+              length from beginning to end and is never truncated after the first N minutes. Run the
+              audio scan (or transcribe) first — without speech info the windows are sampled evenly,
+              which keeps the pacing but not the best bits.
+            </p>
+          </div>
+        )}
       </Section>
 
       <Section title="7 · Video disguise (anti-Content ID)">
