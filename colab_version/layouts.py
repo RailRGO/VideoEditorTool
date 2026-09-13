@@ -70,6 +70,16 @@ class CardStyle:
     title: str = "Full uncut reaction on Patreon"
     sub: str = "link in the description"
     accent: str = "#e879f9"
+    # custom card background (data URL or file path); "" = generated gradient
+    image: str = ""
+    # draw the title/sub/accent bar over the custom image
+    showText: bool = True
+    # short-card height as a fraction of the content height (top-anchored,
+    # so subtitles at the bottom stay visible)
+    shortHeight: float = 0.62
+    # card background opacity 0..1 — the content ghosts through; the text
+    # itself always stays fully opaque
+    opacity: float = 0.9
 
 
 @dataclass
@@ -153,6 +163,10 @@ class LayoutState:
                 title=card.get("title", "Full uncut reaction on Patreon"),
                 sub=card.get("sub", "link in the description"),
                 accent=card.get("accent", "#e879f9"),
+                image=str(card.get("image", "") or ""),
+                showText=bool(card.get("showText", True)),
+                shortHeight=float(card.get("shortHeight", 0.62) or 0.62),
+                opacity=float(card.get("opacity", 0.9) or 0.9),
             ),
         )
 

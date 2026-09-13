@@ -4,7 +4,7 @@ import { LAYOUT_PRESETS } from "../lib/types";
 import { fmtTime } from "../lib/timeline";
 import type { Levels } from "../lib/audio";
 import type { RemoteJob } from "../lib/remote";
-import { Btn, LiveText, Meter, Note, Section, Segmented, Slider, Toggle } from "./ui";
+import { Btn, CardImagePicker, LiveText, Meter, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { cn } from "../utils/cn";
 
 /* ------------------------------------------------------------------ layout */
@@ -492,8 +492,15 @@ export function VideoPanel({
             />
             <span className="font-mono text-[10px] text-slate-500">{layout.card.accent}</span>
           </div>
+          <CardImagePicker
+            image={layout.card.image ?? ""}
+            showText={layout.card.showText !== false}
+            onImage={(v) => setLayout((l) => ({ ...l, card: { ...l.card, image: v } }))}
+            onShowText={(v) => setLayout((l) => ({ ...l, card: { ...l.card, showText: v } }))}
+          />
           <p className="text-[10px] leading-relaxed text-slate-500">
-            Shown full-frame wherever a CARD segment sits, with the programme audio silenced.
+            Covers the content area wherever a CARD segment sits (camera corner is restored
+            on top, so it never touches you), with the programme audio silenced.
           </p>
         </div>
       </Section>
@@ -740,6 +747,8 @@ export function ExportPanel({
   setPartTarget,
   stems = true,
   setStems,
+  audioFadeMs = 80,
+  setAudioFadeMs,
 }: {
   res: 720 | 1080;
   setRes: (v: 720 | 1080) => void;
@@ -779,6 +788,9 @@ export function ExportPanel({
   /** Patreon master: publish content-only + mic-only tracks behind the mix */
   stems?: boolean;
   setStems?: (v: boolean) => void;
+  /** join-fade length in ms at cut/card/mute edges (server renders) */
+  audioFadeMs?: number;
+  setAudioFadeMs?: (v: number) => void;
 }) {
   const job = remote?.job ?? null;
   const running = job?.state === "running";
@@ -908,6 +920,18 @@ export function ExportPanel({
                       tracks 2 and 3 are the isolated content and mic. The
                       YouTube cut reads those instead of the mix, so a mute or
                       card span silences the programme and keeps your voice."
+              />
+            )}
+            {setAudioFadeMs && (
+              <Slider
+                label="Audio join fades"
+                value={audioFadeMs}
+                min={0}
+                max={250}
+                step={10}
+                display={audioFadeMs > 0 ? `${audioFadeMs} ms` : "off"}
+                onChange={setAudioFadeMs}
+                hint="tiny fade in/out at every cut, card and mute edge so joins don't click"
               />
             )}
           </div>

@@ -17,6 +17,8 @@ Dependencies: numpy, opencv (cv2). ffmpeg binary is used when present
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import math
 import shutil
 import subprocess
@@ -251,6 +253,42 @@ def _fit_text(text: str, max_w: int, font: int, start: float, thick: int):
     return scale
 
 
+_card_img_cache: Dict[str, Optional[np.ndarray]] = {}
+
+
+def _load_card_image(spec: str) -> Optional[np.ndarray]:
+    """Decode a custom card background (data URL or file path) to BGR.
+
+    Cached: the Patreon compositor calls card_overlay once per frame, and
+    re-decoding a base64 photo 30×/s would be silly.
+    """
+    s = (spec or "").strip()
+    if not s:
+        return None
+    key = s if len(s) < 8192 else hashlib.sha1(
+        s.encode("utf-8", "ignore")).hexdigest()
+    if key in _card_img_cache:
+        return _card_img_cache[key]
+    img = None
+    try:
+        if s.startswith("data:"):
+            b64 = s.split(",", 1)[1] if "," in s else ""
+            raw = base64.b64decode(b64)
+            img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            p = Path(s)
+            if p.is_file() and p.stat().st_size < 20_000_000:
+                img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+    except Exception:
+        img = None
+    if img is not None and (img.size == 0 or img.ndim != 3):
+        img = None
+    if len(_card_img_cache) > 8:
+        _card_img_cache.clear()
+    _card_img_cache[key] = img
+    return img
+
+
 def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
                  W: int, H: int) -> Tuple[np.ndarray, int, int]:
     """The placeholder card as a standalone BGRA (RGBA) image.
@@ -263,6 +301,15 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     it with drawbox/drawtext.
 
     Returns (bgra, x0, y0); the array is empty when the rect is degenerate.
+
+    When the card carries a custom image, the photo is the background
+    (cover-fit, clipped to the card shape) and the text is drawn over a
+    gentle dim — unless showText is off, which yields a photo-only card.
+
+    A "short" card (card["variant"]) covers only the top shortHeight of the
+    content rect, so subtitles at the bottom stay visible. The backdrop is
+    painted at layout.card.opacity so the content ghosts through; the bar +
+    words always stay fully opaque.
     """
     k = H / 1080.0
     card = card or {}   # a card span with no text of its own is normal
@@ -273,9 +320,20 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     title = pick(card.get("title")) or layout.card.title
     sub = pick(card.get("sub")) or layout.card.sub
     accent = pick(card.get("accent")) or layout.card.accent
+    img_spec = pick(card.get("image")) or getattr(layout.card, "image", "") or ""
+    show_text = card.get("showText", getattr(layout.card, "showText", True))
+    show_text = False if show_text is False else True
+    variant = str(card.get("variant") or "full").strip().lower()
+    short_h = float(getattr(layout.card, "shortHeight", 0.62) or 0.62)
+    short_h = max(0.2, min(1.0, short_h))
+    opacity = float(getattr(layout.card, "opacity", 0.9) or 0.9)
+    opacity = max(0.05, min(1.0, opacity))
     x, y, w, h = (int(round(v)) for v in layout.content.px(W, H))
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
+    if variant == "short":
+        # top-anchored: the bottom of the content (subtitles) stays visible
+        y1 = min(y1, y0 + max(8, int(round((y1 - y0) * short_h))))
     if x1 - x0 < 8 or y1 - y0 < 8:
         return np.zeros((0, 0, 4), np.uint8), x0, y0
     fw, fh = x1 - x0, y1 - y0
@@ -293,29 +351,49 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     # (glyph edges punch alpha holes), which would make the text vanish
     # once the overlay is composited. Drawing into a plain BGR layer is the
     # same math draw_card always did onto the canvas.
-    top = np.array((26, 15, 11), np.float32)   # #0b0f1a
-    bot = np.array((12, 6, 4), np.float32)     # #04060c
-    t = np.linspace(0, 1, fh, dtype=np.float32)[:, None, None]
-    grad = (top * (1 - t) + bot * t).astype(np.uint8)
-    rgb = np.repeat(grad, fw, axis=1)
+    bg_img = _load_card_image(img_spec)
+    if bg_img is not None:
+        rgb = _cover_resize(bg_img, fw, fh)
+        if show_text:
+            # same gentle dim the browser draws so the headline stays readable
+            rgb = (rgb.astype(np.float32) * 0.55 + 2.0).astype(np.uint8)
+    else:
+        top = np.array((26, 15, 11), np.float32)   # #0b0f1a
+        bot = np.array((12, 6, 4), np.float32)     # #04060c
+        t = np.linspace(0, 1, fh, dtype=np.float32)[:, None, None]
+        grad = (top * (1 - t) + bot * t).astype(np.uint8)
+        rgb = np.repeat(grad, fw, axis=1)
 
     accent_bgr = hex_to_bgr(accent)
-    # accent bar
-    bx, by = int(fw * 0.16), int(fh * 0.34)
-    cv2.rectangle(rgb, (bx, by), (int(fw * 0.84), int(by + max(2, 4 * k))),
-                  accent_bgr, -1)
-    # title + sub, centered
-    font = cv2.FONT_HERSHEY_DUPLEX
-    size = max(0.4, min(2.2 * k, (fw * 0.072) / 20.0))
-    size = _fit_text(title, int(fw * 0.88), font, size, 2)
-    (tw, th), _ = cv2.getTextSize(title, font, size, 2)
-    cv2.putText(rgb, title, (int((fw - tw) / 2), int(fh * 0.47 + th / 2)),
-                font, size, (241, 245, 249), 2, cv2.LINE_AA)
-    s2 = _fit_text(sub, int(fw * 0.88),
-                   cv2.FONT_HERSHEY_SIMPLEX, size * 0.62, 1)
-    (tw2, th2), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
-    cv2.putText(rgb, sub, (int((fw - tw2) / 2), int(fh * 0.58 + th2 / 2)),
-                cv2.FONT_HERSHEY_SIMPLEX, s2, (200, 210, 225), 1, cv2.LINE_AA)
+    if bg_img is not None and not show_text:
+        photo_only = True
+    else:
+        photo_only = False
+    # bar + glyphs painted white-on-black: this mask stays fully opaque so
+    # the words stay crisp while the backdrop turns translucent
+    fg = np.zeros((fh, fw), np.uint8)
+    if not photo_only:
+        # accent bar
+        bx, by = int(fw * 0.16), int(fh * 0.34)
+        bar = ((bx, by), (int(fw * 0.84), int(by + max(2, 4 * k))))
+        cv2.rectangle(rgb, bar[0], bar[1], accent_bgr, -1)
+        cv2.rectangle(fg, bar[0], bar[1], 255, -1)
+        # title + sub, centered
+        font = cv2.FONT_HERSHEY_DUPLEX
+        size = max(0.4, min(2.2 * k, (fw * 0.072) / 20.0))
+        size = _fit_text(title, int(fw * 0.88), font, size, 2)
+        (tw, th), _ = cv2.getTextSize(title, font, size, 2)
+        torg = (int((fw - tw) / 2), int(fh * 0.47 + th / 2))
+        cv2.putText(rgb, title, torg, font, size, (241, 245, 249), 2, cv2.LINE_AA)
+        cv2.putText(fg, title, torg, font, size, 255, 2, cv2.LINE_AA)
+        s2 = _fit_text(sub, int(fw * 0.88),
+                       cv2.FONT_HERSHEY_SIMPLEX, size * 0.62, 1)
+        (tw2, th2), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, s2, 1)
+        sorg = (int((fw - tw2) / 2), int(fh * 0.58 + th2 / 2))
+        cv2.putText(rgb, sub, sorg, cv2.FONT_HERSHEY_SIMPLEX, s2,
+                    (200, 210, 225), 1, cv2.LINE_AA)
+        cv2.putText(fg, sub, sorg, cv2.FONT_HERSHEY_SIMPLEX, s2, 255, 1,
+                    cv2.LINE_AA)
     # accent ring (2*k px inset stroke at 50%, like draw_card always drew)
     outer = shape_mask(fw, fh, content_shape, radius)
     inner = np.zeros_like(outer)
@@ -327,7 +405,11 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
     rgb = (rgb.astype(np.float32) * (1 - ring[..., None]) +
            np.array(accent_bgr, np.float32) * ring[..., None]).astype(np.uint8)
-    return np.dstack([rgb, mask]), x0, y0
+    alpha = (mask.astype(np.float32) * opacity).astype(np.uint8)
+    if not photo_only:
+        # the backdrop turns translucent, but the bar + words stay solid
+        alpha[fg > 0] = 255
+    return np.dstack([rgb, alpha]), x0, y0
 
 
 def draw_card(canvas: np.ndarray, layout: LayoutState,
@@ -440,8 +522,10 @@ def compose_frame(frame: np.ndarray, layout: LayoutState,
     if mode == "solo":
         draw_layer(canvas, cam, Rect(0, 0, 1, 1), layout.soloStyle)
     elif mode == "card":
-        draw_layer(canvas, cam, layout.cam, layout.camStyle)
+        # placeholder first, camera on top: the card covers the content 100%
+        # yet can never touch the camera, even when the rects overlap
         draw_card(canvas, layout, card)
+        draw_layer(canvas, cam, layout.cam, layout.camStyle)
     elif mode == "lead":
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
         draw_lead_block(canvas, layout)

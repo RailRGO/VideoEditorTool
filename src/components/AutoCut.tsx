@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { CutOptions, LayoutState, TranscriptCutOptions, VideoCloak } from "../lib/types";
+import type { CutOptions, LayoutState, Segment, TranscriptCutOptions, VideoCloak } from "../lib/types";
 import type { Detection, Envelope } from "../lib/analyze";
 import type { Transcript } from "../lib/polish";
 import { fmtTime } from "../lib/timeline";
@@ -149,6 +149,8 @@ export default function AutoCut({
   trError,
   onApplyTranscriptCut,
   bodySpan,
+  segments,
+  fastSpeed,
   fairUseOpts,
   setFairUseOpts,
   onApplyFairUse,
@@ -190,6 +192,8 @@ export default function AutoCut({
   trError: string;
   onApplyTranscriptCut: () => void;
   bodySpan: { start: number; end: number };
+  segments: Segment[];
+  fastSpeed: number;
   fairUseOpts: FairUseOptions;
   setFairUseOpts: React.Dispatch<React.SetStateAction<FairUseOptions>>;
   onApplyFairUse: () => void;
@@ -223,27 +227,28 @@ export default function AutoCut({
   })();
 
   const fairUsePreview = (() => {
-    if (!duration || bodySpan.end - bodySpan.start < 1) return null;
+    if (!duration || !segments.length || bodySpan.end - bodySpan.start < 1) return null;
     try {
       const speech = transcript?.timed ? transcript.words : detection?.regions ?? null;
       const { report } = buildFairUseLimit(
-        [],
+        segments,
         duration,
         fairUseOpts,
         speech as any,
         bodySpan,
-        detection?.regions ?? null
+        detection?.regions ?? null,
+        fastSpeed
       );
-      // When passing empty segments, report uses bodySpan as original
-      // So compute original from bodySpan
-      const orig = bodySpan.end - bodySpan.start;
-      return { ...report, originalBody: orig, limitedBody: Math.min(orig, fairUseOpts.maxBodySec), saved: Math.max(0, orig - fairUseOpts.maxBodySec) };
+      return report;
     } catch {
       return null;
     }
   })();
 
-  const bodyCurrent = bodySpan.end - bodySpan.start;
+  // Kept programme inside the reaction span (cuts produce no output, so they
+  // don't count — this is what the limiter actually shortens).
+  const bodyCurrent = fairUsePreview?.originalBody ?? (bodySpan.end - bodySpan.start);
+  const preservedCards = fairUsePreview?.preservedCards ?? 0;
 
   return (
     <div className="space-y-2.5">
@@ -652,12 +657,12 @@ export default function AutoCut({
               <Slider
                 label="Breaker every (long speech)"
                 value={transcriptCutOpts.maxSpeech}
-                min={10}
+                min={0}
                 max={60}
                 step={5}
-                display={`${transcriptCutOpts.maxSpeech}s`}
+                display={transcriptCutOpts.maxSpeech > 1 ? `${transcriptCutOpts.maxSpeech}s` : "off"}
                 onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, maxSpeech: v }))}
-                hint="long continuous mic speech > this gets a card over content to break ContentID (keeps voice)"
+                hint="long continuous mic speech > this gets a card over content to break ContentID (keeps voice); 0 = off"
               />
               <Slider
                 label="Breaker card duration"
@@ -668,6 +673,21 @@ export default function AutoCut({
                 display={`${transcriptCutOpts.breakerDuration.toFixed(1)}s`}
                 onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, breakerDuration: v }))}
                 hint="how long card covers content during long monologs (voice stays via stems)"
+              />
+            </div>
+            <div className="mt-2">
+              <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
+                Breaker card size
+              </p>
+              <Segmented
+                value={transcriptCutOpts.breakerVariant ?? "short"}
+                onChange={(v) =>
+                  setTranscriptCutOpts((o) => ({ ...o, breakerVariant: v as "full" | "short" }))
+                }
+                options={[
+                  { value: "short", label: "Short (subs visible)" },
+                  { value: "full", label: "Full" },
+                ]}
               />
             </div>
 
@@ -712,9 +732,10 @@ export default function AutoCut({
 
       <Section title="6 · Fair-use limiter (10 min rule)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          YouTube fair-use: keep reaction body ≤10 min. Intro/outro are never touched. When you have
-          little commentary, this keeps only the most speech-dense parts (from transcript or audio scan)
-          and cuts the rest. Use after the transcript cut for best result.
+          YouTube fair-use: keep the reaction part ≤10 min. Only shortens actual reaction footage —
+          cards and cuts left by the transcript step are preserved as-is, intro/outro never touched.
+          Keeps the most speech-dense parts (transcript or audio scan) and removes the rest. Run it
+          <em> after</em> the transcript cut for the shortest honest result.
         </p>
         <div className="space-y-2">
           <Slider
@@ -754,12 +775,12 @@ export default function AutoCut({
             <Slider
               label="Breaker every (fair-use)"
               value={fairUseOpts.maxSpeech}
-              min={10}
+              min={0}
               max={60}
               step={5}
-              display={`${fairUseOpts.maxSpeech}s`}
+              display={fairUseOpts.maxSpeech > 1 ? `${fairUseOpts.maxSpeech}s` : "off"}
               onChange={(v) => setFairUseOpts((o) => ({ ...o, maxSpeech: v }))}
-              hint="long kept body chunks > this get card breaker (keeps voice)"
+              hint="long kept body chunks > this get a card breaker (keeps voice); 0 = off"
             />
             <Slider
               label="Breaker duration"
@@ -769,6 +790,19 @@ export default function AutoCut({
               step={0.5}
               display={`${fairUseOpts.breakerDuration.toFixed(1)}s`}
               onChange={(v) => setFairUseOpts((o) => ({ ...o, breakerDuration: v }))}
+            />
+          </div>
+          <div>
+            <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
+              Breaker card size
+            </p>
+            <Segmented
+              value={fairUseOpts.breakerVariant ?? "short"}
+              onChange={(v) => setFairUseOpts((o) => ({ ...o, breakerVariant: v as "full" | "short" }))}
+              options={[
+                { value: "short", label: "Short (subs visible)" },
+                { value: "full", label: "Full" },
+              ]}
             />
           </div>
           <div className="rounded-lg border border-white/10 bg-black/25 p-2">
@@ -788,7 +822,9 @@ export default function AutoCut({
             </div>
             {fairUsePreview && (
               <p className="mt-1.5 font-mono text-[9px] text-slate-500">
-                {fairUsePreview.totalBuckets} sec buckets · keeping most speech-dense {fairUsePreview.keptBuckets} · transcript {transcript?.timed ? "yes" : detection ? "audio scan" : "none (chronological)"}
+                {fairUsePreview.totalBuckets} sec of reaction footage · keeping most speech-dense {fairUsePreview.keptBuckets}
+                {preservedCards > 0.5 ? ` · ${fmtTime(preservedCards)} of cards preserved` : ""}
+                {" · "}{transcript?.timed ? "transcript" : detection ? "audio scan" : "no speech info (keeps earliest)"}
               </p>
             )}
           </div>
@@ -803,7 +839,10 @@ export default function AutoCut({
               : "Reaction already within limit"}
           </Btn>
           <p className="text-[10px] leading-relaxed text-slate-500">
-            Only rewrites body — intro/outro preserved. Keeps highest-scoring seconds (speech overlap), preserves order, merges neighbours. If no transcript/scan, keeps first {fmtTime(fairUseOpts.maxBodySec)}.
+            Only rewrites reaction footage — cards, cuts, intro/outro preserved. Keeps the
+            highest-scoring seconds (speech overlap), preserves order, merges neighbours. Cards
+            already on the timeline keep their slot in the {fmtTime(fairUseOpts.maxBodySec)} budget.
+            “Card” for removed parts keeps a {fairUseOpts.cardDuration}s pointer to Patreon before cutting the rest.
           </p>
         </div>
       </Section>
@@ -816,16 +855,21 @@ export default function AutoCut({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setVideoCloak((c) => ({ ...c, flip: !c.flip }))}
+              onClick={() =>
+                setVideoCloak((c) => {
+                  const on = !(c.flipContent || c.flip);
+                  return { ...c, flipContent: on, flip: false };
+                })
+              }
               className={
-                videoCloak.flip
+                videoCloak.flipContent || videoCloak.flip
                   ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
                   : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"
               }
             >
-              {videoCloak.flip ? "Mirror ON (hflip)" : "Mirror off"}
+              {videoCloak.flipContent || videoCloak.flip ? "Mirror content ON" : "Mirror content off"}
             </button>
-            <span className="text-[10px] text-slate-500">Flips whole frame horizontally</span>
+            <span className="text-[10px] text-slate-500">Mirrors the content area only — camera and card text stay readable</span>
           </div>
           <div className="grid grid-cols-2 gap-x-3">
             <Slider label="Zoom" value={videoCloak.zoom} min={1} max={1.12} step={0.005} display={`${Math.round((videoCloak.zoom - 1) * 1000) / 10}%`} onChange={(v) => setVideoCloak((c) => ({ ...c, zoom: v }))} />

@@ -12,7 +12,7 @@ import {
   segSpeed,
   tidy,
 } from "../lib/timeline";
-import { Btn, Note, Section, Slider, Toggle } from "./ui";
+import { Btn, CardImagePicker, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { cn } from "../utils/cn";
 
 const ALL_TYPES = Object.keys(SEGMENT_META) as SegmentType[];
@@ -116,6 +116,14 @@ function Row({
           </option>
         ))}
       </select>
+      {s.type === "card" && s.card?.variant === "short" && (
+        <span
+          className="shrink-0 rounded border border-fuchsia-400/30 bg-fuchsia-500/15 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-fuchsia-200"
+          title="Short card — subtitles stay visible"
+        >
+          short
+        </span>
+      )}
       <TimeInput
         title="Start (source time)"
         value={s.start}
@@ -178,14 +186,17 @@ export default function SegmentsPanel({
   /** edit one card's overrides; empty values inherit the global card */
   const onCardChange = (
     id: string,
-    patch: { title?: string; sub?: string; accent?: string }
+    patch: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" }
   ) => {
-    const card: { title?: string; sub?: string; accent?: string } = {};
+    const card: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" } = {};
     const src = segments.find((s) => s.id === id)?.card ?? {};
     for (const k of ["title", "sub", "accent"] as const) {
       const v = patch[k] !== undefined ? patch[k] : src[k];
       if (v != null && v.trim() !== "") card[k] = v;
     }
+    // "full" is the default — only short is stored on the segment
+    const variant = patch.variant !== undefined ? patch.variant : src.variant;
+    if (variant === "short") card.variant = "short";
     onCommit(
       segments.map((s) =>
         s.id === id ? { ...s, card: Object.keys(card).length ? card : undefined } : s
@@ -297,6 +308,18 @@ export default function SegmentsPanel({
                     </button>
                   )}
                 </div>
+                <Segmented
+                  value={selected.card?.variant ?? "full"}
+                  onChange={(v) => onCardChange(selected.id, { variant: v as "full" | "short" })}
+                  options={[
+                    { value: "full", label: "Full card" },
+                    { value: "short", label: "Short card" },
+                  ]}
+                />
+                <p className="text-[10px] leading-relaxed text-slate-500">
+                  Short covers the top {Math.round((layout.card.shortHeight ?? 0.62) * 100)}% only —
+                  subtitles stay visible. Both mute the content audio.
+                </p>
               </div>
             )}
             <div className="flex gap-1.5">
@@ -382,6 +405,32 @@ export default function SegmentsPanel({
             />
             <span className="font-mono text-[10px] text-slate-500">{layout.card.accent}</span>
           </div>
+          <CardImagePicker
+            image={layout.card.image ?? ""}
+            showText={layout.card.showText !== false}
+            onImage={(v) => setLayout((l) => ({ ...l, card: { ...l.card, image: v } }))}
+            onShowText={(v) => setLayout((l) => ({ ...l, card: { ...l.card, showText: v } }))}
+          />
+          <Slider
+            label="Background opacity"
+            value={Math.round((layout.card.opacity ?? 0.9) * 100)}
+            min={50}
+            max={100}
+            step={1}
+            display={`${Math.round((layout.card.opacity ?? 0.9) * 100)}%`}
+            onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, opacity: v / 100 } }))}
+            hint="the content ghosts through underneath — 90% keeps it barely visible"
+          />
+          <Slider
+            label="Short card height"
+            value={Math.round((layout.card.shortHeight ?? 0.62) * 100)}
+            min={30}
+            max={90}
+            step={1}
+            display={`${Math.round((layout.card.shortHeight ?? 0.62) * 100)}% of content`}
+            onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, shortHeight: v / 100 } }))}
+            hint="short cards cover the top only — subtitles at the bottom stay visible"
+          />
         </div>
       </Section>
 

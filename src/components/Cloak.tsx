@@ -166,12 +166,8 @@ export default function CloakPanel({
           </div>
           <div className="mt-3 space-y-2">
             <div className="flex items-center gap-2">
-              <button type="button" onClick={() => setV({ flip: !video.flip })} className={video.flip ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flip ? "Mirror whole ON" : "Mirror whole off"}</button>
-              <span className="text-[10px] text-slate-500">Flips entire frame — strongest evasion, but mirrors camera</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <button type="button" onClick={() => setV({ flipContent: !video.flipContent })} className={video.flipContent ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flipContent ? "Mirror content ON" : "Mirror content off"}</button>
-              <span className="text-[10px] text-slate-500">Mirrors only watched video, camera stays readable (recommended)</span>
+              <button type="button" onClick={() => setV({ flipContent: !(video.flipContent || video.flip), flip: false })} className={video.flipContent || video.flip ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flipContent || video.flip ? "Mirror content ON" : "Mirror content off"}</button>
+              <span className="text-[10px] text-slate-500">Mirrors only the watched video — camera and card text stay readable</span>
             </div>
           </div>
           <div className="mt-2">

@@ -1,6 +1,114 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { cn } from "../utils/cn";
 
+/**
+ * Downscale an uploaded picture to a card-sized JPEG data URL (≤1280px wide).
+ * Keeps project files and autosaves small — a full-res phone photo would be
+ * megabytes of base64 for a 1344×756 card.
+ */
+export function fileToCardImage(file: File, maxW = 1280): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const iw = img.naturalWidth || 1;
+        const ih = img.naturalHeight || 1;
+        const s = Math.min(1, maxW / iw);
+        const w = Math.max(2, Math.round(iw * s));
+        const h = Math.max(2, Math.round(ih * s));
+        const cv = document.createElement("canvas");
+        cv.width = w;
+        cv.height = h;
+        const ctx = cv.getContext("2d");
+        if (!ctx) throw new Error("no 2d context");
+        ctx.fillStyle = "#04060c";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        resolve(cv.toDataURL("image/jpeg", 0.85));
+      } catch (e) {
+        URL.revokeObjectURL(url);
+        reject(e);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("could not read that image"));
+    };
+    img.src = url;
+  });
+}
+
+/** Custom card background picker: upload / preview / remove + text toggle. */
+export function CardImagePicker({
+  image,
+  showText,
+  onImage,
+  onShowText,
+}: {
+  image: string;
+  showText: boolean;
+  onImage: (dataUrl: string) => void;
+  onShowText: (v: boolean) => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const has = image.trim().length > 0;
+  return (
+    <div className="rounded-lg border border-white/10 bg-black/25 p-2">
+      <div className="flex items-center gap-2">
+        {has ? (
+          <img
+            src={image}
+            alt="card background"
+            className="h-10 w-[72px] shrink-0 rounded border border-white/15 object-cover"
+          />
+        ) : (
+          <div className="flex h-10 w-[72px] shrink-0 items-center justify-center rounded border border-dashed border-white/15 text-[9px] text-slate-500">
+            no image
+          </div>
+        )}
+        <div className="flex min-w-0 flex-1 gap-1.5">
+          <Btn className="flex-1" onClick={() => ref.current?.click()}>
+            {has ? "Change image…" : "Use image…"}
+          </Btn>
+          {has && (
+            <Btn title="Back to the generated gradient card" onClick={() => onImage("")}>
+              ✕
+            </Btn>
+          )}
+        </div>
+        <input
+          ref={ref}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (f) void fileToCardImage(f).then(onImage).catch(() => {});
+          }}
+        />
+      </div>
+      {has && (
+        <div className="mt-1">
+          <Toggle
+            label="Show headline over the image"
+            hint="off = photo-only card"
+            value={showText}
+            onChange={onShowText}
+          />
+        </div>
+      )}
+      <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
+        {has
+          ? "The picture covers the content area (same shape as the content box); the camera corner stays visible. Saved inside the project."
+          : "Optional: a photo/poster instead of the generated card — e.g. a “full video on Patreon” graphic."}
+      </p>
+    </div>
+  );
+}
+
 export function Section({
   title,
   right,
