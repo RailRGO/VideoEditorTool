@@ -648,6 +648,29 @@ export default function AutoCut({
               </div>
             </div>
 
+            <div className="mt-2 grid grid-cols-2 gap-x-3">
+              <Slider
+                label="Breaker every (long speech)"
+                value={transcriptCutOpts.maxSpeech}
+                min={10}
+                max={60}
+                step={5}
+                display={`${transcriptCutOpts.maxSpeech}s`}
+                onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, maxSpeech: v }))}
+                hint="long continuous mic speech > this gets a card over content to break ContentID (keeps voice)"
+              />
+              <Slider
+                label="Breaker card duration"
+                value={transcriptCutOpts.breakerDuration}
+                min={1}
+                max={5}
+                step={0.5}
+                display={`${transcriptCutOpts.breakerDuration.toFixed(1)}s`}
+                onChange={(v) => setTranscriptCutOpts((o) => ({ ...o, breakerDuration: v }))}
+                hint="how long card covers content during long monologs (voice stays via stems)"
+              />
+            </div>
+
             {trReport && (
               <div className="rounded-lg border border-white/10 bg-black/25 p-2">
                 <div className="grid grid-cols-3 gap-1.5 text-center">
@@ -725,6 +748,27 @@ export default function AutoCut({
               display={`${fairUseOpts.keepPad.toFixed(2)} s`}
               onChange={(v) => setFairUseOpts((o) => ({ ...o, keepPad: v }))}
               hint="extra context around kept speech"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-x-3">
+            <Slider
+              label="Breaker every (fair-use)"
+              value={fairUseOpts.maxSpeech}
+              min={10}
+              max={60}
+              step={5}
+              display={`${fairUseOpts.maxSpeech}s`}
+              onChange={(v) => setFairUseOpts((o) => ({ ...o, maxSpeech: v }))}
+              hint="long kept body chunks > this get card breaker (keeps voice)"
+            />
+            <Slider
+              label="Breaker duration"
+              value={fairUseOpts.breakerDuration}
+              min={1}
+              max={5}
+              step={0.5}
+              display={`${fairUseOpts.breakerDuration.toFixed(1)}s`}
+              onChange={(v) => setFairUseOpts((o) => ({ ...o, breakerDuration: v }))}
             />
           </div>
           <div className="rounded-lg border border-white/10 bg-black/25 p-2">

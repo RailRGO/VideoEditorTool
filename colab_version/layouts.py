@@ -339,20 +339,22 @@ def default_audio_cloak() -> Dict[str, Any]:
 def default_video_cloak() -> Dict[str, Any]:
     return {
         "on": True,
-        "zoom": 1.03,
-        "bars": 3.0,       # % of height, top + bottom
+        "zoom": 1.0,
+        "bars": 0.0,       # % of height, top + bottom — 0 by default to avoid black lines
         "border": 0.0,     # px @1080p
         "borderColor": "#0ea5e9",
-        "saturate": 108.0,
-        "contrast": 104.0,
+        "saturate": 100.0,
+        "contrast": 100.0,
         "brightness": 100.0,
         "hue": 0.0,
-        "grain": 12.0,
-        "vignette": 25.0,
-        "flip": False,     # horizontal mirror — strongest Content ID evasion
+        "grain": 0.0,
+        "vignette": 0.0,
+        "flip": False,     # horizontal mirror full frame — strongest Content ID evasion
+        "flipContent": False,  # mirror only content area — keeps camera readable
         "blur": 0.0,       # subtle blur px
         "rotate": 0.0,     # degrees -5..5
         "speed": 1.0,      # global playback speed tweak 0.95..1.05
+        "contentOnly": True,  # when true, zoom/blur/rotate/hue/sat/cont/bri/grain/flipContent affect only content rect
     }
 
 

@@ -279,8 +279,14 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     if x1 - x0 < 8 or y1 - y0 < 8:
         return np.zeros((0, 0, 4), np.uint8), x0, y0
     fw, fh = x1 - x0, y1 - y0
-    radius = min(28.0 * k, min(fw, fh) / 2.0)
-    mask = shape_mask(fw, fh, "rounded", radius)
+    # Use same radius/shape as content layer so card fully covers content (no corner gaps)
+    content_radius = float(getattr(layout.contentStyle, "radius", 10.0))
+    content_shape = getattr(layout.contentStyle, "shape", "rounded")
+    if content_shape == "rect":
+        radius = 0.0
+    else:
+        radius = min(content_radius * k, min(fw, fh) / 2.0)
+    mask = shape_mask(fw, fh, content_shape, radius)
 
     # Colour and alpha are built separately and only joined at the end:
     # cv2's anti-aliased drawing rewrites the 4th channel of a BGRA image
@@ -311,11 +317,11 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     cv2.putText(rgb, sub, (int((fw - tw2) / 2), int(fh * 0.58 + th2 / 2)),
                 cv2.FONT_HERSHEY_SIMPLEX, s2, (200, 210, 225), 1, cv2.LINE_AA)
     # accent ring (2*k px inset stroke at 50%, like draw_card always drew)
-    outer = shape_mask(fw, fh, "rounded", radius)
+    outer = shape_mask(fw, fh, content_shape, radius)
     inner = np.zeros_like(outer)
     b = max(1, int(round(2 * k)))
     if fw - 2 * b > 2 and fh - 2 * b > 2:
-        ring_in = shape_mask(fw - 2 * b, fh - 2 * b, "rounded",
+        ring_in = shape_mask(fw - 2 * b, fh - 2 * b, content_shape,
                              max(0.0, radius - b))
         inner[b:b + fh - 2 * b, b:b + fw - 2 * b] = ring_in
     ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
@@ -627,7 +633,7 @@ def _has_nvenc() -> bool:
 
 
 def _open_writer(path: str, W: int, H: int, fps: float,
-                 crf: int = 18, preset: str = "fast"):
+                 crf: int = 23, preset: str = "fast"):
     """Prefer an ffmpeg rawvideo pipe; fall back to cv2.VideoWriter.
 
     If a T4 GPU is present (h264_nvenc encoder exists), use it — ~5-10x
@@ -641,7 +647,7 @@ def _open_writer(path: str, W: int, H: int, fps: float,
                    "-f", "rawvideo", "-pix_fmt", "bgr24",
                    "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
                    "-an", "-c:v", "h264_nvenc", "-preset", "p4",
-                   "-rc", "vbr_hq", "-cq", str(int(crf)), "-b:v", "0",
+                   "-rc", "vbr_hq", "-cq", str(int(crf)), "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M",
                    "-pix_fmt", "yuv420p",
                    "-movflags", "+faststart", str(path)]
         else:
@@ -649,7 +655,7 @@ def _open_writer(path: str, W: int, H: int, fps: float,
                    "-f", "rawvideo", "-pix_fmt", "bgr24",
                    "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-",
                    "-an", "-c:v", "libx264", "-preset", preset,
-                   "-crf", str(int(crf)), "-pix_fmt", "yuv420p",
+                   "-crf", str(int(crf)), "-maxrate", "8M", "-bufsize", "16M", "-pix_fmt", "yuv420p",
                    "-movflags", "+faststart", str(path)]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
@@ -665,7 +671,7 @@ def render_video(input_path: str, output_path: str,
                  layout: Optional[LayoutState] = None,
                  segments: Optional[List[Segment]] = None,
                  fps: Optional[float] = None,
-                 crf: int = 18, preset: str = "fast",
+                 crf: int = 23, preset: str = "fast",
                  width: int = 1920, height: int = 1080,
                  progress_cb: Optional[Callable[[int, int], None]] = None,
                  cancel_check: Optional[Callable[[], bool]] = None,
