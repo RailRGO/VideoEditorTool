@@ -156,22 +156,25 @@ export function buildPassthroughScene(
   const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
   const type = active?.type ?? "body";
   if (type === "cut") return { bg: null, layers: [], mode: "cut", speed: 1 };
-  if (type === "card") {
-    return {
-      bg: full,
-      layers: [],
-      mode: "card",
-      speed: 1,
-      cardRect: cardRect ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
-      cardText: active?.card,
-    };
-  }
   const layer: SceneLayer = {
     src: full,
     rect: { x: 0, y: 0, w: 1, h: 1 },
     style: FLAT,
   };
   const c = cloak && cloak.on ? cloak : null;
+  if (type === "card") {
+    // YouTube card: keep the full composited frame (camera corner stays visible),
+    // cover only the content area with the Patreon card — no blurred plate.
+    return {
+      bg: null,
+      layers: [layer],
+      mode: "card",
+      speed: 1,
+      cardRect: cardRect ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 },
+      cardText: active?.card,
+      cloak: c,
+    };
+  }
   if (type === "fast") return { bg: null, layers: [layer], mode: "fast", speed, cloak: c };
   return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c };
 }
@@ -410,11 +413,22 @@ function drawCloakedFrame(
     sy = src.y + (src.h - sh) / 2;
   }
   ctx.save();
+  // global transforms: rotate around center, then optional flip
+  if (Math.abs(c.rotate ?? 0) > 0.05) {
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+    ctx.translate(-W / 2, -H / 2);
+  }
+  if (c.flip) {
+    ctx.translate(W, 0);
+    ctx.scale(-1, 1);
+  }
   const f: string[] = [];
   if (Math.abs(c.saturate - 100) > 0.5) f.push(`saturate(${(c.saturate / 100).toFixed(3)})`);
   if (Math.abs(c.contrast - 100) > 0.5) f.push(`contrast(${(c.contrast / 100).toFixed(3)})`);
   if (Math.abs(c.brightness - 100) > 0.5) f.push(`brightness(${(c.brightness / 100).toFixed(3)})`);
   if (Math.abs(c.hue) > 0.5) f.push(`hue-rotate(${c.hue.toFixed(1)}deg)`);
+  if ((c.blur ?? 0) > 0.05) f.push(`blur(${c.blur!.toFixed(2)}px)`);
   ctx.filter = f.length ? f.join(" ") : "none";
   try {
     ctx.drawImage(video, sx, sy, sw, sh, (W - zw) / 2, (H - zh) / 2, zw, zh);

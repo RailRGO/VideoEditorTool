@@ -426,6 +426,14 @@ export interface VideoCloak {
   grain: number;
   /** edge darkening 0..100 */
   vignette: number;
+  /** horizontal mirror — strongest single Content ID evasion */
+  flip: boolean;
+  /** subtle blur 0..10 (px at 1080p) — breaks pixel hashes */
+  blur: number;
+  /** slight rotation -5..5 deg — breaks frame hash, adds black edges */
+  rotate: number;
+  /** playback speed tweak 0.95..1.05 — breaks audio fingerprint when combined with pitch */
+  speed: number;
 }
 
 export const defaultVideoCloak: VideoCloak = {
@@ -440,6 +448,10 @@ export const defaultVideoCloak: VideoCloak = {
   hue: 0,
   grain: 12,
   vignette: 25,
+  flip: false,
+  blur: 0,
+  rotate: 0,
+  speed: 1,
 };
 
 export const defaultCut: CutOptions = {
@@ -449,6 +461,30 @@ export const defaultCut: CutOptions = {
   pad: 1.1,
   minKeep: 1.5,
   replace: "card",
+};
+
+export interface TranscriptCutOptions {
+  /** gaps >= this become a Patreon card (rest cut) */
+  minSilence: number;
+  /** how long the inserted card lasts when a gap is long */
+  cardDuration: number;
+  /** gaps shorter than this are ignored — kept as speech continuity */
+  minGap: number;
+  /** what to do with small silences (minGap <= gap < minSilence) */
+  tinyAction: "keep" | "fast" | "mute";
+  /** breathing room kept before/after each word */
+  pad: number;
+  /** max gap between words to still count as continuous speech */
+  mergeGap: number;
+}
+
+export const defaultTranscriptCut: TranscriptCutOptions = {
+  minSilence: 1.0,
+  cardDuration: 3.0,
+  minGap: 0.25,
+  tinyAction: "keep",
+  pad: 0.25,
+  mergeGap: 0.8,
 };
 
 export type LayoutPreset = {

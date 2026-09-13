@@ -157,6 +157,15 @@ export default function CloakPanel({
             <Slider label="Hue rotate" value={video.hue} min={-30} max={30} step={1} display={`${video.hue > 0 ? "+" : ""}${video.hue}°`} onChange={(v) => setV({ hue: v })} />
             <Slider label="Film grain" value={video.grain} min={0} max={100} step={1} display={`${video.grain}%`} onChange={(v) => setV({ grain: v })} hint="animated, crawls every frame" />
             <Slider label="Vignette" value={video.vignette} min={0} max={100} step={1} display={`${video.vignette}%`} onChange={(v) => setV({ vignette: v })} hint="darkens the corners" />
+            <Slider label="Subtle blur" value={video.blur} min={0} max={3} step={0.1} display={video.blur ? `${video.blur.toFixed(1)}px` : "off"} onChange={(v) => setV({ blur: v })} hint="breaks pixel hashes, keep low" />
+            <Slider label="Rotate" value={video.rotate} min={-5} max={5} step={0.25} display={`${video.rotate > 0 ? "+" : ""}${video.rotate.toFixed(2)}°`} onChange={(v) => setV({ rotate: v })} hint="slight tilt adds black edges" />
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button type="button" onClick={() => setV({ flip: !video.flip })} className={video.flip ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flip ? "Mirror ON (hflip)" : "Mirror off"}</button>
+            <span className="text-[10px] text-slate-500">Strongest single Content ID evasion — flips whole frame</span>
+          </div>
+          <div className="mt-2">
+            <Slider label="Global speed tweak" value={video.speed} min={0.95} max={1.05} step={0.01} display={`${video.speed.toFixed(2)}×`} onChange={(v) => setV({ speed: v })} hint="breaks audio fingerprint when combined with pitch; re-times video+audio together" />
           </div>
         </div>
       </Section>

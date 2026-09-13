@@ -349,6 +349,10 @@ def default_video_cloak() -> Dict[str, Any]:
         "hue": 0.0,
         "grain": 12.0,
         "vignette": 25.0,
+        "flip": False,     # horizontal mirror — strongest Content ID evasion
+        "blur": 0.0,       # subtle blur px
+        "rotate": 0.0,     # degrees -5..5
+        "speed": 1.0,      # global playback speed tweak 0.95..1.05
     }
 
 
