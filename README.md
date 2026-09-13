@@ -57,6 +57,21 @@ render the same map.
   accent; empty fields inherit the global card from the Layout tab. Works in
   the browser render *and* the Colab render (Patreon composite and YouTube
   passthrough).
+- **Cards cover the content, exactly** — the placeholder is pinned to the
+  *drawn* content picture (fit + zoom + offset), so it can neither overrun the
+  picture nor leave a gap at its right/bottom edge; in YouTube mode it covers
+  the same content rect the file was composed with. Opacity is literal: 100 %
+  is fully opaque, 0 % draws no card at all, and backdrop, accent bar, words
+  and ring share that one alpha. Short cards cover the top 75 % of the content
+  by default, so subtitles stay visible.
+- **Fair-use limiter** — *Short cards (cut nothing)* keeps every second of the
+  reaction and lays short cards over the long talking stretches (8 s of talking
+  → 4 s card, repeating; a 30 s stretch gets cards at 8–12 s and 20–24 s), and
+  the card may play a little faster to claw back time. *Trim to limit* is the
+  only tool that drops footage: it splits the reaction into equal windows and
+  keeps the most speech-dense moment of each, so start, middle and end survive
+  instead of the reaction being truncated after the first N minutes. Either way
+  the limiter only ever inserts short cards.
 - **Upload kit (Colab render)** — the finished render is accompanied by
   `{name}_chapters.srt` (chapters at every structural boundary, in output
   time, ready to paste into the YouTube description), five 1280×720 thumbnail
@@ -82,11 +97,21 @@ npm run build    # static bundle in dist/
 npx tsc --noEmit # type check
 ```
 
-Pipeline tests (needs ffmpeg, numpy, opencv):
+Preview/render tests (no ffmpeg, no browser, a couple of seconds):
+
+```bash
+npm test                                 # geometry + export-panel suites
+node src/__tests__/render_geometry.test.mjs   # card, mirror, limiter geometry
+```
+
+Pipeline tests — the planning, card and limiter parts run anywhere, the
+render parts need ffmpeg, numpy and opencv:
 
 ```bash
 cd colab_version
-python3 webapp/tests/test_render_parts.py    # chunked/resumable renders, stems, cards
+python3 webapp/tests/test_render_parts.py fast   # math only, <1 s
+python3 webapp/tests/test_render_parts.py        # chunked/resumable renders, stems, cards
+python3 webapp/tests/parity_browser_vs_colab.py  # browser == Colab (needs node + esbuild)
 ```
 
 ## Colab backend

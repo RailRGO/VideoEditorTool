@@ -30,6 +30,7 @@ import {
   buildPassthroughScene,
   buildScene,
   cardImageEpoch,
+  contentPicture,
   pickRecorderMime,
   renderScene,
   sourceHalves,
@@ -72,6 +73,7 @@ import {
   removeSegment,
   savedBySpeed,
   sameSegs,
+  segSpeed,
   splitAt,
   srcToOut,
   uid,
@@ -837,13 +839,10 @@ export default function App() {
       }
 
       // playback speed: the scanner owns it, otherwise follow the segment type
+      // (fast-forward segments and cards that carry their own speed)
       if (!scanningRef.current) {
-        const want =
-          act?.type === "fast"
-            ? lay.fastSpeed
-            : exportingRef.current
-            ? 1
-            : rateRef.current;
+        const segRate = act ? segSpeed(act, lay.fastSpeed) : 1;
+        const want = segRate > 1 ? segRate : exportingRef.current ? 1 : rateRef.current;
         if (Math.abs(v.playbackRate - want) > 0.02) v.playbackRate = want;
         const pitch = act?.type === "fast" ? !lay.chipmunk : true;
         if (v.preservesPitch !== pitch) v.preservesPitch = pitch;
@@ -919,9 +918,9 @@ export default function App() {
               v.currentTime,
               halves.full,
               lay.fastSpeed,
-              videoCloakRef.current,
               // the card covers the content rect this file was composed with…
               lay.content,
+              videoCloakRef.current,
               // …and the camera corner is restored on top of it, so the card
               // can never bury the camera even when the rects overlap
               lay.cam
@@ -1847,7 +1846,8 @@ export default function App() {
     if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
     if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
     if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
-    if (p.fairUseOpts) setFairUseOpts(p.fairUseOpts as FairUseOptions);
+    if (p.fairUseOpts)
+      setFairUseOpts({ ...defaultFairUse, ...(p.fairUseOpts as FairUseOptions) });
     if (p.polish) setPolish(p.polish as PolishRules);
     if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
     if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
@@ -2028,18 +2028,40 @@ export default function App() {
       )
     : outDur;
 
+  // In a card span the render derives the card rect from the content
+  // *picture* (fit + zoom + offset), which is not always the content box —
+  // show it so the preview can't lie about where the card lands.
+  const cardGuide =
+    sceneMode === "card" && !isYT && !empty && dims.w > 0
+      ? {
+          rect: contentPicture(
+            layout,
+            sourceHalves(dims.w, dims.h, layout.sourceMode, layout.cameraSide).content
+          ),
+          name: "Card (auto)",
+        }
+      : null;
+
   const stageLayers: { key: "content" | "cam"; rect: Rect; name: string }[] =
-    isYT || sceneMode === "cut"
+    sceneMode === "cut"
       ? []
-      : sceneMode === "solo"
+      : sceneMode === "solo" && !isYT
       ? [{ key: "cam", rect: { x: 0, y: 0, w: 1, h: 1 }, name: "Camera (full frame)" }]
-      : sceneMode === "card" || sceneMode === "lead"
-      ? [
-          { key: "cam", rect: layout.cam, name: "Camera" },
-          { key: "content", rect: layout.content, name: "Card" },
-        ]
       : [
-          { key: "content", rect: layout.content, name: "Content" },
+          // YouTube mode shows the same two handles as Patreon: the card
+          // covers `content` and the camera corner is restored from `cam`.
+          // Seeing (and dragging) both against the real file is what makes the
+          // card land exactly on the content instead of "one layout off" —
+          // this used to be invisible in the YouTube tab.
+          {
+            key: "content",
+            rect: layout.content,
+            name: isYT
+              ? "Card / content"
+              : sceneMode === "card" || sceneMode === "lead"
+              ? "Card"
+              : "Content",
+          },
           { key: "cam", rect: layout.cam, name: "Camera" },
         ];
 
@@ -2448,6 +2470,7 @@ export default function App() {
             layout={layout}
             onRect={setRect}
             layers={stageLayers}
+            guide={cardGuide}
             editLayer={editLayer}
             setEditLayer={setEditLayer}
             sceneMode={sceneMode}

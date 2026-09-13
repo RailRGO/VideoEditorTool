@@ -317,7 +317,7 @@ export default function SegmentsPanel({
                   ]}
                 />
                 <p className="text-[10px] leading-relaxed text-slate-500">
-                  Short covers the top {Math.round((layout.card.shortHeight ?? 0.62) * 100)}% only —
+                  Short covers the top {Math.round((layout.card.shortHeight ?? 0.75) * 100)}% only —
                   subtitles stay visible. Both mute the content audio.
                 </p>
               </div>
@@ -412,22 +412,22 @@ export default function SegmentsPanel({
             onShowText={(v) => setLayout((l) => ({ ...l, card: { ...l.card, showText: v } }))}
           />
           <Slider
-            label="Background opacity"
+            label="Card opacity"
             value={Math.round((layout.card.opacity ?? 0.9) * 100)}
-            min={50}
+            min={0}
             max={100}
             step={1}
             display={`${Math.round((layout.card.opacity ?? 0.9) * 100)}%`}
             onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, opacity: v / 100 } }))}
-            hint="the content ghosts through underneath — 90% keeps it barely visible"
+            hint="exact: 100% hides the content, 50% ghosts through, 0% draws no card at all"
           />
           <Slider
             label="Short card height"
-            value={Math.round((layout.card.shortHeight ?? 0.62) * 100)}
+            value={Math.round((layout.card.shortHeight ?? 0.75) * 100)}
             min={30}
-            max={90}
+            max={100}
             step={1}
-            display={`${Math.round((layout.card.shortHeight ?? 0.62) * 100)}% of content`}
+            display={`${Math.round((layout.card.shortHeight ?? 0.75) * 100)}% of content`}
             onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, shortHeight: v / 100 } }))}
             hint="short cards cover the top only — subtitles at the bottom stay visible"
           />

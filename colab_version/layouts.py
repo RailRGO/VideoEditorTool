@@ -76,9 +76,9 @@ class CardStyle:
     showText: bool = True
     # short-card height as a fraction of the content height (top-anchored,
     # so subtitles at the bottom stay visible)
-    shortHeight: float = 0.62
-    # card background opacity 0..1 — the content ghosts through; the text
-    # itself always stays fully opaque
+    shortHeight: float = 0.75
+    # card opacity 0..1, exact: 1 = fully opaque, 0 = no card is drawn at all
+    # (the whole card — backdrop, bar, words, ring — shares this alpha)
     opacity: float = 0.9
 
 
@@ -165,8 +165,12 @@ class LayoutState:
                 accent=card.get("accent", "#e879f9"),
                 image=str(card.get("image", "") or ""),
                 showText=bool(card.get("showText", True)),
-                shortHeight=float(card.get("shortHeight", 0.62) or 0.62),
-                opacity=float(card.get("opacity", 0.9) or 0.9),
+                # `or` here would turn an explicit 0 (no card at all) back
+                # into the default — only a missing/None value may default
+                shortHeight=(0.75 if card.get("shortHeight") is None
+                             else float(card["shortHeight"])),
+                opacity=(0.9 if card.get("opacity") is None
+                         else float(card["opacity"])),
             ),
         )
 

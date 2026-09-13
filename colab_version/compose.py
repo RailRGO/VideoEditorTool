@@ -120,6 +120,60 @@ def _contain_size(sw: int, sh: int, dw: int, dh: int) -> Tuple[int, int]:
     return max(1, int(round(sw * s))), max(1, int(round(sh * s)))
 
 
+def seg_speed(seg: Dict[str, Any], fast_speed: float = 4.0) -> float:
+    """Playback speed of one segment — mirrors segSpeed() in src/lib/timeline.ts.
+
+    `fast` spans run at the fast-forward rate; a `card` span may carry its own
+    speed in `seg["card"]["speed"]` (the card hides the picture, so it can play
+    a little faster without a visible jump). Everything else runs 1x.
+    """
+    typ = str(seg.get("type", "body"))
+    if typ == "fast":
+        return max(1.05, float(fast_speed or 4.0))
+    if typ == "card":
+        c = seg.get("card") or {}
+        try:
+            sp = float(c.get("speed", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            sp = 1.0
+        return max(1.0, sp)
+    return 1.0
+
+
+def content_picture_rect(layout: LayoutState, src_w: int, src_h: int,
+                         W: int, H: int) -> Rect:
+    """Where the content half actually lands on a W×H canvas (normalised).
+
+    Mirrors contentPicture() in src/lib/render.ts and the fit math of
+    draw_layer()/fitRect(): contain keeps the source aspect (letterbox inside
+    the content rect), cover fills the rect; zoom/offset then move the
+    *picture*, scaled by the fitted size, exactly like the compositor does.
+
+    The card is pinned to this rect so it covers the picture it is hiding —
+    not the letterbox padding around it — in the preview and in the render.
+    """
+    box = layout.content
+    st = layout.contentStyle
+    try:
+        sw, sh = max(1, int(src_w)), max(1, int(src_h))
+    except (TypeError, ValueError):
+        return Rect(box.x, box.y, box.w, box.h)
+    w, h = box.w * W, box.h * H
+    if str(getattr(st, "fit", "contain")) != "contain":
+        pw, ph = w, h
+    else:
+        s_asp, d_asp = sw / sh, w / max(1.0, h)
+        if s_asp > d_asp:
+            pw, ph = w, w / s_asp
+        else:
+            pw, ph = h * s_asp, h
+    zoom = max(0.01, float(getattr(st, "zoom", 1.0) or 1.0))
+    zw, zh = pw * zoom, ph * zoom
+    x = box.x * W + (w - zw) / 2 + float(getattr(st, "offsetX", 0.0) or 0.0) * pw
+    y = box.y * H + (h - zh) / 2 + float(getattr(st, "offsetY", 0.0) or 0.0) * ph
+    return Rect(x / W, y / H, zw / W, zh / H)
+
+
 # ---------------------------------------------------------------------------
 # layers
 # ---------------------------------------------------------------------------
@@ -290,7 +344,8 @@ def _load_card_image(spec: str) -> Optional[np.ndarray]:
 
 
 def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
-                 W: int, H: int) -> Tuple[np.ndarray, int, int]:
+                 W: int, H: int,
+                 content: Optional[Rect] = None) -> Tuple[np.ndarray, int, int]:
     """The placeholder card as a standalone BGRA (RGBA) image.
 
     Same math the compositor paints inline and the browser preview draws:
@@ -307,9 +362,14 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     gentle dim — unless showText is off, which yields a photo-only card.
 
     A "short" card (card["variant"]) covers only the top shortHeight of the
-    content rect, so subtitles at the bottom stay visible. The backdrop is
-    painted at layout.card.opacity so the content ghosts through; the bar +
-    words always stay fully opaque.
+    content rect, so subtitles at the bottom stay visible.
+
+    *content* overrides which rect the card covers (the compositor passes the
+    drawn content picture, the ffmpeg passthrough the content rect of the
+    finished file); without it the layout's content rect is used.
+
+    opacity is exact and applies to the whole card — backdrop, accent bar,
+    words and ring — so 100% is fully opaque and 0% draws nothing at all.
     """
     k = H / 1080.0
     card = card or {}   # a card span with no text of its own is normal
@@ -324,11 +384,17 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     show_text = card.get("showText", getattr(layout.card, "showText", True))
     show_text = False if show_text is False else True
     variant = str(card.get("variant") or "full").strip().lower()
-    short_h = float(getattr(layout.card, "shortHeight", 0.62) or 0.62)
-    short_h = max(0.2, min(1.0, short_h))
-    opacity = float(getattr(layout.card, "opacity", 0.9) or 0.9)
-    opacity = max(0.05, min(1.0, opacity))
-    x, y, w, h = (int(round(v)) for v in layout.content.px(W, H))
+    # explicit 0 must survive: an `or 0.9` fallback here used to resurrect a
+    # card the user had turned off
+    _sh = getattr(layout.card, "shortHeight", 0.75)
+    short_h = max(0.2, min(1.0, 0.75 if _sh is None else float(_sh)))
+    _op = getattr(layout.card, "opacity", 0.9)
+    opacity = max(0.0, min(1.0, 0.9 if _op is None else float(_op)))
+    if opacity <= 0.001:
+        # 0 % means no card — not a 5 % ghost of one
+        return np.zeros((0, 0, 4), np.uint8), 0, 0
+    r = content if content is not None else layout.content
+    x, y, w, h = (int(round(v)) for v in r.px(W, H))
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
     if variant == "short":
@@ -405,18 +471,20 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     ring = cv2.subtract(outer, inner).astype(np.float32) / 255.0 * 0.5
     rgb = (rgb.astype(np.float32) * (1 - ring[..., None]) +
            np.array(accent_bgr, np.float32) * ring[..., None]).astype(np.uint8)
+    # one alpha for the whole card: exact opacity (fg no longer forced to
+    # 255, which used to make 100 % mean "opaque everywhere" and any value
+    # below it still look nearly solid)
     alpha = (mask.astype(np.float32) * opacity).astype(np.uint8)
-    if not photo_only:
-        # the backdrop turns translucent, but the bar + words stay solid
-        alpha[fg > 0] = 255
     return np.dstack([rgb, alpha]), x0, y0
 
 
 def draw_card(canvas: np.ndarray, layout: LayoutState,
-              card: Optional[Dict[str, Any]] = None) -> None:
-    """Composite the placeholder card onto *canvas* at the content rect."""
+              card: Optional[Dict[str, Any]] = None,
+              content: Optional[Rect] = None) -> None:
+    """Composite the placeholder card onto *canvas* at *content* (or the
+    layout's content rect)."""
     H, W = canvas.shape[:2]
-    img, x0, y0 = card_overlay(card, layout, W, H)
+    img, x0, y0 = card_overlay(card, layout, W, H, content)
     if img.size == 0:
         return
     fh, fw = img.shape[:2]
@@ -523,8 +591,15 @@ def compose_frame(frame: np.ndarray, layout: LayoutState,
         draw_layer(canvas, cam, Rect(0, 0, 1, 1), layout.soloStyle)
     elif mode == "card":
         # placeholder first, camera on top: the card covers the content 100%
-        # yet can never touch the camera, even when the rects overlap
-        draw_card(canvas, layout, card)
+        # yet can never touch the camera, even when the rects overlap.
+        # The card is pinned to where the content *picture* lands (fit/zoom/
+        # offset), so it can't spill onto the letterbox padding around it.
+        if content is not None and getattr(content, "size", 0):
+            ch_, cw_ = content.shape[:2]
+            picture = content_picture_rect(layout, cw_, ch_, W, H)
+        else:
+            picture = None
+        draw_card(canvas, layout, card, picture)
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
     elif mode == "lead":
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
@@ -691,12 +766,17 @@ def build_segments(duration: float, intro_end: float = 8.0,
 
 
 def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
+    """Programme seconds — every segment divided by its own playback speed.
+
+    Mirrors outDuration()/segSpeed() in src/lib/timeline.ts: fast spans use
+    fastSpeed, a card may carry its own speed, everything else is 1x.
+    """
     total = 0.0
     for s in segments:
         if s["type"] == "cut":
             continue
         ln = s["end"] - s["start"]
-        total += ln / fast_speed if s["type"] == "fast" else ln
+        total += ln / max(1e-6, seg_speed(s, fast_speed))
     return total
 
 
@@ -783,7 +863,9 @@ def render_video(input_path: str, output_path: str,
         typ = s.get("type", "body")
         if typ == "cut":
             continue
-        factor = layout.fastSpeed if typ == "fast" else 1.0
+        # per-segment speed: fast spans AND cards that carry their own speed
+        factor = seg_speed({"type": typ, "card": s.get("card")},
+                           layout.fastSpeed)
         n = max(1, int(round((s["end"] - s["start"]) * fps / factor)))
         mode = {"intro": "solo", "outro": "solo", "mute": "body"}.get(typ, typ)
         seg_card = s.get("card") if typ == "card" else None

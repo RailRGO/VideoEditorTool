@@ -442,6 +442,20 @@ def _card_variant(s: Dict[str, Any]) -> str:
         else "full"
 
 
+def _card_sig(s: Dict[str, Any]) -> Tuple[str, float]:
+    """Card merge key: variant + playback speed.
+
+    Two adjacent card spans only merge when they look and run the same way —
+    the Python twin of sameVariant() in src/lib/timeline.ts.
+    """
+    c = s.get("card") or {}
+    try:
+        sp = round(float(c.get("speed", 1.0) or 1.0), 3)
+    except (TypeError, ValueError):
+        sp = 1.0
+    return (_card_variant(s), sp)
+
+
 def _drawtext_font(bold: bool = True) -> Optional[str]:
     """Find a DejaVu/Liberation TTF for drawtext (None = draw shapes only)."""
     names = (("DejaVuSans-Bold", "DejaVuSans") if bold
@@ -503,9 +517,9 @@ def plan_parts(kept: List[Dict[str, Any]], fast_speed: float,
     for s in kept:
         typ = str(s.get("type", "body"))
         a, b = float(s["start"]), float(s["end"])
-        # programme seconds per source second — a fast span's programme time
-        # is its source time DIVIDED by the speed
-        rate = 1.0 / float(fast_speed) if typ == "fast" else 1.0
+        # programme seconds per source second — a fast span's (or a sped-up
+        # card's) programme time is its source time DIVIDED by its speed
+        rate = 1.0 / max(1e-6, C.seg_speed(s, float(fast_speed)))
         base = {k: s[k] for k in ("type", "card") if k in s}
         while b - a > 1e-6:
             take = b - a
@@ -1414,10 +1428,11 @@ class ReactionVideoProcessor:
             raise ValueError("all segments are cut — nothing to mix")
         mute_types = {"mute", "card"} | ({"intro", "outro"} if mute_solo else set())
         states = [((s.get("type") in mute_types and bool(mute_to_zero)),
-                   (float(fast_speed) if s.get("type") == "fast" else 1.0))
+                   C.seg_speed(s, float(fast_speed)))
                   for s in kept]
         # single untouched span -> no work (unless it mutes this bus)
-        if len(kept) == 1 and kept[0].get("type") not in ({"fast"} | mute_types):
+        if (len(kept) == 1 and kept[0].get("type") not in ({"fast"} | mute_types)
+                and C.seg_speed(kept[0], float(fast_speed)) <= 1.001):
             return wav
         n = len(kept)
         outs, chain = [], []
@@ -1427,15 +1442,17 @@ class ReactionVideoProcessor:
                 raise RenderCancelled("render cancelled by user")
             f = [f"atrim=start={s['start']:.3f}:end={s['end']:.3f}",
                  "asetpts=PTS-STARTPTS"]
-            if s.get("type") == "fast":
+            spd = C.seg_speed(s, float(fast_speed))
+            if spd > 1.001:
                 # atempo only spans 0.5..2.0 — chain it (the default 4x speed
-                # would otherwise fail the whole Patreon audio conform)
-                f.extend(_atempo_chain(float(fast_speed)))
+                # would otherwise fail the whole Patreon audio conform).
+                # A card that carries its own speed is conformed the same way.
+                f.extend(_atempo_chain(spd))
             if mute_to_zero and s.get("type") in mute_types:
                 f.append("volume=0")
             dur = float(s["end"]) - float(s["start"])
-            if s.get("type") == "fast":
-                dur = dur / max(0.125, float(fast_speed))
+            if spd > 1.001:
+                dur = dur / max(0.125, spd)
             fi, fo = _fade_edges(kept, i, states)
             f.extend(_fade_filters(dur, fade_s, fi, fo))
             outs.append(f"[b{i}]")
@@ -1619,7 +1636,9 @@ class ReactionVideoProcessor:
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
-            eff_speed = float(fast_speed) * global_speed if typ == "fast" else global_speed
+            # fast spans AND cards that carry their own speed; the cloak's
+            # global speed tweak multiplies on top
+            eff_speed = C.seg_speed(s, float(fast_speed)) * global_speed
             if abs(eff_speed - 1.0) > 0.001:
                 base_vf = f"trim=start={a:.3f}:end={b:.3f}," \
                           f"setpts=(PTS-STARTPTS)/{eff_speed:.6f}"
@@ -1713,8 +1732,7 @@ class ReactionVideoProcessor:
         t_acc = 0.0
         for s in kept:
             dur = float(s["end"]) - float(s["start"])
-            pd = dur / float(fast_speed) if s.get("type", "body") == "fast" \
-                else dur
+            pd = dur / max(1e-6, C.seg_speed(s, float(fast_speed)))
             if s.get("type", "body") == "card":
                 spans.append((t_acc, t_acc + pd))
             t_acc += pd
@@ -1745,18 +1763,16 @@ class ReactionVideoProcessor:
             outs = []
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
-            states = [((t in ("mute", "card") and j == 0),
-                       (float(fast_speed) * gs if t == "fast" else gs))
-                      for t in (s.get("type", "body") for s in kept)]
+            states = [((s.get("type", "body") in ("mute", "card") and j == 0),
+                       C.seg_speed(s, float(fast_speed)) * gs)
+                      for s in kept]
             for i, s in enumerate(kept):
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
                 af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                eff = float(fast_speed) * gs if typ == "fast" else gs
+                eff = C.seg_speed(s, float(fast_speed)) * gs
                 if abs(eff - 1.0) > 0.001:
                     af += "," + ",".join(_atempo_chain(eff))
-                elif typ == "fast":
-                    af += "," + ",".join(_atempo_chain(fast_speed))
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
                 fi, fo = _fade_edges(kept, i, states)
@@ -1913,7 +1929,13 @@ class ReactionVideoProcessor:
                 round(float(r.get("w", dflt["w"])), 4),
                 round(float(r.get("h", dflt["h"])), 4))
         g = card or {}
-        d = L.CardStyle()
+        # field-by-field fallback to this run's layout, exactly like the
+        # browser (segment card ?? layout.card) — so a global opacity of 0
+        # or a tuned shortHeight reaches the exported PNG too
+        try:
+            d = self.layout.card
+        except AttributeError:
+            d = L.CardStyle()
         title = str(g.get("title") or d.title)
         sub = str(g.get("sub") or d.sub)
         accent = str(g.get("accent") or d.accent)
@@ -1924,10 +1946,14 @@ class ReactionVideoProcessor:
                     if img_spec else "")
         variant = str(g.get("variant") or "full").strip().lower()
         variant = variant if variant == "short" else "full"
-        short_h = float(g.get("shortHeight", getattr(d, "shortHeight", 0.62)) or 0.62)
+        # exact card geometry/alpha, straight from the merged card dict (the
+        # caller merges the project's global card with the segment's own)
+        raw_short = g.get("shortHeight", getattr(d, "shortHeight", 0.75))
+        short_h = 0.75 if raw_short is None else float(raw_short)
         short_h = max(0.2, min(1.0, short_h))
-        opac = float(g.get("opacity", getattr(d, "opacity", 0.9)) or 0.9)
-        opac = max(0.05, min(1.0, opac))
+        raw_opac = g.get("opacity", getattr(d, "opacity", 0.9))
+        opac = 0.9 if raw_opac is None else float(raw_opac)
+        opac = max(0.0, min(1.0, opac))   # 0 = a card the user switched off
         key = (title, sub, accent, img_hash, show_text, variant,
                round(short_h, 4), round(opac, 4), W, H, rect)
         cache: Dict[Any, Tuple[Path, int, int]] = \
@@ -2454,18 +2480,18 @@ class ReactionVideoProcessor:
             outs = []
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
-            states = [((t in ("mute", "card") and j == 0),
-                       (float(fast_speed) if t == "fast" else 1.0))
-                      for t in (s.get("type", "body") for s in part)]
+            states = [((s.get("type", "body") in ("mute", "card") and j == 0),
+                       C.seg_speed(s, float(fast_speed)))
+                      for s in part]
             for i, s in enumerate(part):
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
                 af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                if typ == "fast":
-                    af += "," + ",".join(_atempo_chain(fast_speed))
+                eff = C.seg_speed(s, float(fast_speed))
+                if eff > 1.001:
+                    af += "," + ",".join(_atempo_chain(eff))
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
-                eff = float(fast_speed) if typ == "fast" else 1.0
                 fi, fo = _fade_edges(part, i, states)
                 fz = _fade_filters((b - a) / eff, fade_s, fi, fo)
                 if fz:
@@ -2844,7 +2870,7 @@ class ReactionVideoProcessor:
         out.sort(key=lambda s: s["start"])
         tidy = []
         for s in out:
-            if tidy and tidy[-1]["type"] == s["type"] and abs(tidy[-1]["end"] - s["start"]) < 0.02 and (s["type"] != "card" or _card_variant(tidy[-1]) == _card_variant(s)):
+            if tidy and tidy[-1]["type"] == s["type"] and abs(tidy[-1]["end"] - s["start"]) < 0.02 and (s["type"] != "card" or _card_sig(tidy[-1]) == _card_sig(s)):
                 tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
             else:
                 tidy.append(dict(s))
@@ -2853,28 +2879,46 @@ class ReactionVideoProcessor:
     @staticmethod
     def build_fair_use_limit(segments, duration, opts=None, words=None, body_span=None,
                              detection_regions=None, fast_speed=4.0):
-        """Limit the reaction part to maxBodySec of kept programme.
+        """Content-ID limiter — mirrors src/lib/fairUseCut.ts.
 
-        Only rewriteable footage (body/lead/mute/fast) is shortened: cards
-        and cuts left by an earlier step (e.g. the transcript cut) are
-        preserved byte-for-byte, intro/outro never touched. Cards keep their
-        slot in the budget; cuts produce no output so they don't count.
+        Two modes (opts["mode"]):
 
-        Mirrors src/lib/fairUseCut.ts.
+        * "cards" (the default): **nothing is cut**. Every long stretch of
+          talking gets a card of ``cardSec`` seconds after ``everySec``
+          seconds of speech, so a 30 s stretch with the defaults (8 s / 4 s)
+          gets cards at 8-12 s and 20-24 s. Content ID never sees an
+          uninterrupted run of the programme, and the reaction stays in one
+          piece. Every card is SHORT (the limiter never places a tall card)
+          and may carry a playback ``cardSpeed`` — the card hides the picture,
+          so it can run a little faster without a visible jump.
+        * "trim": keep the most speech-dense ``maxBodySec`` of the reaction.
+          Buckets are picked by score but **spread over the whole reaction**
+          (a candidate has to be at least 6 s away from an already-kept one),
+          then kept in chronological order — not "the first N minutes", which
+          is what a flat audio score used to produce. What is dropped becomes
+          a cut, or a ``cardDuration`` card pointer in front of one
+          ("removedAction": "card").
         """
         o = opts or {}
+        mode = str(o.get("mode", "cards") or "cards").strip().lower()
+        if mode not in ("cards", "trim"):
+            mode = "cards"
+        every_sec = max(1.5, float(o.get("everySec", o.get("every_sec", 8.0)) or 8.0))
+        card_sec = max(0.5, float(o.get("cardSec", o.get("card_sec", 4.0)) or 4.0))
+        card_speed = max(1.0, float(o.get("cardSpeed", o.get("card_speed", 1.0)) or 1.0))
+        min_run = max(0.0, float(o.get("minRunSec", o.get("min_run_sec", 6.0)) or 0.0))
+        # every card the limiter inserts is short, whatever an old project
+        # stored: the bottom of the content (subtitles) has to stay visible
+        variant = "short"
         max_body = float(o.get("maxBodySec", o.get("max_body_sec", 600)))
         removed_action = str(o.get("removedAction", o.get("removed_action", "cut")))
         card_dur = float(o.get("cardDuration", o.get("card_duration", 3.0)))
         bucket_sec = float(o.get("bucketSec", o.get("bucket_sec", 1.0)))
         keep_pad = float(o.get("keepPad", o.get("keep_pad", 0.5)))
-        max_speech = float(o.get("maxSpeech", o.get("max_speech", 30.0)))
-        breaker_dur = float(o.get("breakerDuration", o.get("breaker_duration", 3.0)))
-        breaker_action = str(o.get("breakerAction", o.get("breaker_action", "card")))
-        breaker_variant = str(o.get("breakerVariant", o.get("breaker_variant", "short")))
-        fast = max(1.05, float(fast_speed or 4.0))
+        fast = float(fast_speed or 4.0)
 
         rewrite_types = {"body", "lead", "mute", "fast"}
+        coverable = rewrite_types | {"card"}
         segs = sorted(segments or [], key=lambda x: float(x.get("start", 0)))
         rewriteable = [s for s in segs if str(s.get("type", "body")) in rewrite_types]
         if body_span:
@@ -2884,11 +2928,13 @@ class ReactionVideoProcessor:
             span_start = float(rewriteable[0]["start"]) if rewriteable else 0.0
             span_end = float(rewriteable[-1]["end"]) if rewriteable else float(duration)
 
-        def _prog(s, a, b):
-            src = max(0.0, b - a)
-            return src / fast if str(s.get("type")) == "fast" else src
+        def _spd(s) -> float:
+            return max(1e-6, C.seg_speed(s, fast))
 
-        def _kept_prog(only_rewriteable=False):
+        def _prog(s, a, b) -> float:
+            return max(0.0, b - a) / _spd(s)
+
+        def _kept_prog(only_rewriteable=False) -> float:
             total = 0.0
             for s in segs:
                 typ = str(s.get("type", "body"))
@@ -2903,13 +2949,8 @@ class ReactionVideoProcessor:
             return total
 
         original = _kept_prog(False)
-        rewrite_prog = _kept_prog(True)
-        preserved = max(0.0, original - rewrite_prog)
-        if original <= max_body + 0.01 or rewrite_prog <= 0.01:
-            return segments
 
-        rewrite_budget = max(0.0, max_body - preserved)
-
+        # ---- speech: transcript words, else the audio scan -----------------
         speech = []
         if words and len(words):
             first = words[0]
@@ -2933,7 +2974,103 @@ class ReactionVideoProcessor:
                     speech.append((a, b))
         speech = sorted(speech, key=lambda x: x[0])
 
-        def _score(a, b):
+        def _card_payload() -> Dict[str, Any]:
+            payload: Dict[str, Any] = {"variant": "short"}
+            if card_speed > 1.0001:
+                payload["speed"] = round(card_speed, 4)
+            return payload
+
+        def _tidy(out):
+            out = sorted(out, key=lambda x: float(x["start"]))
+            tidy = []
+            for s in out:
+                if (tidy and tidy[-1]["type"] == s["type"]
+                        and abs(tidy[-1]["end"] - s["start"]) < 0.02
+                        and (s["type"] != "card"
+                             or _card_sig(tidy[-1]) == _card_sig(s))):
+                    tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
+                else:
+                    tidy.append(dict(s))
+            return [s for s in tidy
+                    if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
+
+        # ================================ cards =============================
+        if mode == "cards":
+            runs = []
+            if speech:
+                clipped = sorted((max(a, span_start), min(b, span_end))
+                                 for a, b in speech
+                                 if min(b, span_end) - max(a, span_start) > 0.05)
+                for a, b in clipped:
+                    if runs and a - runs[-1][1] <= 1.0:
+                        runs[-1][1] = max(runs[-1][1], b)
+                    else:
+                        runs.append([a, b])
+                runs = [r for r in runs if r[1] - r[0] >= min_run]
+            else:
+                # no speech info: treat every long kept stretch as talk
+                for s in segs:
+                    if str(s.get("type", "body")) not in coverable:
+                        continue
+                    a = max(float(s["start"]), span_start)
+                    b = min(float(s["end"]), span_end)
+                    if b - a >= every_sec + card_sec:
+                        runs.append([a, b])
+            by_start = [(float(s["start"]), float(s["end"]), str(s.get("type", "body")))
+                        for s in segs]
+
+            def _type_at(t: float) -> str:
+                for a, b, ty in by_start:
+                    if a <= t < b:
+                        return ty
+                return "body"
+
+            intervals = []
+            for a0, b0 in runs:
+                cursor = a0
+                while cursor + every_sec < b0 - 1.0:
+                    a = cursor + every_sec
+                    b = min(b0 - 0.5, a + card_sec)
+                    if b - a < min(1.0, card_sec * 0.5):
+                        break
+                    if _type_at(a) in coverable:
+                        intervals.append((a, b))
+                    cursor = a + card_sec
+
+            out = []
+            for s in segs:
+                typ = str(s.get("type", "body"))
+                if typ not in coverable:
+                    out.append(dict(s))
+                    continue
+                ss = max(float(s["start"]), span_start)
+                se = min(float(s["end"]), span_end)
+                if se <= ss:
+                    out.append(dict(s))
+                    continue
+                hits = [(a, b) for a, b in intervals
+                        if b > ss + 0.02 and a < se - 0.02]
+                hits.sort(key=lambda x: x[0])
+                cursor = ss
+                for a, b in hits:
+                    a = max(a, ss)
+                    b = min(b, se)
+                    if a - cursor > 0.02:
+                        out.append({"type": typ, "start": cursor, "end": a})
+                    out.append({"type": "card", "start": a, "end": b,
+                                "card": _card_payload()})
+                    cursor = max(cursor, b)
+                if se - cursor > 0.02:
+                    out.append({"type": typ, "start": cursor, "end": se})
+            return _tidy(out)
+
+        # ================================= trim =============================
+        rewrite_prog = _kept_prog(True)
+        if original <= max_body + 0.01 or rewrite_prog <= 0.01:
+            return segments
+        rewrite_budget = max(0.0, max_body - max(0.0, original - rewrite_prog))
+
+        def _score(a, b) -> float:
             sc = 0.0
             for sa, sb in speech:
                 if sb <= a:
@@ -2960,41 +3097,37 @@ class ReactionVideoProcessor:
             return segments
 
         prog_per_bucket = rewrite_prog / len(buckets)
+        # Each kept island carries its context padding, and that padding is
+        # real programme time — it comes out of the budget, or "limit to
+        # 10 min" lands well past the limit once there is more than one
+        # island (the browser mirror does the same).
+        pad = max(0.0, min(keep_pad, bucket_sec))
+        per_island = prog_per_bucket + 2.0 * pad
         target = max(0, min(len(buckets),
-                            int(round(rewrite_budget / max(1e-6, prog_per_bucket)))))
+                            int(round(rewrite_budget / max(1e-6, per_island)))))
 
+        # Windows: split the footage into `target` equal slots and keep the
+        # best bucket of each. The keeps land all over the reaction — start,
+        # middle and end all survive — instead of piling up at the front,
+        # which is what score order with an "earliest first" tie-break used to
+        # do (a flat audio scan kept the first N minutes and cut the rest).
         keep_set = set()
-        if target > 0:
-            if speech:
-                ranked = sorted(range(len(buckets)),
-                                key=lambda i: (-buckets[i][2], buckets[i][0]))
-            else:
-                ranked = sorted(range(len(buckets)),
-                                key=lambda i: buckets[i][0])
-            pad_n = int((keep_pad + bucket_sec - 1e-6) // bucket_sec)
-            for sel in ranked[:target]:
-                keep_set.add(sel)
-                for d in range(1, pad_n + 1):
-                    for ni in (sel - d, sel + d):
-                        if ni < 0 or ni >= len(buckets) or ni in keep_set:
-                            continue
-                        # padding must not leak across preserved cards/cuts
-                        a, b = buckets[sel], buckets[ni]
-                        gap = (max(0.0, b[0] - a[1]) if ni > sel
-                               else max(0.0, a[0] - b[1]))
-                        if gap < bucket_sec * 1.5 + 0.05:
-                            keep_set.add(ni)
-            if len(keep_set) > target:
-                if speech:
-                    rescored = sorted(keep_set,
-                                      key=lambda i: (-buckets[i][2], buckets[i][0]))
-                else:
-                    rescored = sorted(keep_set, key=lambda i: buckets[i][0])
-                keep_set = set(rescored[:target])
+        nb = len(buckets)
+        for w in range(target):
+            a = (w * nb) // target
+            b = max(a + 1, ((w + 1) * nb) // target)
+            best = -1
+            for i in range(a, min(b, nb)):
+                if not speech:
+                    best = i          # no scores to compare — one sample/window
+                    break
+                if best < 0 or buckets[i][2] > buckets[best][2]:
+                    best = i
+            if best >= 0:
+                keep_set.add(best)
 
-        keep_indices = sorted(keep_set)
         kept_intervals = []  # [start, end, type]
-        for i in keep_indices:
+        for i in sorted(keep_set):
             bs, be, _, ty = buckets[i]
             if (kept_intervals and abs(kept_intervals[-1][1] - bs) < 0.05
                     and kept_intervals[-1][2] == ty):
@@ -3002,30 +3135,26 @@ class ReactionVideoProcessor:
             else:
                 kept_intervals.append([bs, be, ty])
 
-        # breaker cards inside long kept intervals (maxSpeech <= 1 disables)
-        kept_final = []
-        breaker_intervals = []
-        if max_speech > 1 and breaker_dur > 0:
-            for a, b, ty in kept_intervals:
-                cur = a
-                while cur < b - 0.01:
-                    be = min(b, cur + max_speech)
-                    kept_final.append((cur, be, ty))
-                    cur = be
-                    if cur < b - 0.01:
-                        br_end = min(b, cur + breaker_dur)
-                        if br_end - cur > 0.05:
-                            breaker_intervals.append((cur, br_end))
-                            cur = br_end
-        else:
-            kept_final = [(a, b, ty) for a, b, ty in kept_intervals]
+        padded = [[max(span_start, a - pad), min(span_end, b + pad), ty]
+                  for a, b, ty in kept_intervals]
+        merged = []
+        for a, b, ty in padded:
+            if merged and a - merged[-1][1] <= 0.05 and merged[-1][2] == ty:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b, ty])
 
         def _emit_removed(fr, to):
             if to - fr <= 0.02:
                 return []
             if removed_action == "card" and to - fr > card_dur:
-                return [{"type": "card", "start": fr, "end": fr + card_dur},
+                return [{"type": "card", "start": fr, "end": fr + card_dur,
+                         "card": _card_payload()},
                         {"type": "cut", "start": fr + card_dur, "end": to}]
+            if removed_action == "card":
+                # a short pointer card, never an unlabelled card of any length
+                return [{"type": "card", "start": fr, "end": to,
+                         "card": _card_payload()}]
             return [{"type": removed_action, "start": fr, "end": to}]
 
         out = []
@@ -3034,52 +3163,26 @@ class ReactionVideoProcessor:
             if typ not in rewrite_types:
                 out.append(dict(s))
                 continue
-            ss = float(s["start"])
-            se = float(s["end"])
+            ss, se = float(s["start"]), float(s["end"])
             if se <= span_start or ss >= span_end:
                 out.append(dict(s))
                 continue
             ss = max(ss, span_start)
             se = min(se, span_end)
-            pieces = []
-            for a, b, ty in kept_final:
-                if b <= ss + 0.01 or a >= se - 0.01:
-                    continue
-                pieces.append((max(a, ss), min(b, se), False, ty))
-            for a, b in breaker_intervals:
-                if b <= ss + 0.01 or a >= se - 0.01:
-                    continue
-                pieces.append((max(a, ss), min(b, se), True, "card"))
-            pieces.sort(key=lambda x: x[0])
             cursor = ss
-            for ks, ke, is_br, ty in pieces:
-                if ks - cursor > 0.02:
-                    out.extend(_emit_removed(cursor, ks))
-                if is_br:
-                    btyp = (breaker_action if breaker_action in ("card", "cut")
-                            else "card")
-                    bout = {"type": btyp, "start": ks, "end": ke}
-                    if btyp == "card" and breaker_variant == "short":
-                        bout["card"] = {"variant": "short"}
-                    out.append(bout)
-                else:
-                    out.append({"type": ty, "start": ks, "end": ke})
-                cursor = max(cursor, ke)
+            for a, b, ty in merged:
+                if b <= cursor + 0.02 or a >= se - 0.02:
+                    continue
+                a, b = max(a, cursor), min(b, se)
+                if b - a <= 0.02:
+                    continue
+                if a - cursor > 0.02:
+                    out.extend(_emit_removed(cursor, a))
+                out.append({"type": typ, "start": a, "end": b})
+                cursor = max(cursor, b)
             if se - cursor > 0.02:
                 out.extend(_emit_removed(cursor, se))
-        out.sort(key=lambda x: x["start"])
-        tidy = []
-        for s in out:
-            if (tidy and tidy[-1]["type"] == s["type"]
-                    and abs(tidy[-1]["end"] - s["start"]) < 0.02
-                    and (s["type"] != "card"
-                         or _card_variant(tidy[-1]) == _card_variant(s))):
-                tidy[-1]["end"] = max(tidy[-1]["end"], s["end"])
-            else:
-                tidy.append(dict(s))
-        return [s for s in tidy
-                if s["end"] - s["start"] > 0.08 and s["end"] <= duration + 0.05]
-
+        return _tidy(out)
 
 
 
