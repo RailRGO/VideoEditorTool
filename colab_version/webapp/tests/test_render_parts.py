@@ -688,6 +688,23 @@ def test_youtube_stems(root: Path):
     check(words > 2000,
           f"the exported card carries its title/sub ({words} bright px)")
 
+    # the journal hashes the look: same name + new cloak must rebuild, or a
+    # fixed render would resume straight into the old (broken) parts
+    logs2: List[str] = []
+    proc.render_project(target="youtube", name="yt_test", segments=segs,
+                        layout=L.LayoutState(), crf=30, preset="ultrafast",
+                        part_target=6.0, video_cloak=L.default_video_cloak(),
+                        log=logs2.append)
+    check(not any("already on disk" in l for l in logs2),
+          "a cloak change invalidates the part journal (no stale reuse)")
+    logs3: List[str] = []
+    proc.render_project(target="youtube", name="yt_test", segments=segs,
+                        layout=L.LayoutState(), crf=30, preset="ultrafast",
+                        part_target=6.0, video_cloak=L.default_video_cloak(),
+                        log=logs3.append)
+    check(any("already on disk" in l for l in logs3),
+          "unchanged settings still reuse every saved part")
+
 
 def test_youtube_default_cloak(root: Path):
     """The cloak the browser posts by default must look like the preview.

@@ -1842,9 +1842,39 @@ class ReactionVideoProcessor:
         write_stems = (False if target == "youtube"
                        else (True if stems is None else bool(stems)))
         want_stems = write_stems
+        # engine state first: the journal signature below hashes what the
+        # parts will look/sound like, so it must see the final config
+        if audio is not None:
+            self.audio_cfg.update(audio)
+        if isinstance(retouch, dict):
+            self.retouch_cfg.update(retouch)
+        lay = layout or self.layout
+        if layout is not None and target == "patreon":
+            self.layout = lay
+        rect = {"x": lay.content.x, "y": lay.content.y,
+                "w": lay.content.w, "h": lay.content.h}
+        hook = (self._cam_hook() if target == "patreon"
+                and self.retouch_cfg.get("enabled") else None)
+        pt_streams, pt_used = self._passthrough_streams(stems)
+        if target == "youtube" and pt_used:
+            say("reading the content + mic stems (tracks 2/3) — mute and "
+                "card spans silence the programme, your voice stays")
+        # What the parts look like is part of a part's identity: reusing a
+        # part rendered with a different cloak/card/layout would ship the
+        # old look under the new settings (and hid exactly this regression
+        # once — a fixed render resumed straight into the broken parts).
+        if target == "youtube":
+            look_src: List[Any] = [video_cloak, card, rect, master_gain_db]
+        else:
+            look_src = [lay.to_dict() if lay is not None else None,
+                        dict(self.audio_cfg), dict(self.retouch_cfg),
+                        master_gain_db]
+        look = hashlib.sha1(json.dumps(
+            look_src, sort_keys=True, default=str).encode()).hexdigest()[:12]
         sig = hashlib.sha1(
             (str(self.input) + target + plan_json + f"{fast}|{crf}|{fps}|"
-             f"{height}|{width}|stems={want_stems}").encode()).hexdigest()[:16]
+             f"{height}|{width}|stems={want_stems}|look={look}").encode()
+        ).hexdigest()[:16]
         man = read_manifest(self.out, key)
         done: Dict[int, Dict[str, Any]] = {}
         if man and man.get("sig") == sig and man.get("parts") == len(parts):
@@ -1909,22 +1939,6 @@ class ReactionVideoProcessor:
         for i in range(len(parts)):
             prog_before[i] = acc
             acc += prog_len(parts[i], fast)
-
-        if audio is not None:
-            self.audio_cfg.update(audio)
-        if isinstance(retouch, dict):
-            self.retouch_cfg.update(retouch)
-        lay = layout or self.layout
-        if layout is not None and target == "patreon":
-            self.layout = lay
-        rect = {"x": lay.content.x, "y": lay.content.y,
-                "w": lay.content.w, "h": lay.content.h}
-        hook = (self._cam_hook() if target == "patreon"
-                and self.retouch_cfg.get("enabled") else None)
-        pt_streams, pt_used = self._passthrough_streams(stems)
-        if target == "youtube" and pt_used:
-            say("reading the content + mic stems (tracks 2/3) — mute and card "
-                "spans silence the programme, your voice stays")
 
         for i, part in enumerate(parts):
             if cancel_check is not None and cancel_check():
