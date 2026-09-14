@@ -351,6 +351,10 @@ def default_audio_cloak() -> Dict[str, Any]:
         "reverb": 18.0,  # 0..100
         "tilt": 2.0,     # dB, positive = brighter
         "widen": 6.0,    # ms Haas delay on right channel
+        "voiceChanger": False,  # complete voice change (CapCut-like), off by default
+        "voicePreset": "anon",  # anon|deep|high|robot|custom
+        "voiceStrength": 70.0,  # 0..100 intensity
+        "voicePitch": 0.0,      # extra pitch shift for custom preset, semitones
     }
 
 
@@ -373,6 +377,8 @@ def default_video_cloak() -> Dict[str, Any]:
         "rotate": 0.0,     # degrees -5..5
         "speed": 1.0,      # global playback speed tweak 0.95..1.05
         "contentOnly": True,  # when true, zoom/blur/rotate/hue/sat/cont/bri/grain/flipContent affect only content rect
+        "fisheye": False,  # fisheye lens effect on content only, off by default
+        "fisheyeAmount": 35.0,  # 0..100 intensity of fisheye
     }
 
 

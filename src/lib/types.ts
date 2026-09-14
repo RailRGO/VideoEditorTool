@@ -430,6 +430,14 @@ export interface AudioCloak {
   tilt: number;
   /** Haas stereo widening in ms (delays the right channel) */
   widen: number;
+  /** complete voice changer — shifts formant + pitch to make voice unrecognizable */
+  voiceChanger: boolean;
+  /** voice changer preset */
+  voicePreset: "anon" | "deep" | "high" | "robot" | "custom";
+  /** voice changer strength 0..100 */
+  voiceStrength: number;
+  /** extra pitch shift for voice changer in semitones (custom preset) */
+  voicePitch: number;
 }
 
 export const defaultAudioCloak: AudioCloak = {
@@ -439,6 +447,10 @@ export const defaultAudioCloak: AudioCloak = {
   reverb: 18,
   tilt: 2,
   widen: 6,
+  voiceChanger: false,
+  voicePreset: "anon",
+  voiceStrength: 70,
+  voicePitch: 0,
 };
 
 /**
@@ -446,7 +458,7 @@ export const defaultAudioCloak: AudioCloak = {
  * passthrough mode — zoom/crop, cover bars, colour and grain.
  *
  * contentOnly = true (default) means zoom/blur/rotate/hue/saturate/contrast/
- * brightness/grain/flipContent affect only the content area (where the
+ * brightness/grain/flipContent/fisheye affect only the content area (where the
  * watched video lives), leaving the camera corner untouched. That fixes the
  * "reaction cuts my camera / black lines" complaint: the camera stays full
  * quality, only the potentially-claimed content gets disguised.
@@ -481,8 +493,12 @@ export interface VideoCloak {
   rotate: number;
   /** playback speed tweak 0.95..1.05 — breaks audio fingerprint when combined with pitch */
   speed: number;
-  /** when true (default), zoom/blur/rotate/hue/saturate/contrast/brightness/grain/flipContent affect only the content rect */
+  /** when true (default), zoom/blur/rotate/hue/saturate/contrast/brightness/grain/flipContent/fisheye affect only the content rect */
   contentOnly: boolean;
+  /** fisheye lens distortion on content area only — strong anti-ContentID */
+  fisheye: boolean;
+  /** fisheye strength 0..100 */
+  fisheyeAmount: number;
 }
 
 export const defaultVideoCloak: VideoCloak = {
@@ -503,6 +519,8 @@ export const defaultVideoCloak: VideoCloak = {
   rotate: 0,
   speed: 1,
   contentOnly: true,
+  fisheye: false,
+  fisheyeAmount: 35,
 };
 
 export const defaultCut: CutOptions = {
