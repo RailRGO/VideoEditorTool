@@ -1218,6 +1218,201 @@ def frame_pixel_1080(path: Path, t: float, x: float, y: float) -> List[int]:
     return [int(v) for v in img[int(y * h), int(x * w)]]
 
 
+def test_clean_intro_outro(root: Path):
+    """The user rule: intro/outro leave the YouTube cut EXACTLY as recorded.
+
+    No video cloak, no bars/vignette/border, no speed tweak, no audio cloak,
+    no voice changer — all of it lives in the reaction part only. Proven by
+    rendering the same timeline with a maxed cloak and with none, then
+    diffing frames (intro/outro must match, body must not) and reading the
+    spectrum (intro keeps the unshifted mic tone, body loses it).
+    """
+    print("intro/outro stay clean — every effect is reaction-only")
+    src = root / "master.mp4"
+    out = root / "out_clean"
+    proc = V.ReactionVideoProcessor(str(src), work_dir=str(root / "work_clean"),
+                                    output_dir=str(out))
+    segs = [{"type": "intro", "start": 0, "end": 3},
+            {"type": "body", "start": 3, "end": 8},
+            {"type": "card", "start": 8, "end": 9.5},
+            {"type": "body", "start": 9.5, "end": 13},
+            {"type": "outro", "start": 13, "end": 16}]
+    rect = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
+    vc = L.default_video_cloak()
+    vc.update({"on": True, "bars": 4.0, "vignette": 45.0, "hue": 18.0,
+               "zoom": 1.06, "border": 8.0, "speed": 1.04})
+    ac = L.default_audio_cloak()
+    ac.update({"on": True, "pitch": 1.5, "voiceChanger": True,
+               "voiceMode": "fx", "voicePreset": "deep", "voiceStrength": 80.0})
+    plain = proc.render_passthrough(segs, audio_cloak={"on": False},
+                                    video_cloak={"on": False}, card=None,
+                                    fast_speed=4.0, crf=30, preset="ultrafast",
+                                    name="clean_off", content_rect=rect)
+    cloaked = proc.render_passthrough(segs, audio_cloak=ac, video_cloak=vc,
+                                      card=None, fast_speed=4.0, crf=30,
+                                      preset="ultrafast", name="clean_on",
+                                      content_rect=rect)
+    a, b = Path(plain["mp4"]), Path(cloaked["mp4"])
+    # The speed tweak compresses only the reaction, so the outro starts at a
+    # different programme instant in each file. Sample each render 1 s before
+    # its own end — both then decode the SAME source frame, which is the only
+    # fair way to prove the outro pixels were untouched.
+    dur_plain = media(a)["dur"]
+    dur_cloak = media(b)["dur"]
+
+    def luma_diff(ta: float, tb: float) -> float:
+        fa, fb = frame_gray(a, ta), frame_gray(b, tb)
+        if fa.size == 0 or fb.size == 0:
+            return 999.0
+        return float(np.abs(fa.astype(int) - fb.astype(int)).mean())
+
+    d_intro = luma_diff(1.0, 1.0)
+    d_outro = luma_diff(dur_plain - 1.0, dur_cloak - 1.0)
+    # programme time of the reaction: (16 - 3 - 3) / 1.04 speed tweak,
+    # so programme 5.0 s sits inside the first body span
+    d_body = luma_diff(5.0, 5.0)
+    # Two separate CRF-30 encodes differ by a few luma from rate control
+    # alone, so the proof is RELATIVE: intro/outro stay at encode-noise
+    # level while the reaction jumps by an order of magnitude.
+    check(d_intro < 5.0,
+          f"intro frame is untouched by the full cloak (Δ luma {d_intro:.2f})")
+    check(d_outro < 5.0,
+          f"outro frame is untouched by the full cloak (Δ luma {d_outro:.2f})")
+    check(d_body > 8.0,
+          f"reaction frames DO take the cloak (Δ luma {d_body:.2f})")
+    check(d_outro < 0.5 * d_body,
+          f"outro stays far cleaner than the cloaked reaction "
+          f"({d_outro:.2f} vs {d_body:.2f})")
+    # the top bar zone: black on reaction spans, clean on intro/outro.
+    # Sample rows 10..40 — below the 8 px inset border colour, inside the
+    # 4 % cover bar — so the frame colour can't leak into the reading.
+    bar_on = frame_gray(b, 5.0)[10:40, :].mean()
+    bar_intro = frame_gray(b, 1.0)[10:40, :].mean()
+    bar_plain = frame_gray(a, 1.0)[10:40, :].mean()
+    check(bar_on < 0.4 * bar_plain,
+          f"cover bars reach the reaction part (top rows {bar_on:.0f})")
+    check(abs(bar_intro - bar_plain) < 2.0,
+          f"…but never the intro (top rows {bar_intro:.0f} vs {bar_plain:.0f})")
+
+    # audio: the mic tone (440 Hz) keeps its frequency in the intro
+    # (no pitch shift / voice changer there) and loses it in the body
+    s_intro = spectrum(b, 1.0)
+    s_body = spectrum(b, 5.0)
+    check(s_intro[MIC_HZ] > 40,
+          f"intro audio keeps the natural mic tone ({s_intro[MIC_HZ]:.0f})")
+    check(s_body[MIC_HZ] < 0.5 * s_intro[MIC_HZ],
+          f"reaction audio is pitch/voice-changed (440 Hz "
+          f"{s_intro[MIC_HZ]:.0f} → {s_body[MIC_HZ]:.0f})")
+    s_outro = spectrum(b, 14.0)
+    check(s_outro[MIC_HZ] > 40,
+          f"outro audio keeps the natural mic tone ({s_outro[MIC_HZ]:.0f})")
+
+    # ---- the same rule must hold on the CHUNKED path (parts + journal) ----
+    # that is the path that renders long videos — the one that blew up at
+    # part 6/6 and the one long exports actually take
+    logs: List[str] = []
+    res_c = proc.render_project(target="youtube", name="clean_chunked",
+                                segments=segs, layout=L.LayoutState(),
+                                audio_cloak=ac, video_cloak=vc,
+                                fast_speed=4.0, crf=30, preset="ultrafast",
+                                part_target=4.0, log=logs.append)
+    c = Path(res_c["mp4"])
+    check(res_c.get("chunked") is True and res_c.get("parts", 0) > 1,
+          f"the chunked render actually chunked ({res_c.get('parts')} parts)")
+    dur_chunk = media(c)["dur"]
+    dc_intro = float(np.abs(frame_gray(a, 1.0).astype(int)
+                            - frame_gray(c, 1.0).astype(int)).mean())
+    dc_outro = float(np.abs(frame_gray(a, dur_plain - 1.0).astype(int)
+                            - frame_gray(c, dur_chunk - 1.0).astype(int)).mean())
+    dc_body = float(np.abs(frame_gray(a, 5.0).astype(int)
+                           - frame_gray(c, 5.0).astype(int)).mean())
+    check(dc_intro < 5.0,
+          f"chunked: intro untouched by the cloak (Δ {dc_intro:.2f})")
+    check(dc_outro < 5.0 and dc_outro < 0.5 * max(8.0, dc_body),
+          f"chunked: outro untouched by the cloak "
+          f"(Δ {dc_outro:.2f}, body Δ {dc_body:.2f})")
+    check(frame_gray(c, 5.0)[10:40, :].mean() < 25,
+          "chunked: cover bars still reach the reaction part")
+    sc_intro = spectrum(c, 1.0)
+    sc_body = spectrum(c, 5.0)
+    check(sc_intro[MIC_HZ] > 40 and sc_body[MIC_HZ] < 0.5 * sc_intro[MIC_HZ],
+          f"chunked: intro audio clean, reaction audio disguised "
+          f"(intro {sc_intro[MIC_HZ]:.0f}, body {sc_body[MIC_HZ]:.0f})")
+
+
+def test_sticker_reaction_only(root: Path):
+    """The user's overlay image lands on the reaction part only, with its
+    opacity honoured — intro/outro frames stay pixel-clean."""
+    print("sticker overlay: reaction-only, opacity, position")
+    src = root / "master.mp4"
+    out = root / "out_sticker"
+    proc = V.ReactionVideoProcessor(str(src), work_dir=str(root / "work_sticker"),
+                                    output_dir=str(out))
+    import cv2 as _cv2
+    png = root / "work_sticker.png"
+    img = np.zeros((160, 320, 4), np.uint8)
+    img[..., :3] = 255     # white square (bright in luma), full alpha
+    img[..., 3] = 255
+    _cv2.imwrite(str(png), img)
+    segs = [{"type": "intro", "start": 0, "end": 3},
+            {"type": "body", "start": 3, "end": 10},
+            {"type": "outro", "start": 10, "end": 14}]
+    rect = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
+    sticker = {"on": True, "src": str(png), "x": 0.80, "y": 0.05,
+               "w": 0.15, "opacity": 0.9}
+    plain = proc.render_passthrough(segs, audio_cloak={"on": False},
+                                    video_cloak={"on": False}, card=None,
+                                    fast_speed=4.0, crf=30, preset="ultrafast",
+                                    name="sticker_off", content_rect=rect)
+    stuck = proc.render_passthrough(segs, audio_cloak={"on": False},
+                                    video_cloak={"on": False}, card=None,
+                                    fast_speed=4.0, crf=30, preset="ultrafast",
+                                    name="sticker_on", content_rect=rect,
+                                    sticker=sticker)
+    a, b = Path(plain["mp4"]), Path(stuck["mp4"])
+    box = (0.80, 0.05, 0.15, 0.15)
+    pb, sb = region_brightness(a, 5.0, box, (1920, 1080)), \
+        region_brightness(b, 5.0, box, (1920, 1080))
+    check(sb > pb + 10,
+          f"the sticker is visible during the reaction part "
+          f"({sb:.0f} vs {pb:.0f})")
+    d_intro = float(np.abs(frame_gray(a, 1.0).astype(int)
+                           - frame_gray(b, 1.0).astype(int)).mean())
+    d_outro = float(np.abs(frame_gray(a, 12.0).astype(int)
+                           - frame_gray(b, 12.0).astype(int)).mean())
+    check(d_intro < 1.0, f"no sticker over the intro (Δ {d_intro:.2f})")
+    check(d_outro < 1.0, f"no sticker over the outro (Δ {d_outro:.2f})")
+
+
+def test_encoder_fallback():
+    """GPU detection must be a real smoke encode, not an encoder listing.
+
+    Static ffmpeg builds always LIST h264_nvenc; on a GPU-less runtime the
+    encoder then dies with 'Cannot load libcuda.so.1' mid-render. The pick
+    must run the smoke test (and honour REACT_GPU=0)."""
+    print("encoder pick: smoke-tested nvenc, CPU fallback, REACT_GPU=0")
+    enc, _ = V._pick_video_encoder(prefer_gpu=True)
+    check(enc in ("h264_nvenc", "libx264"),
+          f"encoder pick returns a usable encoder ({enc})")
+    check(V._pick_video_encoder()[0] == ("h264_nvenc" if C.nvenc_available()
+                                         else "libx264"),
+          "the pick agrees with the compose-level smoke test")
+    saved_gpu, saved_cache = os.environ.get("REACT_GPU"), C._NVENC_OK
+    try:
+        os.environ["REACT_GPU"] = "0"
+        C._NVENC_OK = None
+        check(C.nvenc_available(verbose=False) is False,
+              "REACT_GPU=0 forces the CPU encoder")
+        check(V._pick_video_encoder()[0] == "libx264",
+              "REACT_GPU=0 -> libx264")
+    finally:
+        if saved_gpu is None:
+            os.environ.pop("REACT_GPU", None)
+        else:
+            os.environ["REACT_GPU"] = saved_gpu
+        C._NVENC_OK = saved_cache
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -1235,6 +1430,7 @@ def main() -> int:
     test_card_speed()
     test_fair_use_cards()
     test_vignette_matches_preview()
+    test_encoder_fallback()
     if fast_only:
         print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed "
               f"({time.time() - t0:.0f}s)")
@@ -1251,9 +1447,11 @@ def main() -> int:
     # fixtures are reused between runs; render outputs are not (a resume test
     # against last run's finished output would prove nothing)
     for d in ("out", "out_resume", "out_yt", "out_yt_single", "out_short",
-              "out_http", "out_yt_rect", "out_yt_cloak", "out_fish", "work",
+              "out_http", "out_yt_rect", "out_yt_cloak", "out_fish",
+              "out_clean", "out_sticker", "work",
               "work_resume", "work_yt", "work_yt2", "work_short",
-              "work_http", "work_yt_rect", "work_cloak", "work_fish"):
+              "work_http", "work_yt_rect", "work_cloak", "work_fish",
+              "work_clean", "work_sticker"):
         shutil.rmtree(root / d, ignore_errors=True)
     test_patreon_chunked(root)
     test_short_render_single_pass(root)
@@ -1263,6 +1461,8 @@ def main() -> int:
     test_youtube_default_cloak(root)
     test_fisheye_reaction_only(root)
     test_youtube_card_follows_posted_layout(root)
+    test_clean_intro_outro(root)
+    test_sticker_reaction_only(root)
     test_http_api(root)
 
     print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed ({time.time() - t0:.0f}s)")

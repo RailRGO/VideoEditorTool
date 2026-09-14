@@ -938,7 +938,14 @@ export default function AutoCut({
 
       <Section title="7 · Video disguise (anti-Content ID)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Alter the picture itself so Content ID can’t match frames. Mirror is strongest single trick. Combine with zoom, hue, blur, rotate and audio pitch. Preview shows effect, final render uses same in ffmpeg (hflip, gblur, rotate). GPU (nvenc) will be used if available.
+          Alter the picture itself so Content ID can’t match frames. Mirror is the strongest single
+          trick. Combine with zoom, hue, blur, rotate and audio pitch. Preview shows the effect; the
+          final render applies the same thing in ffmpeg (hflip, gblur, rotate).
+        </p>
+        <p className="mb-2 text-[11px] leading-relaxed text-emerald-300/80">
+          Intro and outro are always excluded — every disguise here lands on the reaction part only,
+          so your full-cam solo stays exactly as recorded. The GPU encoder (nvenc) is used only when
+          it passes a real smoke encode; otherwise it falls back to CPU automatically.
         </p>
         <div className="space-y-2">
           <div className="flex items-center gap-2">

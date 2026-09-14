@@ -12,6 +12,7 @@ import type {
   LayoutState,
   Retouch,
   Segment,
+  Sticker,
   Target,
   VideoCloak,
 } from "./types";
@@ -134,6 +135,8 @@ export interface ProjectBody {
   stems?: boolean;
   /** join-fade length in ms at cut/card/mute edges (0 = off, default 80) */
   audioFadeMs?: number;
+  /** overlay image on the YouTube cut (reaction part only) */
+  sticker?: Sticker;
 }
 
 const UNREACHABLE =
@@ -240,6 +243,33 @@ export class RemoteClient {
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
+
+  /** push an image (sticker overlay / card background) to the notebook;
+      the returned name is what `sticker.src` references on the server */
+  uploadAsset = async (file: File): Promise<{ name: string; url: string }> => {
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    let res: Response;
+    try {
+      res = await fetch(this.url("/api/upload"), {
+        method: "POST",
+        headers: { "ngrok-skip-browser-warning": "true" },
+        body: fd,
+      });
+    } catch {
+      throw new Error(UNREACHABLE);
+    }
+    const j = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      name?: string;
+      url?: string;
+      error?: string;
+    };
+    if (!res.ok || !j.ok || !j.name) {
+      throw new Error(j.error || `Upload failed (${res.status})`);
+    }
+    return { name: j.name, url: this.url(j.url || `/files/${encodeURIComponent(j.name)}`) };
+  };
 
   /** bus: "mix" (default), "mic" or "content" */
   proxyUrl = (bus: "mix" | "mic" | "content" = "mix"): string =>

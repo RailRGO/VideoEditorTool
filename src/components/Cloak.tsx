@@ -1,19 +1,63 @@
-import type { AudioCloak, VideoCloak } from "../lib/types";
-import { Note, Section, Slider } from "./ui";
+import { useRef, useState } from "react";
+import type { AudioCloak, Sticker, VideoCloak } from "../lib/types";
+import type { RemoteClient } from "../lib/remote";
+import { Btn, Note, Section, Segmented, Slider } from "./ui";
 
 export default function CloakPanel({
   audio,
   setAudio,
   video,
   setVideo,
+  sticker,
+  setSticker,
+  remote,
 }: {
   audio: AudioCloak;
   setAudio: React.Dispatch<React.SetStateAction<AudioCloak>>;
   video: VideoCloak;
   setVideo: React.Dispatch<React.SetStateAction<VideoCloak>>;
+  sticker: Sticker;
+  setSticker: React.Dispatch<React.SetStateAction<Sticker>>;
+  /** present when the Colab backend is connected (uploads + RVC) */
+  remote: RemoteClient | null;
 }) {
   const setA = (p: Partial<AudioCloak>) => setAudio((c) => ({ ...c, ...p }));
   const setV = (p: Partial<VideoCloak>) => setVideo((c) => ({ ...c, ...p }));
+  const setS = (p: Partial<Sticker>) => setSticker((c) => ({ ...c, ...p }));
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const [uploadErr, setUploadErr] = useState("");
+  const [uploading, setUploading] = useState(false);
+
+  /** where the browser can actually SEE the sticker (preview URL) */
+  const previewSrc = (() => {
+    const src = sticker.src || "";
+    if (!src) return "";
+    if (src.startsWith("data:") || src.startsWith("blob:") || src.startsWith("http")) return src;
+    return remote ? remote.fileUrl(src) : "";
+  })();
+
+  const onPickFile = async (file: File | null) => {
+    if (!file) return;
+    setUploadErr("");
+    if (remote) {
+      // Colab mode: push the image to the notebook — the renderer reads it there
+      setUploading(true);
+      try {
+        const up = await remote.uploadAsset(file);
+        setS({ src: up.name, on: true });
+      } catch (e) {
+        setUploadErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        setUploading(false);
+      }
+    } else {
+      // local mode: keep the image in the browser (object URL for preview,
+      // data URL so it survives inside saved projects)
+      const rd = new FileReader();
+      rd.onload = () => setS({ src: String(rd.result || ""), on: true });
+      rd.readAsDataURL(file);
+    }
+  };
 
   return (
     <div className="space-y-2.5">
@@ -34,8 +78,8 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Treats the whole mixed programme — you and the content voices together. Everything here
-          keeps the duration untouched.
+          Treats the mixed programme of the <b>reaction part only</b> — your intro and outro are
+          exported exactly as recorded. Everything here keeps the duration untouched.
         </p>
         <div className="space-y-2">
           <Slider
@@ -94,7 +138,7 @@ export default function CloakPanel({
       </Section>
 
       <Section
-        title="Voice changer — CapCut style"
+        title="Voice changer — your voice, reaction part only"
         right={
           <button
             type="button"
@@ -110,50 +154,250 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Complete voice transformation — changes timbre, not just pitch. Like CapCut voice changer: makes voice unrecognizable. Off by default.
+          Replaces your voice in the <b>mic track of the reaction part</b> — the content audio and
+          your intro/outro keep their natural sound. Needs the Patreon master with stems so the mic
+          can be isolated.
+        </p>
+        <Segmented
+          value={audio.voiceMode ?? "rvc"}
+          options={[
+            { value: "rvc", label: "AI character voice (RVC)" },
+            { value: "fx", label: "Basic FX" },
+          ]}
+          onChange={(m) => setA({ voiceMode: m })}
+        />
+        {(audio.voiceMode ?? "rvc") === "rvc" ? (
+          <div className="mt-2 space-y-2">
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              Real voice conversion with an RVC model (<code>.pth</code> + optional{" "}
+              <code>.index</code>) — a different person speaking, not a pitch trick, so audio
+              fingerprints don't recognise you. Runs on the Colab backend during export.
+            </p>
+            <label className="block">
+              <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+                Model file (.pth) — path on the notebook
+              </span>
+              <input
+                type="text"
+                value={audio.rvcModel ?? ""}
+                onChange={(e) => setA({ rvcModel: e.target.value })}
+                placeholder="/content/drive/MyDrive/voices/someone.pth"
+                className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+                spellCheck={false}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+                Index file (.index) — optional, sharper likeness
+              </span>
+              <input
+                type="text"
+                value={audio.rvcIndex ?? ""}
+                onChange={(e) => setA({ rvcIndex: e.target.value })}
+                placeholder="/content/drive/MyDrive/voices/someone.index"
+                className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+                spellCheck={false}
+              />
+            </label>
+            <Slider
+              label="Transpose"
+              value={audio.rvcTranspose ?? 0}
+              min={-12}
+              max={12}
+              step={1}
+              display={`${(audio.rvcTranspose ?? 0) > 0 ? "+" : ""}${audio.rvcTranspose ?? 0} st`}
+              onChange={(v) => setA({ rvcTranspose: v })}
+              hint="match the character to your range: male→female ≈ +12, female→male ≈ −12"
+            />
+            <Slider
+              label="Index rate"
+              value={Math.round((audio.rvcIndexRate ?? 0.5) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round((audio.rvcIndexRate ?? 0.5) * 100)}%`}
+              onChange={(v) => setA({ rvcIndexRate: v / 100 })}
+              hint="how much of the character's timbre to pull from the .index"
+            />
+            <div>
+              <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+                Pitch detection
+              </span>
+              <Segmented
+                value={audio.rvcMethod ?? "rmvpe"}
+                size="sm"
+                options={[
+                  { value: "rmvpe", label: "rmvpe · robust" },
+                  { value: "crepe", label: "crepe · clean" },
+                  { value: "pm", label: "pm · fast" },
+                ]}
+                onChange={(m) => setA({ rvcMethod: m })}
+              />
+            </div>
+            <p className="text-[10px] text-amber-300/70">
+              One-time setup in the notebook: <code>%pip install rvc-python</code>. Voice models
+              live on the notebook side (e.g. in your Drive) — paste the full path above.
+            </p>
+          </div>
+        ) : (
+          <div className="mt-2 space-y-2">
+            <div className="flex flex-wrap gap-1.5">
+              {(["anon", "deep", "high", "robot", "custom"] as const).map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setA({ voicePreset: preset })}
+                  className={
+                    audio.voicePreset === preset
+                      ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
+                      : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                  }
+                >
+                  {preset === "anon"
+                    ? "Anon"
+                    : preset === "deep"
+                    ? "Deep"
+                    : preset === "high"
+                    ? "High"
+                    : preset === "robot"
+                    ? "Robot"
+                    : "Custom"}
+                </button>
+              ))}
+            </div>
+            <Slider
+              label="Strength"
+              value={audio.voiceStrength}
+              min={0}
+              max={100}
+              step={1}
+              display={`${audio.voiceStrength}%`}
+              onChange={(v) => setA({ voiceStrength: v })}
+              hint="how much to transform — 100% = full change"
+            />
+            {audio.voicePreset === "custom" && (
+              <Slider
+                label="Custom pitch"
+                value={audio.voicePitch}
+                min={-6}
+                max={6}
+                step={0.5}
+                display={`${audio.voicePitch > 0 ? "+" : ""}${audio.voicePitch.toFixed(1)} st`}
+                onChange={(v) => setA({ voicePitch: v })}
+                hint="extra pitch shift for custom preset"
+              />
+            )}
+            <p className="text-[10px] text-amber-300/70">
+              Basic pitch/formant tricks — better than nothing, but a determined matcher can still
+              see through them. Use the AI character voice for a truly different voice.
+            </p>
+          </div>
+        )}
+      </Section>
+
+      <Section
+        title="Sticker / overlay image"
+        right={
+          <button
+            type="button"
+            onClick={() => setS({ on: !sticker.on })}
+            className={
+              sticker.on
+                ? "rounded border border-sky-400/40 bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-sky-200"
+                : "rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-400"
+            }
+          >
+            {sticker.on ? "on" : "off"}
+          </button>
+        }
+      >
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          A transparent image (subscribe, like, your logo…) placed in a free corner of the frame.
+          Shown during the <b>reaction part only</b> — never over intro/outro.
         </p>
         <div className="space-y-2">
-          <div className="flex flex-wrap gap-1.5">
-            {(["anon", "deep", "high", "robot", "custom"] as const).map((preset) => (
-              <button
-                key={preset}
-                type="button"
-                onClick={() => setA({ voicePreset: preset })}
-                className={
-                  audio.voicePreset === preset
-                    ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
-                    : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
-                }
-              >
-                {preset === "anon" ? "Anon" : preset === "deep" ? "Deep" : preset === "high" ? "High" : preset === "robot" ? "Robot" : "Custom"}
-              </button>
-            ))}
-          </div>
-          <Slider
-            label="Strength"
-            value={audio.voiceStrength}
-            min={0}
-            max={100}
-            step={1}
-            display={`${audio.voiceStrength}%`}
-            onChange={(v) => setA({ voiceStrength: v })}
-            hint="how much to transform — 100% = full change"
-          />
-          {audio.voicePreset === "custom" && (
-            <Slider
-              label="Custom pitch"
-              value={audio.voicePitch}
-              min={-6}
-              max={6}
-              step={0.5}
-              display={`${audio.voicePitch > 0 ? "+" : ""}${audio.voicePitch.toFixed(1)} st`}
-              onChange={(v) => setA({ voicePitch: v })}
-              hint="extra pitch shift for custom preset"
+          <div className="flex items-center gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              className="hidden"
+              onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
             />
-          )}
-          <p className="text-[10px] text-amber-300/70">
-            Anon = pitch down + formant shift (most private). Deep = lower, High = chipmunk, Robot = metallic distortion.
-          </p>
+            <Btn variant="primary" onClick={() => fileRef.current?.click()} disabled={uploading}>
+              {uploading ? "Uploading…" : remote ? "Upload image to notebook" : "Choose image"}
+            </Btn>
+            {sticker.src && (
+              <Btn onClick={() => setS({ src: "" })} title="Remove the image">
+                Clear
+              </Btn>
+            )}
+            {previewSrc && (
+              <img
+                src={previewSrc}
+                alt="sticker preview"
+                className="h-9 max-w-[72px] rounded border border-white/10 bg-[repeating-conic-gradient(#1e293b_0%_25%,#0f172a_0%_50%)] bg-[length:12px_12px] object-contain"
+              />
+            )}
+          </div>
+          {uploadErr && <p className="text-[10px] text-rose-300">{uploadErr}</p>}
+          <label className="block">
+            <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+              {remote
+                ? "Image on the notebook (uploaded name or a Drive path)"
+                : "Image source"}
+            </span>
+            <input
+              type="text"
+              value={sticker.src}
+              onChange={(e) => setS({ src: e.target.value })}
+              placeholder={remote ? "subscribe.png or /content/drive/MyDrive/img/sub.png" : ""}
+              className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-[11px] text-slate-200 outline-none focus:border-sky-400/50"
+              spellCheck={false}
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+            <Slider
+              label="Position X"
+              value={Math.round(sticker.x * 100)}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round(sticker.x * 100)}%`}
+              onChange={(v) => setS({ x: v / 100 })}
+              hint="left edge of the image"
+            />
+            <Slider
+              label="Position Y"
+              value={Math.round(sticker.y * 100)}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round(sticker.y * 100)}%`}
+              onChange={(v) => setS({ y: v / 100 })}
+              hint="top edge of the image"
+            />
+            <Slider
+              label="Size"
+              value={Math.round(sticker.w * 100)}
+              min={2}
+              max={60}
+              step={1}
+              display={`${Math.round(sticker.w * 100)}% of width`}
+              onChange={(v) => setS({ w: v / 100 })}
+              hint="height follows the image's own aspect"
+            />
+            <Slider
+              label="Opacity"
+              value={Math.round(sticker.opacity * 100)}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round(sticker.opacity * 100)}%`}
+              onChange={(v) => setS({ opacity: v / 100 })}
+              hint="for a subtle watermark pull it down to ~60%"
+            />
+          </div>
         </div>
       </Section>
 
@@ -173,6 +417,9 @@ export default function CloakPanel({
           </button>
         }
       >
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          Reaction part only — intro and outro frames pass through untouched.
+        </p>
         <div className="space-y-2">
           <div className="flex flex-wrap gap-2">
             <button type="button" onClick={() => setV({ contentOnly: !video.contentOnly })} className={video.contentOnly ? "rounded border border-emerald-400/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-semibold text-emerald-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.contentOnly ? "Content-only ON" : "Content-only OFF"}</button>
@@ -247,17 +494,18 @@ export default function CloakPanel({
             )}
           </div>
           <div className="mt-2">
-            <Slider label="Global speed tweak" value={video.speed} min={0.95} max={1.05} step={0.01} display={`${video.speed.toFixed(2)}×`} onChange={(v) => setV({ speed: v })} hint="breaks audio fingerprint when combined with pitch; re-times video+audio together" />
+            <Slider label="Global speed tweak" value={video.speed} min={0.95} max={1.05} step={0.01} display={`${video.speed.toFixed(2)}×`} onChange={(v) => setV({ speed: v })} hint="reaction part only — intro/outro always play at 1.00×" />
           </div>
         </div>
       </Section>
 
       <Section title="How to use it">
         <p className="text-[11px] leading-relaxed text-slate-400">
-          Start gentle and check after upload — these are a starting point, push further only where
-          claims actually land. Preview before rendering: pitch and chorus are audible, zoom and
-          bars are visible. Small values already move the needle; large values annoy viewers faster
-          than they fool matchers. Content-only ON is now default — it keeps your camera intact.
+          Every setting on this page touches the <b>reaction part only</b> — your intro and outro
+          are exported exactly as recorded (no video disguise, no audio cloak, no voice changer,
+          no sticker, no speed tweak). Start gentle and check after upload — these are a starting
+          point, push further only where claims actually land. Small values already move the
+          needle; large values annoy viewers faster than they fool matchers.
         </p>
       </Section>
 

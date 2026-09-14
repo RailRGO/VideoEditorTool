@@ -244,38 +244,36 @@ def _voice_changer_filters(cfg: Optional[Dict[str, Any]]) -> Tuple[List[str], Li
 
 
 def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
-                      out_label: str) -> Tuple[str, List[str]]:
+                      out_label: str, tag: str = "clk") -> Tuple[str, List[str]]:
     """ffmpeg filter_complex snippet: anti-fingerprint audio treatment.
 
-    Voice changer (formant+pitched, complete transformation) ->
     Tempo-preserving pitch (rubberband) -> chorus -> tilt EQ -> room echo ->
     Haas widening. Returns (snippet, warnings). Anull when disabled/empty.
+
+    The voice changer is NOT part of this chain: it must touch the mic bus
+    alone (an RVC model / formant shift over the content voices would turn
+    the show into chipmunks), so the caller applies it there first.
+
+    *tag* namespaces the internal labels so several instances can coexist
+    in one filter_complex (one per reaction run — intro/outro stay clean).
     """
     c = cfg or {}
-    if not c.get("on", False) and not c.get("voiceChanger", False):
+    if not c.get("on", False):
         return f"[{in_label}]anull[{out_label}]", []
     warnings: List[str] = []
-    pitch = float(c.get("pitch", 0.0)) if c.get("on") else 0.0
-    chorus = float(c.get("chorus", 0.0)) if c.get("on") else 0.0
-    reverb = float(c.get("reverb", 0.0)) if c.get("on") else 0.0
-    tilt = float(c.get("tilt", 0.0)) if c.get("on") else 0.0
-    widen = float(c.get("widen", 0.0)) if c.get("on") else 0.0
+    pitch = float(c.get("pitch", 0.0))
+    chorus = float(c.get("chorus", 0.0))
+    reverb = float(c.get("reverb", 0.0))
+    tilt = float(c.get("tilt", 0.0))
+    widen = float(c.get("widen", 0.0))
 
     cur = in_label
     parts: List[str] = []
-    tag = [0]
+    tagc = [0]
 
     def nxt() -> str:
-        tag[0] += 1
-        return f"clk{tag[0]}"
-
-    # voice changer first — complete transformation
-    v_filters, v_warns = _voice_changer_filters(c)
-    warnings.extend(v_warns)
-    for vf in v_filters:
-        o = nxt()
-        parts.append(f"[{cur}]{vf}[{o}]")
-        cur = o
+        tagc[0] += 1
+        return f"{tag}{tagc[0]}"
 
     if abs(pitch) >= 0.05:
         if _ffmpeg_has_filter("rubberband"):
@@ -320,6 +318,200 @@ def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
         return f"[{in_label}]anull[{out_label}]", warnings
     parts.append(f"[{cur}]anull[{out_label}]")
     return ";".join(parts), warnings
+
+
+# ---------------------------------------------------------------------------
+# clean vs reaction runs — intro/outro are exported EXACTLY as they are
+# ---------------------------------------------------------------------------
+# The user's rule: no effect of any kind may touch the intro or the outro —
+# no video disguise, no audio cloak, no voice changer, not even the global
+# speed tweak. Everything disguising lives in the reaction part only.
+
+CLEAN_TYPES = ("intro", "outro")
+
+
+def _clean_flags(kept: List[Dict[str, Any]]) -> List[bool]:
+    """Per segment: True = must pass through untouched (intro/outro)."""
+    return [str(s.get("type", "body")) in CLEAN_TYPES for s in kept]
+
+
+def _passthrough_runs(kept: List[Dict[str, Any]], fast_speed: float,
+                      global_speed: float
+                      ) -> Tuple[List[Dict[str, Any]], List[Tuple[float, float]], float]:
+    """Split *kept* into contiguous clean / reaction runs on the OUTPUT
+    timeline.
+
+    Returns (runs, out_off, total):
+      * runs    — [{\"clean\": bool, \"idxs\": [segment indices], \"a\": out_start, \"b\": out_end}]
+      * out_off — per segment (out_start, out_end) in programme seconds
+      * total   — total programme seconds
+
+    The cloak's global speed tweak multiplies reaction speeds only — clean
+    spans always play at their own (segment) speed, i.e. untouched.
+    """
+    gs = max(0.5, min(2.0, float(global_speed or 1.0)))
+    clean = _clean_flags(kept)
+    eff: List[float] = []
+    for i, s in enumerate(kept):
+        e = C.seg_speed(s, float(fast_speed))
+        if not clean[i]:
+            e *= gs
+        eff.append(e)
+    out_off: List[Tuple[float, float]] = []
+    t = 0.0
+    for i, s in enumerate(kept):
+        d = (float(s["end"]) - float(s["start"])) / max(1e-6, eff[i])
+        out_off.append((t, t + d))
+        t += d
+    runs: List[Dict[str, Any]] = []
+    for i, s in enumerate(kept):
+        if runs and runs[-1]["clean"] == clean[i] and \
+                runs[-1]["idxs"][-1] == i - 1:
+            runs[-1]["idxs"].append(i)
+            runs[-1]["b"] = out_off[i][1]
+        else:
+            runs.append({"clean": clean[i], "idxs": [i],
+                         "a": out_off[i][0], "b": out_off[i][1]})
+    return runs, out_off, t
+
+
+def _voice_mode(cfg: Optional[Dict[str, Any]]) -> str:
+    """'off' | 'fx' | 'rvc' — the voice changer flavour requested."""
+    c = cfg or {}
+    if not c.get("voiceChanger", False):
+        return "off"
+    mode = str(c.get("voiceMode", "fx") or "fx").lower()
+    return "rvc" if mode == "rvc" else "fx"
+
+
+# ---------------------------------------------------------------------------
+# RVC voice conversion (.pth character voices) — mic bus only, reaction only
+# ---------------------------------------------------------------------------
+
+_RVC_CACHE: Dict[Tuple[str, str], Any] = {}
+
+
+def _rvc_pick_device() -> str:
+    """cuda when it can actually be used, else cpu (checked, not guessed)."""
+    try:
+        import torch  # noqa: F401
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _rvc_get(model: str, device: str):
+    """Load (and cache) an RVC inference session for *model* on *device*."""
+    key = (str(model), device)
+    hit = _RVC_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from rvc_python.infer import RVCInfer  # noqa: deferred — heavy import
+    sess = RVCInfer(device=device, model_path=str(model))
+    _RVC_CACHE[key] = sess
+    return sess
+
+
+def _rvc_convert_file(sess: Any, src: Path, dst: Path,
+                      cfg: Dict[str, Any]) -> None:
+    """Run one wav through the RVC session (tolerant of API drift)."""
+    transpose = int(round(float(cfg.get("rvcTranspose", 0) or 0)))
+    index_rate = max(0.0, min(1.0, float(cfg.get("rvcIndexRate", 0.5) or 0.0)))
+    method = str(cfg.get("rvcMethod", "rmvpe") or "rmvpe").lower()
+    index = str(cfg.get("rvcIndex", "") or "").strip()
+    if index and Path(index).is_file():
+        try:
+            setattr(sess, "index_path", index)
+        except Exception:
+            pass
+    variants = (
+        dict(input=str(src), output=str(dst), f0_up_key=transpose,
+             index_rate=index_rate, method=method),
+        dict(input=str(src), output=str(dst), transpose=transpose,
+             index_rate=index_rate, method=method),
+        dict(input_path=str(src), output_path=str(dst), f0_up_key=transpose,
+             index_rate=index_rate, f0_method=method),
+    )
+    last: Optional[Exception] = None
+    for kw in variants:
+        try:
+            sess.infer_file(**kw)
+            if Path(dst).is_file() and dst.stat().st_size > 1000:
+                return
+        except TypeError as e:
+            last = e
+            continue
+        except Exception as e:  # noqa: BLE001 — surfaced by the caller
+            raise RuntimeError(f"RVC inference failed on {src.name}: {e}") from e
+    raise RuntimeError(f"RVC inference produced nothing for {src.name}"
+                       + (f" ({last})" if last else ""))
+
+
+def _voice_rvc_runs(proc: "ReactionVideoProcessor", wav: Path,
+                    runs: List[Dict[str, Any]], cfg: Dict[str, Any],
+                    tag: str = "rvc") -> Path:
+    """Replace the reaction runs of *wav* with their RVC conversion.
+
+    Clean runs (intro/outro) pass through bit-for-bit; each reaction run is
+    run through the character model; the runs are stitched back in order, so
+    the result is exactly as long as the input (A/V stays aligned).
+    """
+    model = str(cfg.get("rvcModel", "") or "").strip()
+    if not model or not Path(model).is_file():
+        raise RuntimeError(
+            f"voice changer is set to an RVC character voice but the model "
+            f"file is missing: {model!r} — put the .pth on the notebook "
+            f"(e.g. inside /content/drive/MyDrive) and set its full path")
+    try:
+        import rvc_python  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "voice changer is set to an RVC character voice but rvc-python "
+            "is not installed — run  %pip install rvc-python  in the "
+            "notebook, then export again") from e
+    device = _rvc_pick_device()
+    print(f"  voice: RVC model {Path(model).name} on {device} "
+          f"(transpose {cfg.get('rvcTranspose', 0)}, method "
+          f"{cfg.get('rvcMethod', 'rmvpe')})")
+    sess = _rvc_get(model, device)
+    work = proc.work
+    parts: List[Path] = []
+    for r, run in enumerate(runs):
+        seg_wav = work / f"{tag}_run{r:02d}.wav"
+        if run["clean"]:
+            # untouched copy of the clean run (intro/outro stay as-is)
+            if run["a"] <= 0.001 and run["b"] >= \
+                    proc._media_duration(str(wav)) - 0.001:
+                parts.append(wav)   # the only run — no extraction needed
+            else:
+                proc._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                          "-ss", f"{run['a']:.3f}", "-to", f"{run['b']:.3f}",
+                          "-c:a", "pcm_s16le", str(seg_wav)],
+                         f"voice: clean run {r + 1}")
+                parts.append(seg_wav)
+            continue
+        dry = work / f"{tag}_react{r:02d}.wav"
+        wet = work / f"{tag}_react{r:02d}_rvc.wav"
+        proc._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                  "-ss", f"{run['a']:.3f}", "-to", f"{run['b']:.3f}",
+                  "-c:a", "pcm_s16le", str(dry)], f"voice: extract run {r + 1}")
+        _rvc_convert_file(sess, dry, wet, cfg)
+        # RVC output can drift a few ms — fit it back onto the run length
+        parts.append(proc._fit_audio(wet, run["b"] - run["a"], f"voice run {r + 1}"))
+    if len(parts) == 1 and parts[0] == wav:
+        return wav
+    out = work / f"{tag}_voice.wav"
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    for p in parts:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex",
+            "".join(f"[{i}:a]" for i in range(len(parts)))
+            + f"concat=n={len(parts)}:v=0:a=1[vout]",
+            "-map", "[vout]", "-c:a", "pcm_s16le", str(out)]
+    proc._ff(cmd, "voice: join runs")
+    return out
 
 
 def _vignette_angle(amount: float) -> float:
@@ -1166,15 +1358,12 @@ def _pick_video_encoder(prefer_gpu: bool = True) -> Tuple[str, List[str]]:
     """Choose best available h264 encoder: nvenc if GPU, else libx264.
 
     Returns (encoder_name, extra_global_args). Using nvenc gives ~5-10x
-    speedup on T4 and actually uses the GPU RAM Colab warns about.
+    speedup on T4 — but only when it can actually open: the check runs a
+    real one-frame smoke encode (see compose.nvenc_available), because
+    every static ffmpeg *lists* h264_nvenc while a GPU-less runtime dies
+    with "Cannot load libcuda.so.1" the moment the encoder is opened.
     """
-    if prefer_gpu and _has_encoder("h264_nvenc"):
-        # nvenc preset p4 = medium quality, good speed; rc vbr_hq
-        # No crf — nvenc uses qp/cq; we map crf to qp via caller, but here
-        # we return encoder and let caller build args.
-        return "h264_nvenc", []
-    if prefer_gpu and _has_encoder("hevc_nvenc"):
-        # fallback, but we prefer h264 for compatibility
+    if prefer_gpu and C.nvenc_available():
         return "h264_nvenc", []
     return "libx264", []
 
@@ -1821,13 +2010,31 @@ class ReactionVideoProcessor:
                            master_gain_db, content_rect, out_fps, height,
                            audio_inputs: List[str],
                            cam_rect: Optional[Dict[str, float]] = None,
-                           audio_fade_s: float = 0.08
+                           audio_fade_s: float = 0.08,
+                           sticker: Optional[Dict[str, Any]] = None,
+                           mic_override: Optional[Path] = None
                            ) -> Tuple[List[str], List[str], List[Path]]:
         """filter_complex for one (part of a) passthrough render.
 
         Both streams are conformed from the same segment list, so A/V can
         never desync. With two *audio_inputs* the first is the content bus
         (silenced on mute/card) and the second the mic (never silenced).
+
+        INTRO / OUTRO STAY CLEAN: every disguise — video cloak, fisheye,
+        mirror, cover bars, border, vignette, sticker, audio cloak, voice
+        changer, even the global speed tweak — is applied ONLY to reaction
+        spans (body/lead/mute/fast/card). Intro and outro segments pass
+        through bit-neutral (trim only), both video and audio.
+
+        *audio_inputs* may be empty: the graph is then video-only (the
+        chunked path builds the audio separately and muxes it at the end).
+
+        *mic_override* is a pre-conformed mic wav (output timeline, RVC
+        character voice already applied to the reaction runs): when given,
+        the mic bus is read from it instead of the source stream.
+
+        *sticker* overlays a user image (subscribe button & co.) on the
+        reaction spans: {on, src, x, y, w, opacity} — see _sticker_png.
 
         When video_cloak contentOnly=True (default), zoom/blur/eq/hue/grain/
         flipContent/rotate affect ONLY the content rect — camera stays clean
@@ -1928,24 +2135,28 @@ class ReactionVideoProcessor:
                     float(video_cloak.get("vignette", 0.0)), W, H)
             else:
                 warns.append("overlay filter missing — vignette skipped")
-        # global speed tweak from video cloak (breaks fingerprint)
+        # global speed tweak from video cloak (breaks fingerprint) — it is a
+        # reaction-only effect: intro/outro always play untouched at 1.00
         global_speed = float((video_cloak or {}).get("speed", 1.0) or 1.0)
         global_speed = max(0.5, min(2.0, global_speed))
+        clean = _clean_flags(kept)
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
-            # reaction-part effect: intro/outro are full-cam solo in the
-            # finished file — no lens over the camera there
-            fe = None if typ in ("intro", "outro") else fe_plan
+            # reaction-part effects: intro/outro are full-cam solo in the
+            # finished file and must come through EXACTLY as recorded —
+            # no lens, no cloak, no mirror, no speed tweak
+            fe = None if clean[i] else fe_plan
             # fast spans AND cards that carry their own speed; the cloak's
-            # global speed tweak multiplies on top
-            eff_speed = C.seg_speed(s, float(fast_speed)) * global_speed
+            # global speed tweak multiplies on top (reaction spans only)
+            eff_speed = C.seg_speed(s, float(fast_speed)) * \
+                (1.0 if clean[i] else global_speed)
             if abs(eff_speed - 1.0) > 0.001:
                 base_vf = f"trim=start={a:.3f}:end={b:.3f}," \
                           f"setpts=(PTS-STARTPTS)/{eff_speed:.6f}"
             else:
                 base_vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
-            if pre:
+            if pre and not clean[i]:
                 base_vf += "," + ",".join(pre)
 
             want_camfix = (typ == "card" and cam_ok
@@ -1953,12 +2164,14 @@ class ReactionVideoProcessor:
             # content-only mirror for the legacy cloak path (the content-only
             # path takes it through content_filters instead) — `flip` is a
             # legacy alias, the camera and card text are never mirrored
-            want_mirror = (bool((video_cloak or {}).get("on", False))
+            want_mirror = (not clean[i]
+                           and bool((video_cloak or {}).get("on", False))
                            and (bool((video_cloak or {}).get("flip", False))
                                 or bool((video_cloak or {}).get("flipContent", False)))
                            and _ffmpeg_has_filter("overlay"))
 
-            if is_content_only and (content_filters or fe is not None):
+            if not clean[i] and is_content_only and \
+                    (content_filters or fe is not None):
                 # Split trimmed frame into base and content crop
                 tmp_label = f"vtmp{i}"
                 chain.append(f"[vin{i}]{base_vf}[{tmp_label}]")
@@ -2051,76 +2264,157 @@ class ReactionVideoProcessor:
             vouts.append(f"[v{i}]")
         chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
 
-        spans: List[Tuple[float, float]] = []
-        t_acc = 0.0
-        for s in kept:
-            dur = float(s["end"]) - float(s["start"])
-            pd = dur / max(1e-6, C.seg_speed(s, float(fast_speed)))
-            if s.get("type", "body") == "card":
-                spans.append((t_acc, t_acc + pd))
-            t_acc += pd
-        en = ""
-        if spans:
-            terms = "+".join(f"gte(t,{a:.3f})*lt(t,{b:.3f})" for a, b in spans)
-            en = f":enable='1-({terms})'"
+        # Programme-time map of the finished file. The cloak's speed tweak
+        # already lives in the per-segment eff speeds above, so the runs
+        # here walk the SAME speeds — video and audio can't disagree.
+        runs, out_off, _total_out = _passthrough_runs(
+            kept, float(fast_speed), global_speed)
+
+        def _terms(pred) -> str:
+            return "+".join(
+                f"gte(t,{out_off[i][0]:.3f})*lt(t,{out_off[i][1]:.3f})"
+                for i, s in enumerate(kept) if pred(i, s))
+
+        # reaction spans minus card spans: where vignette / bars / border go
+        # (cards draw their own look, and intro/outro get NOTHING)
+        react_nocard = _terms(
+            lambda i, s: (not clean[i]) and s.get("type", "body") != "card")
+        # every reaction span: where the sticker may sit
+        react = _terms(lambda i, s: not clean[i])
+        en_react_nocard = f":enable='{react_nocard}'" if react_nocard else ""
+        en_react = f":enable='{react}'" if react else ""
+
         cur = "vcat"
-        if vig_png is not None:
+        if vig_png is not None and en_react_nocard:
             nxt = "vvig"
             chain.append(f"[{cur}][{input_index(vig_png)}:v]"
-                         f"overlay=x=0:y=0:format=auto{en}[{nxt}]")
+                         f"overlay=x=0:y=0:format=auto{en_react_nocard}[{nxt}]")
             cur = nxt
-        if post:
+        if post and en_react_nocard:
             nxt = "vpost"
             chain.append(f"[{cur}]"
-                         + (",".join(f"{p}{en}" for p in post))
+                         + (",".join(f"{p}{en_react_nocard}" for p in post))
                          + f"[{nxt}]")
             cur = nxt
+        # user sticker image (subscribe / like / …) — reaction spans only,
+        # intro/outro stay clean like everything else
+        st = sticker or {}
+        if st.get("on", False) and en_react and _ffmpeg_has_filter("overlay"):
+            sp = self._sticker_png(st, W, H)
+            if sp is not None:
+                spath, sx, sy, _sw, _sh = sp
+                nxt = "vstick"
+                chain.append(f"[{cur}][{input_index(spath)}:v]"
+                             f"overlay=x={sx}:y={sy}:format=auto"
+                             f"{en_react}[{nxt}]")
+                cur = nxt
+            elif str(st.get("src") or "").strip():
+                warns.append(f"sticker image not found / unreadable: "
+                             f"{st.get('src')!r} — skipped")
 
-        cats: List[str] = []
-        try:
-            gs = global_speed
-        except NameError:
-            gs = float((video_cloak or {}).get("speed", 1.0) or 1.0)
-            gs = max(0.5, min(2.0, gs))
-        for j, spec in enumerate(audio_inputs):
-            outs = []
-            chain.append(f"[{spec}]asplit={n}"
-                         + "".join(f"[j{j}s{i}]" for i in range(n)))
-            states = [((s.get("type", "body") in ("mute", "card") and j == 0),
-                       C.seg_speed(s, float(fast_speed)) * gs)
-                      for s in kept]
-            for i, s in enumerate(kept):
-                typ = s.get("type", "body")
-                a, b = float(s["start"]), float(s["end"])
-                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                eff = C.seg_speed(s, float(fast_speed)) * gs
-                if abs(eff - 1.0) > 0.001:
-                    af += "," + ",".join(_atempo_chain(eff))
-                if typ in ("mute", "card") and j == 0:
-                    af += ",volume=0"
-                fi, fo = _fade_edges(kept, i, states)
-                fz = _fade_filters((b - a) / max(0.125, eff), audio_fade_s, fi, fo)
-                if fz:
-                    af += "," + ",".join(fz)
-                chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
-                outs.append(f"[j{j}b{i}]")
-            chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
-            cats.append(f"[cat{j}]")
-        if len(cats) > 1:
-            chain.append("".join(cats)
-                         + f"amix=inputs={len(cats)}:duration=longest:"
-                           "dropout_transition=0.2[mix0]")
-            src = "mix0"
-        else:
-            src = cats[0][1:-1]
-        clk, cloak_warn = audio_cloak_chain(audio_cloak, src, "acl")
-        chain.append(clk)
-        warns.extend(cloak_warn)
-        chain.append(
-            f"[acl]volume={float(master_gain_db):.1f}dB,"
-            "alimiter=limit=-1.5dB:attack=5:release=50,"
-            "aformat=channel_layouts=stereo[aout]"
-        )
+        # ---- audio: same segment map, cloaked ONLY in the reaction runs ---
+        # Each bus is trimmed per segment (source time), grouped into clean /
+        # reaction runs, the voice changer rides the mic bus alone inside
+        # reaction runs, and the audio cloak touches reaction runs only —
+        # intro/outro leave this graph exactly as they entered it.
+        if audio_inputs:
+            vmode = _voice_mode(audio_cloak)
+            vfx: List[str] = []
+            if vmode == "fx":
+                vfx, vwarns = _voice_changer_filters(audio_cloak)
+                warns.extend(vwarns)
+            elif vmode == "rvc" and mic_override is None:
+                warns.append("voice changer: RVC conversion runs in the "
+                             "full-render path — this pass keeps the "
+                             "natural voice")
+            stems = len(audio_inputs) > 1
+            mic_idx = 1 if stems else 0
+            if vmode == "fx" and vfx and not stems:
+                warns.append("voice changer without stems: the source has one "
+                             "mixed track, so the effect covers the content "
+                             "audio too")
+            states_per_bus = [[
+                ((s.get("type", "body") in ("mute", "card") and j == 0),
+                 C.seg_speed(s, float(fast_speed))
+                 * (1.0 if clean[i] else global_speed))
+                for i, s in enumerate(kept)]
+                for j in range(len(audio_inputs))]
+            emitted: set = set()
+            for r, run in enumerate(runs):
+                bus_labels: List[str] = []
+                for j, spec in enumerate(audio_inputs):
+                    if mic_override is not None and stems and j == mic_idx:
+                        # the pre-conformed mic (RVC voice already on the
+                        # reaction runs) — trimmed on the OUTPUT timeline,
+                        # no atempo / fades (they are baked in)
+                        rl = f"jr{j}r{r}"
+                        chain.append(
+                            f"[{input_index(mic_override)}:a]"
+                            f"atrim=start={run['a']:.3f}:end={run['b']:.3f},"
+                            f"asetpts=PTS-STARTPTS[{rl}]")
+                        bus_labels.append(rl)
+                        continue
+                    outs: List[str] = []
+                    for i in run["idxs"]:
+                        if (j, i) in emitted:
+                            outs.append(f"[j{j}b{i}]")
+                            continue
+                        emitted.add((j, i))
+                        s = kept[i]
+                        typ = s.get("type", "body")
+                        a, b = float(s["start"]), float(s["end"])
+                        eff = C.seg_speed(s, float(fast_speed)) * \
+                            (1.0 if clean[i] else global_speed)
+                        af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+                        if abs(eff - 1.0) > 0.001:
+                            af += "," + ",".join(_atempo_chain(eff))
+                        if typ in ("mute", "card") and j == 0:
+                            af += ",volume=0"
+                        fi, fo = _fade_edges(kept, i, states_per_bus[j])
+                        fz = _fade_filters((b - a) / max(0.125, eff),
+                                           audio_fade_s, fi, fo)
+                        if fz:
+                            af += "," + ",".join(fz)
+                        chain.append(f"[{spec}]{af}[j{j}b{i}]")
+                        outs.append(f"[j{j}b{i}]")
+                    if len(outs) == 1:
+                        bus_labels.append(outs[0][1:-1])
+                    else:
+                        rl = f"jr{j}r{r}"
+                        chain.append(f"{''.join(outs)}"
+                                     f"concat=n={len(outs)}:v=0:a=1[{rl}]")
+                        bus_labels.append(rl)
+                # voice changer: the mic bus alone, reaction runs only
+                if vmode == "fx" and vfx and not run["clean"]:
+                    vl = f"jvr{r}"
+                    chain.append(f"[{bus_labels[mic_idx]}]"
+                                 f"{','.join(vfx)}[{vl}]")
+                    bus_labels[mic_idx] = vl
+                if len(bus_labels) > 1:
+                    ml = f"jmr{r}"
+                    chain.append(
+                        "".join(f"[{b_}]" for b_ in bus_labels)
+                        + f"amix=inputs={len(bus_labels)}:duration=longest:"
+                          f"dropout_transition=0.2[{ml}]")
+                    mix_l = ml
+                else:
+                    mix_l = bus_labels[0]
+                if run["clean"]:
+                    # intro/outro: NOTHING — straight through
+                    chain.append(f"[{mix_l}]anull[rr{r}]")
+                else:
+                    snip, cw_ = audio_cloak_chain(audio_cloak, mix_l,
+                                                  f"rr{r}", tag=f"clk{r}x")
+                    chain.append(snip)
+                    warns.extend(cw_)
+            nruns = len(runs)
+            chain.append("".join(f"[rr{r}]" for r in range(nruns))
+                         + f"concat=n={nruns}:v=0:a=1[aall]")
+            chain.append(
+                f"[aall]volume={float(master_gain_db):.1f}dB,"
+                "alimiter=limit=-1.5dB:attack=5:release=50,"
+                "aformat=channel_layouts=stereo[aout]"
+            )
 
         vtail = f"[{cur}]"
         if out_fps and float(out_fps) > 0:
@@ -2134,24 +2428,34 @@ class ReactionVideoProcessor:
 
     def _passthrough_cmd(self, chain: List[str], out: Path, crf: int,
                          preset: str,
-                         inputs: Optional[List[Path]] = None) -> List[str]:
+                         inputs: Optional[List[Path]] = None,
+                         with_audio: bool = True) -> List[str]:
         cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(self.input)]
-        # still-image inputs for the overlay PNGs (card / vignette). One
-        # frame each, on purpose: `overlay` repeats the last secondary frame
-        # (repeatlast=1) for the rest of the base, while -loop 1 would feed
-        # frames forever and the graph would never reach EOF.
+        # still-image inputs for the overlay PNGs (card / vignette) and, when
+        # an RVC voice is active, the pre-conformed mic wav. One frame each
+        # for the PNGs, on purpose: `overlay` repeats the last secondary
+        # frame (repeatlast=1) for the rest of the base, while -loop 1 would
+        # feed frames forever and the graph would never reach EOF.
         for p in (inputs or []):
             cmd += ["-i", str(p)]
-        # Pick GPU encoder if available — actually uses the T4
+        # GPU encoder only when it passes a real smoke encode (see
+        # compose.nvenc_available) — a GPU-less runtime falls back to
+        # libx264 instead of dying mid-render on "Cannot load libcuda.so.1"
         enc, _ = _pick_video_encoder(prefer_gpu=True)
         if enc == "h264_nvenc":
             vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
                       "-cq", str(int(crf)), "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M"]
         else:
             vcodec = ["-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)), "-maxrate", "8M", "-bufsize", "16M"]
-        cmd += ["-filter_complex", ";".join(chain),
-                "-map", "[vout]", "-map", "[aout]"] + vcodec + [
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        maps = ["-map", "[vout]"]
+        audio_enc: List[str] = []
+        if with_audio:
+            maps += ["-map", "[aout]"]
+            audio_enc = ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            audio_enc = ["-an"]
+        cmd += ["-filter_complex", ";".join(chain)] + maps + vcodec + [
+                "-pix_fmt", "yuv420p"] + audio_enc + [
                 "-movflags", "+faststart", str(out)]
         return cmd
 
@@ -2176,6 +2480,7 @@ class ReactionVideoProcessor:
         stems: Optional[bool] = None,
         stall_min: float = 30.0,
         audio_fade_s: float = 0.08,
+        sticker: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """YouTube cut as ONE ffmpeg pass: no compositing, full-frame source.
 
@@ -2184,9 +2489,10 @@ class ReactionVideoProcessor:
         stems), card spans cover the *content rect* — the same rect the
         Patreon compositor covered when it made this file — and then paste
         the *cam rect* back on top, so the camera corner stays visible
-        whatever the two rects do. Everything else takes the cloak. A/V can
-        never desync: both streams come from the same segment list in one
-        command.
+        whatever the two rects do. Every disguise (video + audio cloak,
+        voice changer, sticker, speed tweak) applies to the REACTION spans
+        only — intro and outro pass through untouched. A/V can never
+        desync: both streams come from the same segment list in one command.
         """
         if not _has("ffmpeg"):
             raise RuntimeError("ffmpeg not found (needed for render_passthrough)")
@@ -2204,12 +2510,29 @@ class ReactionVideoProcessor:
         audio_inputs, used_stems = self._passthrough_streams(stems)
         if used_stems:
             print("  passthrough: reading the content + mic stems (tracks 2/3)")
+        # RVC character voice: the mic bus is conformed to the output
+        # timeline first, the character model converts the reaction runs,
+        # and the finished wav rides into the one-pass graph as the mic.
+        mic_override: Optional[Path] = None
+        if _voice_mode(audio_cloak) == "rvc":
+            if used_stems:
+                gs = max(0.5, min(2.0, float(
+                    (video_cloak or {}).get("speed", 1.0) or 1.0)))
+                runs, _off, _tot = _passthrough_runs(kept, fast_speed, gs)
+                mic_wav = self._conform_passthrough_mic(
+                    kept, fast_speed, gs, audio_fade_s, audio_inputs[1])
+                mic_override = _voice_rvc_runs(self, mic_wav, runs,
+                                               audio_cloak or {})
+            else:
+                print("  (voice: RVC needs the stems (a Patreon master with "
+                      "the mic track) — keeping the natural voice)")
         chain, warns, extra = self._passthrough_graph(
             kept, W=W, H=H, audio_cloak=audio_cloak, video_cloak=video_cloak,
             card=card, fast_speed=fast_speed, master_gain_db=master_gain_db,
             content_rect=content_rect, out_fps=out_fps, height=height,
             audio_inputs=audio_inputs, cam_rect=cam_rect,
-            audio_fade_s=audio_fade_s)
+            audio_fade_s=audio_fade_s, sticker=sticker,
+            mic_override=mic_override)
         for w in warns:
             print(f"  (cloak: {w})")
 
@@ -2310,6 +2633,84 @@ class ReactionVideoProcessor:
         cache[key] = path
         return path
 
+    def _sticker_png(self, sticker: Dict[str, Any], W: int, H: int
+                     ) -> Optional[Tuple[Path, int, int, int, int]]:
+        """The user's overlay image (subscribe / like / …) as a PNG + pos.
+
+        Returns (path, x, y, w, h) in frame pixels, or None when there is
+        nothing usable. *sticker* keys: src (data URL / http(s) / file path,
+        a bare name resolves inside the output dir), x / y normalised
+        top-left position, w width as a fraction of the frame width,
+        opacity 0..1. Transparent PNGs keep their alpha; the opacity slider
+        multiplies it.
+        """
+        import base64 as _b64
+        src = str(sticker.get("src") or "").strip()
+        if not src:
+            return None
+        try:
+            x = max(0.0, min(1.0, float(sticker.get("x", 0.72))))
+            y = max(0.0, min(1.0, float(sticker.get("y", 0.04))))
+            w = max(0.02, min(1.0, float(sticker.get("w", 0.18))))
+            opac = max(0.0, min(1.0, float(sticker.get("opacity", 1.0))))
+        except (TypeError, ValueError):
+            return None
+        if opac <= 0.004:
+            return None
+        cache: Dict[Any, Tuple[Path, int, int, int, int]] = \
+            self.__dict__.setdefault("_sticker_png_cache", {})
+        src_hash = hashlib.sha1(src.encode("utf-8", "ignore")).hexdigest()[:12]
+        key = (src_hash, round(x, 4), round(y, 4), round(w, 4),
+               round(opac, 3), W, H)
+        hit = cache.get(key)
+        if hit and hit[0].is_file():
+            return hit
+        import cv2  # module scope has no cv2 — import it here, like fisheye
+        img = None
+        try:
+            if src.startswith("data:"):
+                b64 = src.split(",", 1)[1] if "," in src else ""
+                raw = _b64.b64decode(b64)
+                img = cv2.imdecode(np.frombuffer(raw, np.uint8),
+                                   cv2.IMREAD_UNCHANGED)
+            elif src.startswith(("http://", "https://")):
+                import urllib.request
+                with urllib.request.urlopen(src, timeout=30) as r:
+                    raw = r.read(20_000_000)
+                img = cv2.imdecode(np.frombuffer(raw, np.uint8),
+                                   cv2.IMREAD_UNCHANGED)
+            else:
+                p = Path(src)
+                if not p.is_absolute():
+                    p = self.out / p.name    # bare name = uploaded asset
+                if p.is_file() and p.stat().st_size < 30_000_000:
+                    img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        except Exception:
+            img = None
+        if img is None or getattr(img, "size", 0) == 0:
+            return None
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        elif img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        else:
+            img = img.astype(np.uint8, copy=True)
+        if opac < 0.999:
+            img[:, :, 3] = (img[:, :, 3].astype(np.float32)
+                            * opac).astype(np.uint8)
+        dw = max(8, min(W, int(round(W * w))))
+        sh, sw = img.shape[:2]
+        dh = max(8, min(H, int(round(dw * sh / max(1, sw)))))
+        if (dw, dh) != (sw, sh):
+            img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
+        px = max(0, min(W - dw, int(round(x * W))))
+        py = max(0, min(H - dh, int(round(y * H))))
+        digest = hashlib.sha1(repr(key).encode()).hexdigest()[:10]
+        path = self.work / f"sticker_{digest}_{W}x{H}.png"
+        C.write_png(path, img)
+        cache[key] = (path, px, py, dw, dh)
+        return cache[key]
+
     # ------------------------------------------- chunked / resumable render
     def _fit_audio(self, wav: Path, dur: float, tag: str = "") -> Path:
         """Pad/trim an audio part to exactly *dur* seconds.
@@ -2372,24 +2773,148 @@ class ReactionVideoProcessor:
         self._ff(cmd, what)
         return out
 
-    def _final_audio(self, wav: Path, audio_cloak: Optional[Dict[str, Any]],
-                     master_gain_db: float, out: Path) -> Path:
-        """Cloak + master gain + limiter on a joined audio track.
+    def _conform_passthrough_mic(self, kept: List[Dict[str, Any]],
+                                 fast_speed: float, global_speed: float,
+                                 fade_s: float, mic_spec: str) -> Path:
+        """Conform the mic bus to the OUTPUT timeline (single pass).
 
-        Applied once to the whole programme rather than per part: the cloak's
-        echo/reverb tail would otherwise be chopped at every join.
+        Exact twin of the in-graph per-segment audio math (trim → atempo →
+        edge fades → concat, cloak speed tweak on reaction spans only), so
+        the RVC pass can work in programme time and the result can ride
+        back into the graph with output-time trims.
         """
-        clk, warns = audio_cloak_chain(audio_cloak, "a0", "acl")
-        for w in warns:
-            print(f"  (cloak: {w})")
-        self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
-                  "-filter_complex",
-                  f"[0:a]anull[a0];{clk};"
-                  f"[acl]volume={float(master_gain_db):.1f}dB,"
-                  "alimiter=limit=-1.5dB:attack=5:release=50,"
-                  "aformat=channel_layouts=stereo[aout]",
+        clean = _clean_flags(kept)
+        gs = max(0.5, min(2.0, float(global_speed or 1.0)))
+        states = [(False, C.seg_speed(s, float(fast_speed))
+                   * (1.0 if clean[i] else gs))
+                  for i, s in enumerate(kept)]
+        chain: List[str] = []
+        outs: List[str] = []
+        for i, s in enumerate(kept):
+            a, b = float(s["start"]), float(s["end"])
+            eff = C.seg_speed(s, float(fast_speed)) * \
+                (1.0 if clean[i] else gs)
+            af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
+            if abs(eff - 1.0) > 0.001:
+                af += "," + ",".join(_atempo_chain(eff))
+            fi, fo = _fade_edges(kept, i, states)
+            fz = _fade_filters((b - a) / max(0.125, eff), fade_s, fi, fo)
+            if fz:
+                af += "," + ",".join(fz)
+            chain.append(f"[{mic_spec}]{af}[m{i}]")
+            outs.append(f"[m{i}]")
+        n = len(kept)
+        chain.append("".join(outs) + f"concat=n={n}:v=0:a=1[aout]")
+        out = self.work / "pt_mic_conform.wav"
+        self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
+                  "-filter_complex", ";".join(chain),
                   "-map", "[aout]", "-c:a", "pcm_s16le", str(out)],
-                 "final audio")
+                 "voice: conform mic bus")
+        return out
+
+    def _voice_fx_wav(self, wav: Path, runs: List[Dict[str, Any]],
+                      cfg: Dict[str, Any], tag: str = "vfx") -> Path:
+        """Apply the ffmpeg voice-changer presets to the reaction runs of
+        *wav* (clean runs pass through), one ffmpeg pass."""
+        vfx, warns = _voice_changer_filters(cfg)
+        for w in warns:
+            print(f"  (voice: {w})")
+        if not vfx:
+            return wav
+        chain: List[str] = [f"[0:a]asplit={len(runs)}"
+                            + "".join(f"[vs{r}]" for r in range(len(runs)))]
+        for r, run in enumerate(runs):
+            seg_l = f"vseg{r}"
+            chain.append(f"[vs{r}]atrim=start={run['a']:.3f}:"
+                         f"end={run['b']:.3f},asetpts=PTS-STARTPTS[{seg_l}]")
+            if run["clean"]:
+                chain.append(f"[{seg_l}]anull[vv{r}]")
+            else:
+                chain.append(f"[{seg_l}]{','.join(vfx)}[vv{r}]")
+        chain.append("".join(f"[vv{r}]" for r in range(len(runs)))
+                     + f"concat=n={len(runs)}:v=0:a=1[vout]")
+        out = self.work / f"{tag}_voice.wav"
+        self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                  "-filter_complex", ";".join(chain),
+                  "-map", "[vout]", "-c:a", "pcm_s16le", str(out)],
+                 "voice: reaction runs")
+        return out
+
+    def _final_youtube_audio(self, kept: List[Dict[str, Any]],
+                             fast_speed: float, global_speed: float,
+                             audio_cloak: Optional[Dict[str, Any]],
+                             master_gain_db: float,
+                             content_wav: Optional[Path], mic_wav: Path,
+                             out: Path) -> Path:
+        """The finished YouTube mix, assembled once over the whole programme.
+
+        The buses arrive already conformed to the output timeline (same
+        math as the video parts). This stage then:
+          1. voice changer — MIC bus only, reaction runs only
+             (rvc = character model, fx = ffmpeg presets),
+          2. mixes the buses,
+          3. anti-fingerprint cloak — reaction runs only,
+          4. master gain + limiter everywhere (safety, not a disguise).
+        Intro/outro runs pass through stages 1-3 completely untouched.
+        """
+        runs, _off, total = _passthrough_runs(kept, fast_speed, global_speed)
+        vmode = _voice_mode(audio_cloak)
+        mic_v = mic_wav
+        if vmode == "rvc":
+            mic_v = _voice_rvc_runs(self, mic_wav, runs, audio_cloak or {},
+                                    tag="rvcf")
+        elif vmode == "fx":
+            if content_wav is None:
+                print("  (voice: no stems — the voice changer covers the "
+                      "mixed track, content audio included)")
+            mic_v = self._voice_fx_wav(mic_wav, runs, audio_cloak or {})
+
+        chain: List[str] = []
+        inputs: List[Path] = []
+        if content_wav is not None:
+            inputs.append(Path(content_wav))
+        inputs.append(Path(mic_v))
+        nbus = len(inputs)
+        warned_mix_cloak = False
+        for r, run in enumerate(runs):
+            bus_labels: List[str] = []
+            for k in range(nbus):
+                bl = f"kr{k}r{r}"
+                chain.append(f"[{k}:a]atrim=start={run['a']:.3f}:"
+                             f"end={run['b']:.3f},asetpts=PTS-STARTPTS[{bl}]")
+                bus_labels.append(bl)
+            if nbus > 1:
+                ml = f"mr{r}"
+                chain.append("".join(f"[{b_}]" for b_ in bus_labels)
+                             + f"amix=inputs={nbus}:duration=longest:"
+                               f"dropout_transition=0.2[{ml}]")
+                mix_l = ml
+            else:
+                mix_l = bus_labels[0]
+            if run["clean"]:
+                chain.append(f"[{mix_l}]anull[rr{r}]")
+            else:
+                snip, warns = audio_cloak_chain(audio_cloak, mix_l,
+                                                f"rr{r}", tag=f"f{r}c")
+                chain.append(snip)
+                for w in warns:
+                    if not warned_mix_cloak:
+                        print(f"  (cloak: {w})")
+                        warned_mix_cloak = True
+        chain.append("".join(f"[rr{r}]" for r in range(len(runs)))
+                     + f"concat=n={len(runs)}:v=0:a=1[aall]")
+        chain.append(f"[aall]volume={float(master_gain_db):.1f}dB,"
+                     "alimiter=limit=-1.5dB:attack=5:release=50,"
+                     "aformat=channel_layouts=stereo[aout]")
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for p in inputs:
+            cmd += ["-i", str(p)]
+        cmd += ["-filter_complex", ";".join(chain),
+                "-map", "[aout]", "-c:a", "pcm_s16le", str(out)]
+        self._ff(cmd, "youtube final audio")
+        fitted = self._fit_audio(out, total, "final mix")
+        if fitted != out:
+            fitted.replace(out)
         return out
 
     def render_project(self, *, target: str, name: str,
@@ -2410,7 +2935,8 @@ class ReactionVideoProcessor:
                        progress_cb=None, cancel_check=None,
                        log: Optional[Callable[[str], None]] = None,
                        resume_body: Optional[Dict[str, Any]] = None,
-                       audio_fade_s: float = 0.08
+                       audio_fade_s: float = 0.08,
+                       sticker: Optional[Dict[str, Any]] = None
                        ) -> Dict[str, Any]:
         """Render a whole project, in parts, with a journal on disk.
 
@@ -2489,7 +3015,7 @@ class ReactionVideoProcessor:
                     card=card, fast_speed=fast, master_gain_db=master_gain_db,
                     crf=crf, preset=preset, fps=fps, height=height, name=name,
                     webm=webm, content_rect=rect, cam_rect=camrect, stems=stems,
-                    audio_fade_s=audio_fade_s,
+                    audio_fade_s=audio_fade_s, sticker=sticker,
                     stall_min=stall_min, cancel_check=cancel_check,
                     progress_cb=lambda d, t: (beat(), report(
                         0.05 + 0.9 * d / max(1e-6, t),
@@ -2573,16 +3099,20 @@ class ReactionVideoProcessor:
         # old look under the new settings (and hid exactly this regression
         # once — a fixed render resumed straight into the broken parts).
         if target == "youtube":
-            look_src: List[Any] = [video_cloak, card, rect, master_gain_db]
+            look_src: List[Any] = [video_cloak, card, rect, master_gain_db,
+                                   sticker]
         else:
             look_src = [lay.to_dict() if lay is not None else None,
                         dict(self.audio_cfg), dict(self.retouch_cfg),
                         master_gain_db]
         look = hashlib.sha1(json.dumps(
             look_src, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        # av3: youtube parts now journal the raw content/mic buses (video
+        # stays effect-free audio-wise; the cloak/voice join runs once at
+        # the end) — old journals with one mixed wav per part must rebuild
         sig = hashlib.sha1(
             (str(self.input) + target + plan_json + f"{fast}|{crf}|{fps}|"
-             f"{height}|{width}|stems={want_stems}|look={look}").encode()
+             f"{height}|{width}|stems={want_stems}|av3|look={look}").encode()
         ).hexdigest()[:16]
         man = read_manifest(self.out, key)
         done: Dict[int, Dict[str, Any]] = {}
@@ -2591,13 +3121,29 @@ class ReactionVideoProcessor:
                 i = int(rec.get("i", -1))
                 if not (0 <= i < len(parts)):
                     continue
-                if not rec.get("v") or not rec.get("a"):
+                if not rec.get("v"):
                     continue
-                need = [pdir / str(rec["v"]), pdir / str(rec["a"])]
-                if want_stems:
-                    if not rec.get("ac") or not rec.get("am"):
-                        continue   # journalled without stems — rebuild
-                    need += [pdir / str(rec["ac"]), pdir / str(rec["am"])]
+                if target == "youtube":
+                    # av3 layout: video-only parts + the raw buses (content /
+                    # mic when the source has stems, else one mixed wav);
+                    # cloak + voice run once at the join
+                    if pt_used:
+                        if not rec.get("ac") or not rec.get("am"):
+                            continue   # journalled before av3 — rebuild
+                        need = [pdir / str(rec["v"]), pdir / str(rec["ac"]),
+                                pdir / str(rec["am"])]
+                    else:
+                        if not rec.get("a"):
+                            continue
+                        need = [pdir / str(rec["v"]), pdir / str(rec["a"])]
+                else:
+                    if not rec.get("a"):
+                        continue
+                    need = [pdir / str(rec["v"]), pdir / str(rec["a"])]
+                    if want_stems:
+                        if not rec.get("ac") or not rec.get("am"):
+                            continue   # journalled without stems — rebuild
+                        need += [pdir / str(rec["ac"]), pdir / str(rec["am"])]
                 if not all(f.is_file() for f in need):
                     continue
                 # a part that was reclaimed mid-encode is shorter than its
@@ -2677,6 +3223,11 @@ class ReactionVideoProcessor:
                 report(frac, step="encoding", part=i + 1, parts=len(parts))
 
             if target == "youtube":
+                # video-only parts: the disguise audio (cloak + voice) runs
+                # once at the join over the whole programme, so its reverb
+                # tails are never chopped at a part boundary and the intro/
+                # outro cleanness is decided in exactly one place. Skipping
+                # the audio encode here also makes the parts finish faster.
                 chain, warns, extra = self._passthrough_graph(
                     part, W=int(self.info.get("width") or 1920),
                     H=int(self.info.get("height") or 1080),
@@ -2684,26 +3235,36 @@ class ReactionVideoProcessor:
                     card=card, fast_speed=fast, master_gain_db=master_gain_db,
                     content_rect=rect, out_fps=(float(fps) if fps else
                                                 float(self.info.get("fps") or 0)),
-                    height=height, audio_inputs=pt_streams, cam_rect=camrect,
-                    audio_fade_s=audio_fade_s)
+                    height=height, audio_inputs=[], cam_rect=camrect,
+                    audio_fade_s=audio_fade_s, sticker=sticker)
                 for w in warns:
                     say(f"  (cloak: {w})")
                 _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset,
-                                                  extra), pn,
+                                                  extra, with_audio=False), pn,
                             f"part {i + 1}/{len(parts)}", progress_cb=cb,
                             cancel_check=cancel_check, stall_min=stall_min,
                             out_path=vp, heartbeat=beat).run()
-                ap = pdir / f"part_{i:03d}.wav"
                 report((prog_before[i] + pn * 0.97) / total_prog,
                        step="audio", part=i + 1, parts=len(parts))
                 beat()
-                self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
-                          "-filter_complex",
-                          self._part_audio_chain(part, fast,
-                                                   fade_s=audio_fade_s),
-                          "-map", "[aout]", "-c:a", "pcm_s16le", str(ap)],
-                         f"part {i + 1} audio")
-                rec: Dict[str, Any] = {"i": i, "v": vp.name, "a": ap.name}
+                # raw conformed buses, journalled per part: with stems the
+                # content and mic wavs stay separate so the join can run the
+                # voice changer on the mic alone
+                gspeed = max(0.5, min(2.0, float(
+                    (video_cloak or {}).get("speed", 1.0) or 1.0)))
+                achain, alabels = self._part_audio_chain(
+                    part, fast, fade_s=audio_fade_s, global_speed=gspeed)
+                label_field = {"cout": "ac", "mout": "am", "aout": "a"}
+                label_file = {"cout": "c", "mout": "m", "aout": "a"}
+                acmd = ["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
+                        "-filter_complex", achain]
+                rec: Dict[str, Any] = {"i": i, "v": vp.name}
+                for label in alabels:
+                    wavname = f"part_{i:03d}_{label_file[label]}.wav"
+                    acmd += ["-map", f"[{label}]", "-c:a", "pcm_s16le",
+                             str(pdir / wavname)]
+                    rec[label_field[label]] = wavname
+                self._ff(acmd, f"part {i + 1} audio")
             else:
                 C.render_video(str(self.input), str(vp), layout=lay,
                                segments=part, crf=crf, progress_cb=cb,
@@ -2751,14 +3312,36 @@ class ReactionVideoProcessor:
         video_all = self.out / f"{name}.video.mp4"
         self._concat_video(vparts, video_all, crf=crf, preset=preset,
                            what=f"join {name} video")
-        mix_all = self._concat_audio([pdir / done[i]["a"]
-                                      for i in range(len(parts))],
-                                     self.work / f"{name}_mix.wav")
         if target == "youtube":
-            # parts carry the raw conformed buses; cloak + master gain happen
-            # once here, over the whole programme
-            mix_all = self._final_audio(mix_all, audio_cloak, master_gain_db,
-                                        self.work / f"{name}_mix_final.wav")
+            # parts carry the raw conformed buses; voice changer + cloak +
+            # master happen once here over the whole programme — reaction
+            # runs only, intro/outro pass through untouched
+            gspeed = max(0.5, min(2.0, float(
+                (video_cloak or {}).get("speed", 1.0) or 1.0)))
+            if pt_used:
+                say("joining the buses: voice changer on the mic, cloak on "
+                    "the reaction part …")
+                content_all = self._concat_audio(
+                    [pdir / done[i]["ac"] for i in range(len(parts))],
+                    self.work / f"{name}_content.wav", "join content bus")
+                mic_all = self._concat_audio(
+                    [pdir / done[i]["am"] for i in range(len(parts))],
+                    self.work / f"{name}_mic.wav", "join mic bus")
+                mix_all = self._final_youtube_audio(
+                    kept, fast, gspeed, audio_cloak, master_gain_db,
+                    content_all, mic_all,
+                    self.work / f"{name}_mix_final.wav")
+            else:
+                mix_raw = self._concat_audio(
+                    [pdir / done[i]["a"] for i in range(len(parts))],
+                    self.work / f"{name}_mix.wav")
+                mix_all = self._final_youtube_audio(
+                    kept, fast, gspeed, audio_cloak, master_gain_db,
+                    None, mix_raw, self.work / f"{name}_mix_final.wav")
+        else:
+            mix_all = self._concat_audio([pdir / done[i]["a"]
+                                          for i in range(len(parts))],
+                                         self.work / f"{name}_mix.wav")
         st = None
         if want_stems:
             st = {}
@@ -2788,15 +3371,22 @@ class ReactionVideoProcessor:
                 "chunked": True}
 
     def _part_audio_chain(self, part: List[Dict[str, Any]],
-                          fast_speed: float, fade_s: float = 0.08) -> str:
+                          fast_speed: float, fade_s: float = 0.08,
+                          global_speed: float = 1.0
+                          ) -> Tuple[str, List[str]]:
         """Audio for one passthrough part (YouTube path).
 
         Same conform math as the single-pass graph: stems are read
         separately when the source has them, mute/card silences the content
-        bus only.
+        bus only, the cloak's global speed tweak rides reaction spans only
+        (intro/outro stay untouched). Returns (chain, out_labels): with
+        stems the buses leave UNMIXED ([cout], [mout]) so the join stage
+        can run the voice changer on the mic alone; otherwise one [aout].
         """
         inputs, used = self._passthrough_streams(None)
         n = len(part)
+        gs = max(0.5, min(2.0, float(global_speed or 1.0)))
+        clean = _clean_flags(part)
         chain: List[str] = []
         cats: List[str] = []
         for j, spec in enumerate(inputs):
@@ -2804,19 +3394,21 @@ class ReactionVideoProcessor:
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
             states = [((s.get("type", "body") in ("mute", "card") and j == 0),
-                       C.seg_speed(s, float(fast_speed)))
-                      for s in part]
+                       C.seg_speed(s, float(fast_speed))
+                       * (1.0 if clean[i] else gs))
+                      for i, s in enumerate(part)]
             for i, s in enumerate(part):
                 typ = s.get("type", "body")
                 a, b = float(s["start"]), float(s["end"])
                 af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
-                eff = C.seg_speed(s, float(fast_speed))
+                eff = C.seg_speed(s, float(fast_speed)) * \
+                    (1.0 if clean[i] else gs)
                 if eff > 1.001:
                     af += "," + ",".join(_atempo_chain(eff))
                 if typ in ("mute", "card") and j == 0:
                     af += ",volume=0"
                 fi, fo = _fade_edges(part, i, states)
-                fz = _fade_filters((b - a) / eff, fade_s, fi, fo)
+                fz = _fade_filters((b - a) / max(0.125, eff), fade_s, fi, fo)
                 if fz:
                     af += "," + ",".join(fz)
                 chain.append(f"[j{j}s{i}]{af}[j{j}b{i}]")
@@ -2824,14 +3416,11 @@ class ReactionVideoProcessor:
             chain.append(f"{''.join(outs)}concat=n={n}:v=0:a=1[cat{j}]")
             cats.append(f"[cat{j}]")
         if len(cats) > 1:
-            chain.append("".join(cats)
-                         + f"amix=inputs={len(cats)}:duration=longest:"
-                           "dropout_transition=0.2[mix0]")
-            src = "mix0"
-        else:
-            src = cats[0][1:-1]
-        chain.append(f"[{src}]aformat=channel_layouts=stereo[aout]")
-        return ";".join(chain)
+            chain.append(f"[{cats[0][1:-1]}]aformat=channel_layouts=stereo[cout]")
+            chain.append(f"[{cats[1][1:-1]}]aformat=channel_layouts=stereo[mout]")
+            return ";".join(chain), ["cout", "mout"]
+        chain.append(f"[{cats[0][1:-1]}]aformat=channel_layouts=stereo[aout]")
+        return ";".join(chain), ["aout"]
 
     def _to_webm(self, mp4: Path) -> str:
         wb = Path(mp4).with_suffix(".webm")

@@ -1,4 +1,4 @@
-import type { LayerStyle, LayoutState, Rect, Segment, Shape, VideoCloak } from "./types";
+import type { LayerStyle, LayoutState, Rect, Segment, Shape, Sticker, VideoCloak } from "./types";
 import { fitRect, type FacePose } from "./retouch";
 
 export type SrcRect = { x: number; y: number; w: number; h: number };
@@ -37,6 +37,8 @@ export interface Scene {
   cardText?: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" };
   /** anti-fingerprint frame treatment (YouTube passthrough only) */
   cloak?: VideoCloak | null;
+  /** user overlay image — reaction spans only (YouTube passthrough) */
+  sticker?: Sticker | null;
 }
 
 /**
@@ -235,7 +237,9 @@ export function buildPassthroughScene(
    * covers 100% of the content yet can never touch the camera — whatever the
    * two rects do (they overlap by a hair in the default layout).
    */
-  camRect?: Rect
+  camRect?: Rect,
+  /** user overlay image (subscribe / like / …) — reaction spans only */
+  sticker?: Sticker | null
 ): Scene {
   const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
   const type = active?.type ?? "body";
@@ -245,15 +249,14 @@ export function buildPassthroughScene(
     rect: { x: 0, y: 0, w: 1, h: 1 },
     style: FLAT,
   };
-  // The fisheye is a reaction-part effect: intro/outro are full-cam solo in
-  // the finished file, so the lens must not bulge the camera — those
-  // segments get it stripped (the ffmpeg export skips it there too, so the
-  // preview and the render agree). A standalone fisheye (cloak bypassed)
-  // still counts as active, like on the export side.
+  // Intro/outro are exported EXACTLY as recorded: every disguise — cloak,
+  // fisheye, sticker, all of it — is stripped from those spans. The ffmpeg
+  // export does the same, so preview and render agree (and the user's rule
+  // holds: all effects live in the reaction part only).
   const feOn = !!(cloak && cloak.fisheye && (cloak.fisheyeAmount ?? 0) > 0.5);
   const solo = type === "intro" || type === "outro";
-  const c =
-    cloak && (cloak.on || feOn) ? (solo ? { ...cloak, fisheye: false } : cloak) : null;
+  const c = solo ? null : cloak && (cloak.on || feOn) ? cloak : null;
+  const stick = solo ? null : sticker && sticker.on && sticker.src ? sticker : null;
   if (type === "card") {
     // YouTube card: keep the full composited frame (camera corner stays
     // visible), cover only the content area of the finished file — the layout
@@ -269,10 +272,12 @@ export function buildPassthroughScene(
       camRect,
       cardText: active?.card,
       cloak: c,
+      sticker: stick,
     };
   }
-  if (type === "fast") return { bg: null, layers: [layer], mode: "fast", speed, cloak: c };
-  return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c };
+  if (type === "fast")
+    return { bg: null, layers: [layer], mode: "fast", speed, cloak: c, sticker: stick };
+  return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c, sticker: stick };
 }
 
 /** Clip/stroke path for any of the supported layer shapes. */
@@ -380,6 +385,55 @@ function getCardImage(url: string): HTMLImageElement | null {
     img.src = url;
   }
   return e.ready && e.img.naturalWidth > 0 ? e.img : null;
+}
+
+/** User sticker overlays (subscribe / like images) — same cache/epoch idea. */
+const stickerImgCache = new Map<string, { img: HTMLImageElement; ready: boolean }>();
+function getStickerImage(src: string): HTMLImageElement | null {
+  let e = stickerImgCache.get(src);
+  if (!e) {
+    if (stickerImgCache.size > 12) stickerImgCache.clear();
+    const img = new Image();
+    e = { img, ready: false };
+    stickerImgCache.set(src, e);
+    img.onload = () => {
+      const cur = stickerImgCache.get(src);
+      if (cur) cur.ready = true;
+      cardImgEpoch++; // same repaint trigger as card images
+    };
+    img.onerror = () => {
+      stickerImgCache.delete(src);
+      cardImgEpoch++;
+    };
+    img.src = src;
+  }
+  return e.ready && e.img.naturalWidth > 0 ? e.img : null;
+}
+
+/** The user's overlay image, aspect-preserving, opacity-aware. */
+function drawSticker(
+  ctx: CanvasRenderingContext2D,
+  st: Sticker,
+  W: number,
+  H: number
+) {
+  const im = getStickerImage(st.src);
+  if (!im) return;
+  const dw = Math.max(8, Math.min(W, st.w * W));
+  const dh = Math.max(
+    8,
+    Math.min(H, (dw * im.naturalHeight) / Math.max(1, im.naturalWidth))
+  );
+  const x = Math.max(0, Math.min(W - dw, st.x * W));
+  const y = Math.max(0, Math.min(H - dh, st.y * H));
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, st.opacity));
+  try {
+    ctx.drawImage(im, x, y, dw, dh);
+  } catch {
+    /* detached canvas — skip the sticker this frame */
+  }
+  ctx.restore();
 }
 
 function drawCard(
@@ -1089,6 +1143,9 @@ export function renderScene(
   }
   if (scene.mode === "lead") drawLeadBlock(ctx, layout, W, H);
   if (scene.mode === "fast") drawSpeedBadge(ctx, scene.speed, W, H);
+  // user sticker on top — only ever set for reaction spans (intro/outro come
+  // through clean, like every other effect)
+  if (scene.sticker) drawSticker(ctx, scene.sticker, W, H);
   ctx.restore();
 }
 
