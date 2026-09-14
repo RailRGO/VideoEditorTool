@@ -239,7 +239,7 @@ export default function CloakPanel({
               <span className="text-[11px] font-semibold text-violet-200">Fisheye lens (content only)</span>
               <button type="button" onClick={() => setV({ fisheye: !video.fisheye })} className={video.fisheye ? "rounded border border-violet-400/40 bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-violet-100" : "rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-400"}>{video.fisheye ? "on" : "off"}</button>
             </div>
-            <p className="mt-1 text-[10px] text-slate-500">Distorts content area like a fisheye lens — strong anti-ContentID, camera stays clean. Off by default.</p>
+            <p className="mt-1 text-[10px] text-slate-500">Distorts content area like a fisheye lens — strong anti-ContentID, camera stays clean. Applies to the reaction parts only — intro/outro (full-cam) stay untouched. Off by default.</p>
             {video.fisheye && (
               <div className="mt-2">
                 <Slider label="Fisheye strength" value={video.fisheyeAmount} min={0} max={100} step={1} display={`${video.fisheyeAmount}%`} onChange={(v) => setV({ fisheyeAmount: v })} hint="higher = more bulge distortion, breaks frame hash" />

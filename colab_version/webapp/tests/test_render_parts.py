@@ -18,6 +18,9 @@ What is covered, and why each check exists:
 * a Patreon master carries three audio tracks (mix / content / mic) and the
   YouTube cut reads tracks 2+3, so a mute keeps the voice.
 * the placeholder card covers the layout's content rect, not the frame.
+* the fisheye lens reaches the export on ANY ffmpeg build (remap maps ->
+  lenscorrection -> geq fallback chain), distorts content only, and never
+  touches the full-cam intro/outro frames.
 
 Needs ffmpeg on PATH plus numpy/opencv (the compositor). No pytest required.
 """
@@ -892,6 +895,175 @@ def test_youtube_default_cloak(root: Path):
                         f"({words} bright px)")
 
 
+def test_fisheye_reaction_only(root: Path):
+    """The fisheye lens must actually reach the export (it used to be drawn
+    in the preview and silently dropped by the ffmpeg graph), must distort
+    the content only (camera stays clean), and must NEVER touch intro/outro
+    — those are full-cam solo frames, so a lens over them bulges the camera.
+    """
+    print("fisheye: in export, content-only, reaction-only, backend fallback")
+    src = root / "master.mp4"
+    out = root / "out_fish"
+    proc = V.ReactionVideoProcessor(str(src), work_dir=str(root / "work_fish"),
+                                    output_dir=str(out))
+    rect = {"x": 0.294, "y": 0.289, "w": 0.70, "h": 0.70}
+    cam = {"x": 0.006, "y": 0.011, "w": 0.30, "h": 0.30}
+    fish = L.default_video_cloak()
+    fish.update({"on": True, "fisheye": True, "fisheyeAmount": 60.0})
+
+    # ---- graph level: which backend is chosen, and on which segments ----
+    # one pass per backend: default (remap), no remap (lenscorrection),
+    # no remap+lenscorrection (geq). All must stay reaction-only.
+    segs = [{"type": "intro", "start": 0, "end": 3},
+            {"type": "body", "start": 3, "end": 8},
+            {"type": "mute", "start": 8, "end": 10},
+            {"type": "card", "start": 10, "end": 11.5},
+            {"type": "fast", "start": 11.5, "end": 15.5},
+            {"type": "outro", "start": 15.5, "end": 20}]
+    reaction = [i for i, s in enumerate(segs)
+                if s["type"] not in ("intro", "outro")]
+
+    def build(disable=(), video_cloak=None):
+        orig = V._ffmpeg_has_filter
+        V._ffmpeg_has_filter = (lambda n: (False if n in disable
+                                           else orig(n)))
+        try:
+            return proc._passthrough_graph(
+                segs, W=1920, H=1080, audio_cloak={"on": False},
+                video_cloak=video_cloak or fish, card=None,
+                fast_speed=4.0, master_gain_db=0.0, content_rect=rect,
+                out_fps=30.0, height=0, audio_inputs=["0:a:1", "0:a:2"],
+                cam_rect=cam)
+        finally:
+            V._ffmpeg_has_filter = orig
+
+    def assert_reaction_only(ct: str, marker: str, label: str) -> None:
+        for i in range(len(segs)):
+            has = f"{marker}{i}" in ct
+            want = i in reaction
+            check(has == want,
+                  f"{label}: segment {i} ({segs[i]['type']}) "
+                  f"{'has' if has else 'lacks'} fisheye (want "
+                  f"{'yes' if want else 'no'})")
+
+    # default backend: remap maps (present on every FFmpeg since 3.1)
+    chain, warns, inputs = build()
+    ct = " ".join(chain)
+    check("remap" in ct, "default fisheye backend is remap (exact preview math)")
+    check(any(p.name.startswith("fish_") for p in inputs),
+          "remap map PNGs are attached as extra inputs")
+    assert_reaction_only(ct, "remap[vcf", "remap")
+
+    # force lenscorrection (drop remap): must still be reaction-only. It is
+    # inlined into the content-crop element, so check per segment element.
+    chain2 = build(disable=("remap",))[0]
+    check(any("lenscorrection" in p for p in chain2),
+          "no remap -> falls back to lenscorrection")
+    for i in range(len(segs)):
+        el = [p for p in chain2 if f"vcsrc{i}]" in p]
+        has = any("lenscorrection" in p for p in el)
+        want = i in reaction
+        check(has == want,
+              f"lenscorrection: segment {i} ({segs[i]['type']}) "
+              f"{'has' if has else 'lacks'} fisheye (want "
+              f"{'yes' if want else 'no'})")
+
+    # force geq (drop remap + lenscorrection): last resort, still reaction-only
+    chain3, warns3, _ = build(disable=("remap", "lenscorrection"))
+    ct3 = " ".join(chain3)
+    check("geq=" in ct3, "no remap/lenscorrection -> falls back to geq")
+    check(any("geq" in w for w in warns3),
+          "the slow geq fallback announces itself in the render log")
+    # geq is inlined into the content crop, so grep the per-segment crop
+    for i in range(len(segs)):
+        m = re.search(rf"\[vcsrc{i}\][^\[]*?geq=", ct3)
+        want = i in reaction
+        check((m is not None) == want,
+              f"geq: segment {i} ({segs[i]['type']}) "
+              f"{'has' if m else 'lacks'} fisheye (want "
+              f"{'yes' if want else 'no'})")
+
+    # a standalone fisheye (frame cloak bypassed) still reaches the graph
+    fish_off = dict(fish)
+    fish_off["on"] = False
+    chain4 = build(video_cloak=fish_off)[0]
+    check(all(f"remap[vcf{i}" in " ".join(chain4) for i in reaction)
+          and not any(f"remap[vcf{i}" in " ".join(chain4)
+                      for i in range(len(segs)) if i not in reaction),
+          "cloak bypassed + fisheye on: reaction-only lens still applied")
+
+    # ---- render level: prove it reaches the exported file ----
+    # speed-1 segments only, so programme time == source time
+    segs2 = [{"type": "intro", "start": 0, "end": 3},
+             {"type": "body", "start": 3, "end": 8},
+             {"type": "outro", "start": 8, "end": 11}]
+    res = proc.render_passthrough(segs2, audio_cloak={"on": False},
+                                  video_cloak=fish, card=None, fast_speed=4.0,
+                                  crf=30, preset="ultrafast", name="fish",
+                                  content_rect=rect, cam_rect=cam)
+    fin = Path(res["mp4"])
+    W, H = 1920, 1080
+
+    def crop(img: np.ndarray, r: tuple) -> np.ndarray:
+        x, y, rw, rh = r
+        return img[int(y * H):int((y + rh) * H),
+                   int(x * W):int((x + rw) * W)]
+
+    def mad(a: np.ndarray, b: np.ndarray) -> float:
+        if a.size == 0 or b.size == 0 or a.shape != b.shape:
+            return -1.0
+        return float(np.abs(a.astype(int) - b.astype(int)).mean())
+
+    # body centre (source vs export, same t): the lens must have moved it
+    s_body = frame_gray(src, 5.5, size=(W, H))
+    e_body = frame_gray(fin, 5.5, size=(W, H))
+    ccx = int((rect["x"] + rect["w"] / 2) * W)
+    ccy = int((rect["y"] + rect["h"] / 2) * H)
+    c_diff = mad(crop(s_body, (0.42, 0.42, 0.16, 0.16)),
+                 crop(e_body, (0.42, 0.42, 0.16, 0.16)))
+    check(c_diff > 10,
+          f"fisheye reached the export (content centre moved {c_diff:.1f} "
+          f"grey levels; a dropped lens scores < 3)")
+    # camera corner in the body: must stay clean (content-only)
+    cam_diff = mad(crop(s_body, (cam["x"], cam["y"], cam["w"], cam["h"])),
+                   crop(e_body, (cam["x"], cam["y"], cam["w"], cam["h"])))
+    check(cam_diff < 8,
+          f"fisheye leaves the camera corner clean ({cam_diff:.1f} "
+          f"grey levels)")
+    # intro and outro: the whole frame must match the source (no lens)
+    for t, label in ((1.5, "intro"), (9.5, "outro")):
+        d = mad(frame_gray(src, t, size=(W, H)),
+                frame_gray(fin, t, size=(W, H)))
+        check(d < 8,
+              f"fisheye stays off the {label} full-cam frame "
+              f"(whole-frame diff {d:.1f} grey levels)")
+    # and the chunked path (the one long Colab renders actually take):
+    # every part is its own ffmpeg command, so the map inputs have to work
+    # per part and the joined file must carry the lens
+    out2 = root / "out_fish_chunked"
+    proc2 = V.ReactionVideoProcessor(str(src),
+                                     work_dir=str(root / "work_fish2"),
+                                     output_dir=str(out2))
+    res2 = proc2.render_project(target="youtube", name="fish_c",
+                                segments=segs2, layout=L.LayoutState(),
+                                video_cloak=fish, crf=30,
+                                preset="ultrafast", part_target=4.0,
+                                progress_cb=lambda f, i: None)
+    fin2 = Path(res2["mp4"])
+    m2 = media(fin2)
+    check(res2["chunked"] and res2["parts"] >= 2,
+          f"chunked fisheye render split into {res2['parts']} parts")
+    check(abs(m2["dur"] - 11.0) < 0.2,
+          f"chunked fisheye file is {m2['dur']:.2f}s == 11s of programme")
+    c2 = mad(crop(frame_gray(src, 5.5, size=(W, H)),
+                  (0.42, 0.42, 0.16, 0.16)),
+             crop(frame_gray(fin2, 5.5, size=(W, H)),
+                  (0.42, 0.42, 0.16, 0.16)))
+    check(c2 > 10,
+          f"joined chunked export carries the lens "
+          f"(content centre moved {c2:.1f} grey levels)")
+
+
 def test_http_api(root: Path):
     """The routes the hosted editor talks to, against a live server."""
     print("http api")
@@ -1079,9 +1251,9 @@ def main() -> int:
     # fixtures are reused between runs; render outputs are not (a resume test
     # against last run's finished output would prove nothing)
     for d in ("out", "out_resume", "out_yt", "out_yt_single", "out_short",
-              "out_http", "out_yt_rect", "out_yt_cloak", "work",
+              "out_http", "out_yt_rect", "out_yt_cloak", "out_fish", "work",
               "work_resume", "work_yt", "work_yt2", "work_short",
-              "work_http", "work_yt_rect", "work_cloak"):
+              "work_http", "work_yt_rect", "work_cloak", "work_fish"):
         shutil.rmtree(root / d, ignore_errors=True)
     test_patreon_chunked(root)
     test_short_render_single_pass(root)
@@ -1089,6 +1261,7 @@ def main() -> int:
     test_resume_after_kill(root)
     test_youtube_stems(root)
     test_youtube_default_cloak(root)
+    test_fisheye_reaction_only(root)
     test_youtube_card_follows_posted_layout(root)
     test_http_api(root)
 

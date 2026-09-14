@@ -245,7 +245,15 @@ export function buildPassthroughScene(
     rect: { x: 0, y: 0, w: 1, h: 1 },
     style: FLAT,
   };
-  const c = cloak && cloak.on ? cloak : null;
+  // The fisheye is a reaction-part effect: intro/outro are full-cam solo in
+  // the finished file, so the lens must not bulge the camera — those
+  // segments get it stripped (the ffmpeg export skips it there too, so the
+  // preview and the render agree). A standalone fisheye (cloak bypassed)
+  // still counts as active, like on the export side.
+  const feOn = !!(cloak && cloak.fisheye && (cloak.fisheyeAmount ?? 0) > 0.5);
+  const solo = type === "intro" || type === "outro";
+  const c =
+    cloak && (cloak.on || feOn) ? (solo ? { ...cloak, fisheye: false } : cloak) : null;
   if (type === "card") {
     // YouTube card: keep the full composited frame (camera corner stays
     // visible), cover only the content area of the finished file — the layout
