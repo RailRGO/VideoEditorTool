@@ -377,7 +377,7 @@ def default_video_cloak() -> Dict[str, Any]:
         "rotate": 0.0,     # degrees -5..5
         "speed": 1.0,      # global playback speed tweak 0.95..1.05
         "contentOnly": True,  # when true, zoom/blur/rotate/hue/sat/cont/bri/grain/flipContent affect only content rect
-        "fisheye": False,  # fisheye lens effect on content only, off by default
+        "fisheye": False,  # fisheye lens on the content of reaction parts only (intro/outro stay clean), off by default
         "fisheyeAmount": 35.0,  # 0..100 intensity of fisheye
     }
 

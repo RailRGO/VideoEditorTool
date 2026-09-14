@@ -340,8 +340,9 @@ def _vignette_angle(amount: float) -> float:
 
 
 def _fisheye_vfilter(amount: float) -> Optional[str]:
-    """Map 0..100 fisheye amount to ffmpeg lenscorrection filter.
-    Negative k1 creates barrel (fisheye) distortion. Returns None if disabled.
+    """Map 0..100 fisheye amount to ffmpeg lenscorrection filter
+    (FFmpeg 7.0+). Negative k1 creates barrel (fisheye) distortion.
+    Returns None if disabled.
     """
     a = max(0.0, min(100.0, float(amount or 0.0)))
     if a < 0.5:
@@ -353,8 +354,93 @@ def _fisheye_vfilter(amount: float) -> Optional[str]:
     return f"lenscorrection=k1={k1:.3f}:k2={k2:.3f}:cx=0.5:cy=0.5"
 
 
-def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
-                      ) -> Tuple[List[str], List[str]]:
+def _fisheye_exp(amount: float) -> float:
+    """The radial exponent the browser grid uses (drawFisheyeGrid in
+    render.ts): exp = 1 + amount/100 * 1.8."""
+    return 1.0 + (max(0.0, min(100.0, float(amount or 0.0))) / 100.0) * 1.8
+
+
+def _fisheye_coords(amount: float, W: int, H: int
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+    """(xmap, ymap) uint16 arrays for ffmpeg's `remap` filter: for every
+    output pixel, the source pixel the browser's fisheye grid samples.
+
+    r_src = min(1, r/rmax)^exp * rmax with rmax the half diagonal — the
+    exact math of render.ts (corners pinned, centre bulged). Out-of-range
+    values are clamped to the frame: `remap` paints anything outside as
+    black, and the mapping never actually leaves the frame.
+    """
+    exp = _fisheye_exp(amount)
+    hw, hh = W / 2.0, H / 2.0
+    rmax = float(np.hypot(hw, hh))
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
+    dx, dy = xx - hw, yy - hh
+    ro = np.hypot(dx, dy)
+    rn = np.clip(ro / max(1e-6, rmax), 0.0, 1.0)
+    rsrc = np.power(rn, exp) * rmax
+    s = np.where(ro > 0.001, rsrc / np.maximum(ro, 0.001), 0.0)
+    xmap = np.clip(hw + dx * s, 0, W - 1).round().astype(np.uint16)
+    ymap = np.clip(hh + dy * s, 0, H - 1).round().astype(np.uint16)
+    return xmap, ymap
+
+
+def _fisheye_geq(amount: float, W: int, H: int) -> Optional[str]:
+    """The same remap written as pure `geq` expressions — the last-resort
+    backend for builds without `remap` or `lenscorrection`. It is an mexpr
+    evaluation per pixel per plane, so it is SLOW (a few fps at 1080p);
+    only used when nothing better is available.
+    """
+    a = max(0.0, min(100.0, float(amount or 0.0)))
+    if a < 0.5:
+        return None
+    exp = _fisheye_exp(a)
+    hw, hh = W / 2.0, H / 2.0
+    rmax = float(np.hypot(hw, hh))
+
+    def coord(axis: str, other: str) -> str:
+        c = hw if axis == "X" else hh
+        co = hh if axis == "X" else hw
+        r = (f"(({axis}-{c:.4f})*({axis}-{c:.4f})"
+             f"+({other}-{co:.4f})*({other}-{co:.4f}))")
+        rn = f"min(1,sqrt({r})/{rmax:.4f})"
+        s = (f"(pow({rn},{exp:.4f})*{rmax:.4f})"
+             f"/max(0.001,sqrt({r}))")
+        return f"{c:.4f}+({axis}-{c:.4f})*{s}"
+
+    xs, ys = coord("X", "Y"), coord("Y", "X")
+    return f"geq=lum='p({xs},{ys})':cb='p({xs},{ys})':cr='p({xs},{ys})'"
+
+
+class FisheyePlan:
+    """How the fisheye will actually be applied in an ffmpeg graph.
+
+    * kind "remap": two 16-bit x/y maps ride in as single-frame PNG inputs
+      (like the card / vignette stills) and a `remap` stage is spliced in.
+      Exact preview math (pixel-verified against render.ts), fast, and
+      available on every FFmpeg since 3.1 — this is the default.
+    * kind "filter": a plain in-chain filter string — `lenscorrection`
+      (FFmpeg 7+) or the slow `geq` fallback.
+    * kind "none": disabled, or no usable backend (the caller already has
+      a warning about that).
+
+    The preview canvas always draws the fisheye, so silently falling back
+    to "none" is exactly the "shows in preview, missing from export" bug —
+    the plan tries every backend before giving up.
+    """
+
+    def __init__(self, kind: str = "none", filter_str: str = "",
+                 map_x: Optional[Path] = None, map_y: Optional[Path] = None,
+                 note: str = ""):
+        self.kind = kind
+        self.filter_str = filter_str
+        self.map_x = map_x
+        self.map_y = map_y
+        self.note = note
+
+
+def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int,
+                       fisheye: Optional[str] = None
+                       ) -> Tuple[List[str], List[str]]:
     """(filters before the vignette overlay, filters after it).
 
     The browser draws its vignette over the colour/grain and under the
@@ -364,15 +450,17 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     When contentOnly is True (default), zoom/blur/eq/hue/grain/flipContent/rotate
     are NOT applied full-frame here — they are applied only to the content rect
     in _passthrough_graph via _content_cloak_filters. This preserves camera.
+
+    The fisheye is deliberately NOT decided here. It has to be chosen per
+    segment (intro/outro stay clean) and per ffmpeg build (remap maps /
+    lenscorrection / geq — see _plan_fisheye), so the caller passes the
+    resolved filter string (or None); when given, it lands in `pre` at the
+    end of the legacy full-frame chain.
     """
     c = cfg or {}
-    # even if on=False, we still want to allow standalone fisheye? No — must be gated by fisheye flag
-    # But fisheye flag lives in same cfg, on must be True? In browser, fisheye is inside cloak object with on toggle
-    # For python, we check fisheye independent if on or not? Keep consistent: require on or fisheye alone?
-    # We'll allow fisheye if cfg.fisheye and fisheyeAmount>0 even when on=False for flexibility
+    # even if on=False, a standalone fisheye still counts as "active"
     has_on = bool(c.get("on", False))
-    has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
-    if not has_on and not has_fisheye:
+    if not has_on and not fisheye:
         return [], []
     content_only = bool(c.get("contentOnly", True))
     zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0)))) if has_on else 1.0
@@ -390,17 +478,10 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     pre: List[str] = []
     post: List[str] = []
 
-    if content_only:
-        # Full-frame part only: bars, border + optional full-frame fisheye when contentOnly=False? Actually fisheye content-only handled in content filters
-        # But if contentOnly and fisheye enabled, we still need it in content path, not here
-        # If contentOnly=False and fisheye enabled, it should be full-frame
-        if not content_only and has_fisheye:
-            # handled below in full-frame path
-            pass
-        # When contentOnly=True, bars/border still full-frame, fisheye is content-only (see _content_cloak_filters)
-    else:
-        # legacy full-frame path (mirroring is content-only here too — it
-        # happens per segment in _passthrough_graph, never full-frame)
+    if not content_only:
+        # legacy full-frame path (mirroring is content-only there too — it
+        # happens per segment in _passthrough_graph, never full-frame).
+        # The fisheye, when the caller resolved one, lands here.
         if abs(rotate) > 0.05:
             pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
         if zoom > 1.001:
@@ -417,10 +498,8 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
             pre.append(f"gblur=sigma={min(3.0, blur):.2f}")
         if grain > 0.5:
             pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
-        if has_fisheye:
-            vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
-            if vf and _ffmpeg_has_filter("lenscorrection"):
-                pre.append(vf)
+        if fisheye:
+            pre.append(fisheye)
 
     if bars > 0.05:
         bh = max(1, int(round(H * bars / 100.0)))
@@ -436,13 +515,16 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
 
 def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
                            content_rect: Optional[Dict[str, float]] = None) -> List[str]:
-    """Filters that apply ONLY to the content area when contentOnly=True."""
+    """Filters that apply ONLY to the content area when contentOnly=True.
+
+    The fisheye is NOT part of this list: it is a per-segment stage (the
+    `remap` filter with its map inputs, or an in-chain filter on other
+    builds) that _passthrough_graph splices in AFTER these — so intro/outro
+    can skip it while body/mute/fast/card keep it.
+    """
     c = cfg or {}
     has_on = bool(c.get("on", False))
-    has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
-    if not has_on and not has_fisheye:
-        return []
-    if not c.get("contentOnly", True):
+    if not has_on or not c.get("contentOnly", True):
         return []
     zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0)))) if has_on else 1.0
     saturate = float(c.get("saturate", 100.0)) / 100.0 if has_on else 1.0
@@ -474,10 +556,6 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
         f.append(f"gblur=sigma={min(3.0, blur):.2f}")
     if grain > 0.5:
         f.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
-    if has_fisheye:
-        vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
-        if vf and _ffmpeg_has_filter("lenscorrection"):
-            f.append(vf)
     return f
 
 
@@ -487,27 +565,28 @@ def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[
     Stands on its own (no overlay input to hang a gradient PNG on), so the
     vignette here is the calibrated `vignette` filter rather than the exact
     browser gradient the passthrough graph composites.
+
+    The fisheye here can only use the in-chain filter backends
+    (lenscorrection / geq) — the remap backend needs map inputs this
+    snippet has nowhere to declare.
     """
     c = cfg or {}
-    pre, post = _video_cloak_split(c, W, H)
     has_on = bool(c.get("on", False))
     has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
     if not has_on and not has_fisheye:
         return []
     # no mirror here: mirroring is always content-only, which needs the
     # content rect the graph has and this snippet doesn't
+    pre, post = _video_cloak_split(c, W, H, fisheye=None)
     f = list(pre)
     if has_on and float(c.get("vignette", 0.0)) > 0.5:
         f.append(f"vignette=a={_vignette_angle(c.get('vignette', 0.0)):.4f}")
     f.extend(post)
-    # If contentOnly and fisheye, the fisheye lives in content filters, not here.
-    # For full-frame fisheye case, pre already contains it.
-    # However for the simple snippet path (no content rect), we need to add fisheye if contentOnly=False or if contentOnly flag missing?
-    # Simplest: if fisheye and not contentOnly, ensure filter present
-    if has_fisheye and not c.get("contentOnly", True):
-        vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
-        if vf and vf not in f and _ffmpeg_has_filter("lenscorrection"):
-            f.append(vf)
+    if has_fisheye:
+        if _ffmpeg_has_filter("lenscorrection"):
+            f.append(_fisheye_vfilter(c.get("fisheyeAmount", 35)))
+        elif _ffmpeg_has_filter("geq"):
+            f.append(_fisheye_geq(c.get("fisheyeAmount", 35), W, H))
     return f
 
 
@@ -1677,6 +1756,66 @@ class ReactionVideoProcessor:
             return ["0:a:1", "0:a:2"], True
         return ["0:a"], False
 
+    def _fisheye_maps(self, amount: float, W: int, H: int) -> Tuple[Path, Path]:
+        """The fisheye's 16-bit grayscale x/y map PNGs for `remap`, cached
+        per (amount, size) — identical maps are one pair of files for the
+        whole render (and for every part of a chunked render)."""
+        key = (round(float(amount), 1), int(W), int(H))
+        cache: Dict[Any, Tuple[Path, Path]] = \
+            self.__dict__.setdefault("_fish_map_cache", {})
+        hit = cache.get(key)
+        if hit and hit[0].is_file() and hit[1].is_file():
+            return hit
+        import cv2
+        xmap, ymap = _fisheye_coords(key[0], key[1], key[2])
+        x = self.work / f"fish_x_{key[0]}_{key[1]}x{key[2]}.png"
+        y = self.work / f"fish_y_{key[0]}_{key[1]}x{key[2]}.png"
+        cv2.imwrite(str(x), xmap)
+        cv2.imwrite(str(y), ymap)
+        cache[key] = (x, y)
+        return x, y
+
+    def _plan_fisheye(self, cfg: Optional[Dict[str, Any]], W: int, H: int,
+                      warns: List[str]) -> FisheyePlan:
+        """Pick the fisheye backend this ffmpeg build actually has.
+
+        The preview canvas always draws the fisheye, so a backend the build
+        lacks must be worked around, not silently skipped (that is exactly
+        the "shows in preview, missing from export" bug). Order: remap maps
+        (exact preview math, fast, FFmpeg 3.1+) -> lenscorrection (7.0+) ->
+        geq (works everywhere, much slower) -> give up with a warning.
+
+        *W*/*H* are the dimensions the lens applies to (the content crop in
+        contentOnly mode, the whole frame otherwise) — the remap maps are
+        built at exactly that size.
+        """
+        c = cfg or {}
+        if not (c.get("fisheye", False)
+                and float(c.get("fisheyeAmount", 0.0)) > 0.5):
+            return FisheyePlan("none")
+        amt = float(c.get("fisheyeAmount", 35.0))
+        if _ffmpeg_has_filter("remap"):
+            try:
+                x, y = self._fisheye_maps(amt, W, H)
+                return FisheyePlan("remap", map_x=x, map_y=y,
+                                   note="fisheye via remap maps "
+                                        "(pixel-exact preview math)")
+            except Exception as e:  # no cv2, disk full, ...
+                warns.append(f"remap maps failed ({e}) — "
+                             "trying another fisheye backend")
+        if _ffmpeg_has_filter("lenscorrection"):
+            return FisheyePlan("filter", _fisheye_vfilter(amt),
+                               note="fisheye via lenscorrection")
+        if _ffmpeg_has_filter("geq"):
+            f = _fisheye_geq(amt, W, H)
+            if f:
+                warns.append("ffmpeg lacks remap and lenscorrection — the "
+                             "geq fisheye fallback is much slower")
+                return FisheyePlan("filter", f)
+        warns.append("fisheye skipped in the export: this ffmpeg build has "
+                     "no remap, lenscorrection or geq filter")
+        return FisheyePlan("none")
+
     def _passthrough_graph(self, kept: List[Dict[str, Any]], *, W: int, H: int,
                            audio_cloak, video_cloak, card, fast_speed,
                            master_gain_db, content_rect, out_fps, height,
@@ -1700,10 +1839,19 @@ class ReactionVideoProcessor:
         can never touch the camera whatever the two rects do — the ffmpeg
         twin of the browser preview's snapshot/restore.
 
-        Returns (chain, warnings, extra_inputs): the card and the vignette
-        gradient arrive as single-frame PNG stills the caller must add to
-        the command as plain inputs (`overlay` repeats their one frame for
-        the whole base), because neither drawtext nor ffmpeg's own vignette
+        The fisheye is a reaction-part effect: it is spliced into
+        body/lead/mute/fast/card spans and deliberately SKIPPED on
+        intro/outro — in the finished file those are full-cam solo, so the
+        lens would bulge the camera instead of the content (the preview
+        does the same). The backend is picked per build by _plan_fisheye
+        (remap maps -> lenscorrection -> geq), so the effect can never be
+        silently missing from the export just because a filter is absent.
+
+        Returns (chain, warnings, extra_inputs): the card, the vignette
+        gradient and the fisheye maps arrive as single-frame PNG stills the
+        caller must add to the command as plain inputs (`overlay` repeats
+        their one frame for the whole base; `remap` keeps its last map
+        frame too), because neither drawtext nor ffmpeg's own vignette
         filter reproduces what the browser preview draws.
         """
         n = len(kept)
@@ -1719,11 +1867,10 @@ class ReactionVideoProcessor:
                 inputs.append(p)
             return inputs.index(p) + 1      # input 0 is the source
 
-        pre, post = _video_cloak_split(video_cloak, W, H)
-        content_filters = _content_cloak_filters(video_cloak, W, H, content_rect)
         vc = video_cloak or {}
-        is_content_only = bool(vc.get("contentOnly", True)) and (bool(vc.get("on", False)) or (bool(vc.get("fisheye", False)) and float(vc.get("fisheyeAmount", 0.0)) > 0.5))
-        # Resolve content rect in pixels
+        # Resolve content rect in pixels FIRST — the fisheye's remap maps
+        # must be exactly the crop size (contentOnly mode) or the frame
+        # size (legacy full-frame mode).
         cr = content_rect or {}
         try:
             crx = float(cr.get("x", 0.294))
@@ -1741,6 +1888,18 @@ class ReactionVideoProcessor:
         cy = max(0, min(H - 1, cy))
         cw = max(1, min(W - cx, cw))
         ch = max(1, min(H - cy, ch))
+        content_only_mode = bool(vc.get("contentOnly", True))
+        # the fisheye backend for this render (one plan; spliced per
+        # segment below, skipped on intro/outro)
+        fe_plan = self._plan_fisheye(
+            vc, cw if content_only_mode else W, ch if content_only_mode else H,
+            warns)
+        if fe_plan.note:
+            warns.append(fe_plan.note)
+        pre, post = _video_cloak_split(vc, W, H)
+        content_filters = _content_cloak_filters(vc, W, H, content_rect)
+        is_content_only = content_only_mode and (bool(vc.get("on", False))
+                                                 or fe_plan.kind != "none")
         # camera corner, restored on top of card spans (see docstring).
         # All rects below are in unflipped coordinates: the full-frame
         # mirror (flip) is applied once to the finished programme after
@@ -1775,6 +1934,9 @@ class ReactionVideoProcessor:
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
+            # reaction-part effect: intro/outro are full-cam solo in the
+            # finished file — no lens over the camera there
+            fe = None if typ in ("intro", "outro") else fe_plan
             # fast spans AND cards that carry their own speed; the cloak's
             # global speed tweak multiplies on top
             eff_speed = C.seg_speed(s, float(fast_speed)) * global_speed
@@ -1796,7 +1958,7 @@ class ReactionVideoProcessor:
                                 or bool((video_cloak or {}).get("flipContent", False)))
                            and _ffmpeg_has_filter("overlay"))
 
-            if is_content_only and content_filters:
+            if is_content_only and (content_filters or fe is not None):
                 # Split trimmed frame into base and content crop
                 tmp_label = f"vtmp{i}"
                 chain.append(f"[vin{i}]{base_vf}[{tmp_label}]")
@@ -1811,10 +1973,24 @@ class ReactionVideoProcessor:
                 # content crop + filters (unflipped coordinates throughout)
                 crop_vf = f"crop={cw}:{ch}:{cx}:{cy}"
                 cf = list(content_filters)
-                # ensure final size matches content rect
-                cf_vf = ",".join([crop_vf] + cf + [f"scale={cw}:{ch}:flags=lanczos"])
                 content_filt_label = f"vcf{i}"
-                chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
+                if fe is not None and fe.kind == "remap":
+                    # the fisheye as a `remap` stage: the rest of the
+                    # content cloak first, then the pixel-exact remap. The
+                    # maps are the crop size, so the output is already
+                    # cw x ch — no extra scale.
+                    chain.append(f"[{content_src_label}]{crop_vf}"
+                                 + ("," + ",".join(cf) if cf else "")
+                                 + f"[vpre{i}]")
+                    chain.append(f"[vpre{i}][{input_index(fe.map_x)}:v]"
+                                 f"[{input_index(fe.map_y)}:v]"
+                                 f"remap[{content_filt_label}]")
+                else:
+                    if fe is not None and fe.kind == "filter":
+                        cf.append(fe.filter_str)
+                    # ensure final size matches content rect
+                    cf_vf = ",".join([crop_vf] + cf + [f"scale={cw}:{ch}:flags=lanczos"])
+                    chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
                 # overlay filtered content back onto base
                 ov_x = cx
                 ov_y = cy
@@ -1824,10 +2000,18 @@ class ReactionVideoProcessor:
             else:
                 cur = f"vp{i}"
                 vf = base_vf
-                if not is_content_only and content_filters:
-                    # legacy path shouldn't happen, but include
-                    pass
-                chain.append(f"[vin{i}]{vf}[{cur}]")
+                if fe is not None and fe.kind == "filter":
+                    vf += "," + fe.filter_str
+                if fe is not None and fe.kind == "remap":
+                    # legacy full-frame path: run trim/speed/cloak, then
+                    # remap the whole frame (maps are frame-sized)
+                    mid = f"vpre{i}"
+                    chain.append(f"[vin{i}]{vf}[{mid}]")
+                    chain.append(f"[{mid}][{input_index(fe.map_x)}:v]"
+                                 f"[{input_index(fe.map_y)}:v]"
+                                 f"remap[{cur}]")
+                else:
+                    chain.append(f"[vin{i}]{vf}[{cur}]")
                 if want_mirror:
                     # mirror just the content rect, like the content-only path
                     mbase, msrc, mfl = f"vmbase{i}", f"vmsrc{i}", f"vmf{i}"
