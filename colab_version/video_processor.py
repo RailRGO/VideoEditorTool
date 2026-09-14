@@ -156,22 +156,110 @@ def browser_audio_to_cfg(browser: Dict[str, Any]) -> Tuple[Dict[str, Any], float
     return cfg, float(master.get("gain", 0.0))
 
 
+def _voice_changer_filters(cfg: Optional[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    """Return (filters, warnings) for complete voice changer.
+    Uses rubberband with formant shifted for timbre change, plus optional robot effects.
+    """
+    c = cfg or {}
+    if not c.get("voiceChanger", False):
+        return [], []
+    warnings: List[str] = []
+    preset = str(c.get("voicePreset", "anon") or "anon").lower()
+    strength = max(0.0, min(100.0, float(c.get("voiceStrength", 70.0)))) / 100.0
+    extra_pitch = float(c.get("voicePitch", 0.0))
+    if strength < 0.01:
+        return [], []
+
+    # map preset to base pitch
+    base_pitch = 0.0
+    formant_shift = True
+    robot = False
+    if preset == "deep":
+        base_pitch = -3.5
+    elif preset == "high":
+        base_pitch = 4.5
+    elif preset == "robot":
+        base_pitch = 0.0
+        robot = True
+    elif preset == "custom":
+        base_pitch = extra_pitch
+    else:  # anon
+        base_pitch = -2.2
+
+    eff_pitch = (base_pitch + extra_pitch) * strength
+    # if both pitch and formant shift are wanted, use rubberband with formant=shifted
+    # This is the CapCut-like complete voice changer: changes timbre, not just pitch
+    filters: List[str] = []
+    if abs(eff_pitch) >= 0.05:
+        if _ffmpeg_has_filter("rubberband"):
+            ratio = 2.0 ** (eff_pitch / 12.0)
+            # formant shifted makes voice unrecognizable (changes timbre)
+            # Use high quality: transients=smooth, detector=compound
+            if formant_shift:
+                filters.append(f"rubberband=pitch={ratio:.5f}:formant=shifted:transients=smooth:detector=compound")
+            else:
+                filters.append(f"rubberband=pitch={ratio:.5f}:formant=preserved")
+        else:
+            # fallback: asetrate trick shifts formant + pitch together
+            # e.g., pitch -2 semitones => rate 0.89, then atempo to restore duration
+            ratio = 2.0 ** (eff_pitch / 12.0)
+            # asetrate changes both pitch and speed, so we need atempo to fix duration
+            # asetrate=44100*ratio, aresample back, then atempo=1/ratio
+            # This preserves duration but shifts formant
+            filters.append(f"asetrate=44100*{ratio:.5f}")
+            filters.append(f"aresample=44100")
+            # atempo chain for 1/ratio
+            inv = 1.0 / max(0.1, ratio)
+            for af in _atempo_chain(inv):
+                filters.append(af)
+            warnings.append("rubberband missing — using asetrate fallback for voice changer")
+
+    # extra formant EQ for more transformation
+    if preset == "deep":
+        # boost low, cut high
+        filters.append(f"equalizer=f=200:t=h:width=200:g={2*strength:.1f}")
+        filters.append(f"equalizer=f=3000:t=h:width=800:g={-2*strength:.1f}")
+    elif preset == "high":
+        filters.append(f"equalizer=f=300:t=h:width=200:g={-2*strength:.1f}")
+        filters.append(f"equalizer=f=3000:t=h:width=1000:g={2*strength:.1f}")
+    elif preset == "anon":
+        # slight telephone-like filtering plus pitch already
+        filters.append(f"highpass=f={80 + 120*strength:.0f}")
+        filters.append(f"lowpass=f={8000 - 3000*strength:.0f}")
+
+    if robot:
+        # robot: ring modulation + distortion + echo
+        # tremolo for metallic, aecho for robot repeat, acrusher for bit reduction
+        if _ffmpeg_has_filter("tremolo"):
+            filters.append(f"tremolo=f=30:d={0.6*strength:.2f}")
+        if _ffmpeg_has_filter("aecho"):
+            filters.append(f"aecho=0.8:0.9:15|25:0.4|0.3")
+        if _ffmpeg_has_filter("acrusher"):
+            filters.append(f"acrusher=level_in=1:level_out=1:bits={max(4, int(12 - 6*strength))}:mode=log:aa=1")
+        else:
+            # fallback distortion via waveshaper-like overdrive using aevalsrc? Use volume + alimiter
+            filters.append(f"acontrast=33")
+
+    return filters, warnings
+
+
 def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
                       out_label: str) -> Tuple[str, List[str]]:
     """ffmpeg filter_complex snippet: anti-fingerprint audio treatment.
 
+    Voice changer (formant+pitched, complete transformation) ->
     Tempo-preserving pitch (rubberband) -> chorus -> tilt EQ -> room echo ->
     Haas widening. Returns (snippet, warnings). Anull when disabled/empty.
     """
     c = cfg or {}
-    if not c.get("on", False):
+    if not c.get("on", False) and not c.get("voiceChanger", False):
         return f"[{in_label}]anull[{out_label}]", []
     warnings: List[str] = []
-    pitch = float(c.get("pitch", 0.0))
-    chorus = float(c.get("chorus", 0.0))
-    reverb = float(c.get("reverb", 0.0))
-    tilt = float(c.get("tilt", 0.0))
-    widen = float(c.get("widen", 0.0))
+    pitch = float(c.get("pitch", 0.0)) if c.get("on") else 0.0
+    chorus = float(c.get("chorus", 0.0)) if c.get("on") else 0.0
+    reverb = float(c.get("reverb", 0.0)) if c.get("on") else 0.0
+    tilt = float(c.get("tilt", 0.0)) if c.get("on") else 0.0
+    widen = float(c.get("widen", 0.0)) if c.get("on") else 0.0
 
     cur = in_label
     parts: List[str] = []
@@ -180,6 +268,14 @@ def audio_cloak_chain(cfg: Optional[Dict[str, Any]], in_label: str,
     def nxt() -> str:
         tag[0] += 1
         return f"clk{tag[0]}"
+
+    # voice changer first — complete transformation
+    v_filters, v_warns = _voice_changer_filters(c)
+    warnings.extend(v_warns)
+    for vf in v_filters:
+        o = nxt()
+        parts.append(f"[{cur}]{vf}[{o}]")
+        cur = o
 
     if abs(pitch) >= 0.05:
         if _ffmpeg_has_filter("rubberband"):
@@ -243,6 +339,20 @@ def _vignette_angle(amount: float) -> float:
     return 0.45 * (v / 100.0) ** 0.5
 
 
+def _fisheye_vfilter(amount: float) -> Optional[str]:
+    """Map 0..100 fisheye amount to ffmpeg lenscorrection filter.
+    Negative k1 creates barrel (fisheye) distortion. Returns None if disabled.
+    """
+    a = max(0.0, min(100.0, float(amount or 0.0)))
+    if a < 0.5:
+        return None
+    # 0..100 -> k1 -0.02..-0.5, k2 similar but smaller for natural falloff
+    # Use cx=0.5 cy=0.5 center
+    k1 = -0.02 - (a / 100.0) * 0.48  # -0.02 .. -0.50
+    k2 = k1 * 0.35  # secondary
+    return f"lenscorrection=k1={k1:.3f}:k2={k2:.3f}:cx=0.5:cy=0.5"
+
+
 def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
                       ) -> Tuple[List[str], List[str]]:
     """(filters before the vignette overlay, filters after it).
@@ -256,30 +366,38 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
     in _passthrough_graph via _content_cloak_filters. This preserves camera.
     """
     c = cfg or {}
-    if not c.get("on", False):
+    # even if on=False, we still want to allow standalone fisheye? No — must be gated by fisheye flag
+    # But fisheye flag lives in same cfg, on must be True? In browser, fisheye is inside cloak object with on toggle
+    # For python, we check fisheye independent if on or not? Keep consistent: require on or fisheye alone?
+    # We'll allow fisheye if cfg.fisheye and fisheyeAmount>0 even when on=False for flexibility
+    has_on = bool(c.get("on", False))
+    has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
+    if not has_on and not has_fisheye:
         return [], []
     content_only = bool(c.get("contentOnly", True))
-    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
-    bars = max(0.0, min(12.0, float(c.get("bars", 0.0))))
-    border = max(0.0, min(24.0, float(c.get("border", 0.0))))
+    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0)))) if has_on else 1.0
+    bars = max(0.0, min(12.0, float(c.get("bars", 0.0)))) if has_on else 0.0
+    border = max(0.0, min(24.0, float(c.get("border", 0.0)))) if has_on else 0.0
     border_color = str(c.get("borderColor", "#0ea5e9")).lstrip("#") or "0ea5e9"
-    saturate = float(c.get("saturate", 100.0)) / 100.0
-    contrast = float(c.get("contrast", 100.0)) / 100.0
-    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
-    hue = float(c.get("hue", 0.0))
-    grain = float(c.get("grain", 0.0))
-    blur = float(c.get("blur", 0.0))
-    rotate = float(c.get("rotate", 0.0))
+    saturate = float(c.get("saturate", 100.0)) / 100.0 if has_on else 1.0
+    contrast = float(c.get("contrast", 100.0)) / 100.0 if has_on else 1.0
+    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0 if has_on else 0.0
+    hue = float(c.get("hue", 0.0)) if has_on else 0.0
+    grain = float(c.get("grain", 0.0)) if has_on else 0.0
+    blur = float(c.get("blur", 0.0)) if has_on else 0.0
+    rotate = float(c.get("rotate", 0.0)) if has_on else 0.0
 
     pre: List[str] = []
     post: List[str] = []
 
     if content_only:
-        # Full-frame part only: bars, border. Mirroring is NOT here — it is
-        # always content-only (content filters + the mirror step in
-        # _passthrough_graph), so the camera and card text stay readable.
-        # zoom/rotate/eq/hue/blur/grain/flipContent are content-only, handled separately
-        pass
+        # Full-frame part only: bars, border + optional full-frame fisheye when contentOnly=False? Actually fisheye content-only handled in content filters
+        # But if contentOnly and fisheye enabled, we still need it in content path, not here
+        # If contentOnly=False and fisheye enabled, it should be full-frame
+        if not content_only and has_fisheye:
+            # handled below in full-frame path
+            pass
+        # When contentOnly=True, bars/border still full-frame, fisheye is content-only (see _content_cloak_filters)
     else:
         # legacy full-frame path (mirroring is content-only here too — it
         # happens per segment in _passthrough_graph, never full-frame)
@@ -299,6 +417,10 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int
             pre.append(f"gblur=sigma={min(3.0, blur):.2f}")
         if grain > 0.5:
             pre.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+        if has_fisheye:
+            vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
+            if vf and _ffmpeg_has_filter("lenscorrection"):
+                pre.append(vf)
 
     if bars > 0.05:
         bh = max(1, int(round(H * bars / 100.0)))
@@ -316,21 +438,23 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
                            content_rect: Optional[Dict[str, float]] = None) -> List[str]:
     """Filters that apply ONLY to the content area when contentOnly=True."""
     c = cfg or {}
-    if not c.get("on", False):
+    has_on = bool(c.get("on", False))
+    has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
+    if not has_on and not has_fisheye:
         return []
     if not c.get("contentOnly", True):
         return []
-    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0))))
-    saturate = float(c.get("saturate", 100.0)) / 100.0
-    contrast = float(c.get("contrast", 100.0)) / 100.0
-    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0
-    hue = float(c.get("hue", 0.0))
-    grain = float(c.get("grain", 0.0))
-    blur = float(c.get("blur", 0.0))
-    rotate = float(c.get("rotate", 0.0))
+    zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0)))) if has_on else 1.0
+    saturate = float(c.get("saturate", 100.0)) / 100.0 if has_on else 1.0
+    contrast = float(c.get("contrast", 100.0)) / 100.0 if has_on else 1.0
+    brightness = (float(c.get("brightness", 100.0)) - 100.0) / 100.0 if has_on else 0.0
+    hue = float(c.get("hue", 0.0)) if has_on else 0.0
+    grain = float(c.get("grain", 0.0)) if has_on else 0.0
+    blur = float(c.get("blur", 0.0)) if has_on else 0.0
+    rotate = float(c.get("rotate", 0.0)) if has_on else 0.0
     # `flip` is a legacy alias — all mirroring is content-only, so the
     # camera corner and the card text stay readable
-    flip_content = bool(c.get("flipContent", False) or c.get("flip", False))
+    flip_content = bool(c.get("flipContent", False) or c.get("flip", False)) if has_on else False
 
     f: List[str] = []
     if flip_content:
@@ -350,6 +474,10 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
         f.append(f"gblur=sigma={min(3.0, blur):.2f}")
     if grain > 0.5:
         f.append(f"noise=alls={min(30, grain / 100.0 * 14.0):.1f}:allf=t")
+    if has_fisheye:
+        vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
+        if vf and _ffmpeg_has_filter("lenscorrection"):
+            f.append(vf)
     return f
 
 
@@ -362,14 +490,24 @@ def _video_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int) -> List[
     """
     c = cfg or {}
     pre, post = _video_cloak_split(c, W, H)
-    if not c.get("on", False):
+    has_on = bool(c.get("on", False))
+    has_fisheye = bool(c.get("fisheye", False)) and float(c.get("fisheyeAmount", 0.0)) > 0.5
+    if not has_on and not has_fisheye:
         return []
     # no mirror here: mirroring is always content-only, which needs the
     # content rect the graph has and this snippet doesn't
     f = list(pre)
-    if float(c.get("vignette", 0.0)) > 0.5:
+    if has_on and float(c.get("vignette", 0.0)) > 0.5:
         f.append(f"vignette=a={_vignette_angle(c.get('vignette', 0.0)):.4f}")
     f.extend(post)
+    # If contentOnly and fisheye, the fisheye lives in content filters, not here.
+    # For full-frame fisheye case, pre already contains it.
+    # However for the simple snippet path (no content rect), we need to add fisheye if contentOnly=False or if contentOnly flag missing?
+    # Simplest: if fisheye and not contentOnly, ensure filter present
+    if has_fisheye and not c.get("contentOnly", True):
+        vf = _fisheye_vfilter(c.get("fisheyeAmount", 35))
+        if vf and vf not in f and _ffmpeg_has_filter("lenscorrection"):
+            f.append(vf)
     return f
 
 
@@ -1583,7 +1721,8 @@ class ReactionVideoProcessor:
 
         pre, post = _video_cloak_split(video_cloak, W, H)
         content_filters = _content_cloak_filters(video_cloak, W, H, content_rect)
-        is_content_only = bool((video_cloak or {}).get("contentOnly", True)) and bool((video_cloak or {}).get("on", False))
+        vc = video_cloak or {}
+        is_content_only = bool(vc.get("contentOnly", True)) and (bool(vc.get("on", False)) or (bool(vc.get("fisheye", False)) and float(vc.get("fisheyeAmount", 0.0)) > 0.5))
         # Resolve content rect in pixels
         cr = content_rect or {}
         try:

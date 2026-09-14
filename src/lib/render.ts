@@ -552,17 +552,142 @@ function getNoiseTile(): HTMLCanvasElement {
   return cv;
 }
 
+/** Offscreen canvas cache for fisheye source */
+let fisheyeSrcCanvas: HTMLCanvasElement | null = null;
+function getFisheyeSrcCanvas(w: number, h: number): HTMLCanvasElement {
+  if (!fisheyeSrcCanvas) fisheyeSrcCanvas = document.createElement("canvas");
+  const cv = fisheyeSrcCanvas;
+  if (cv.width !== w || cv.height !== h) {
+    cv.width = w;
+    cv.height = h;
+  }
+  return cv;
+}
+
+/**
+ * Draw src canvas onto ctx with fisheye lens distortion.
+ * amount 0..1, 0=no distortion, 1=strong barrel bulge.
+ * rotateDeg is applied as part of mapping (around center) so it composes correctly.
+ * Uses grid approximation for performance: N x N cells with per-cell scale.
+ */
+function drawFisheyeGrid(
+  ctx: CanvasRenderingContext2D,
+  src: HTMLCanvasElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  amount: number,
+  rotateDeg: number
+) {
+  if (dw <= 2 || dh <= 2) return;
+  const amt = Math.max(0, Math.min(1, amount));
+  if (amt < 0.01) {
+    // fast path no fisheye but with rotation
+    if (Math.abs(rotateDeg) > 0.05) {
+      ctx.save();
+      ctx.translate(dx + dw / 2, dy + dh / 2);
+      ctx.rotate((rotateDeg * Math.PI) / 180);
+      ctx.translate(-(dx + dw / 2), -(dy + dh / 2));
+      try {
+        ctx.drawImage(src, 0, 0, src.width, src.height, dx, dy, dw, dh);
+      } catch {}
+      ctx.restore();
+    } else {
+      try {
+        ctx.drawImage(src, 0, 0, src.width, src.height, dx, dy, dw, dh);
+      } catch {}
+    }
+    return;
+  }
+  const exp = 1 + amt * 1.8; // 1..2.8
+  const cx = dx + dw / 2;
+  const cy = dy + dh / 2;
+  const maxR = Math.sqrt((dw / 2) * (dw / 2) + (dh / 2) * (dh / 2)); // diagonal half, keeps corners pinned
+  const rad = (-rotateDeg * Math.PI) / 180;
+  const cosR = Math.cos(rad);
+  const sinR = Math.sin(rad);
+  // adaptive grid: larger area -> more cells, but capped for perf
+  const N = dw * dh > 600 * 400 ? 20 : 16;
+  const cellW = dw / N;
+  const cellH = dh / N;
+  const srcW = src.width;
+  const srcH = src.height;
+  // precompute scale from dw/dh to src
+  const scaleX = srcW / dw;
+  const scaleY = srcH / dh;
+
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const outX = dx + i * cellW;
+      const outY = dy + j * cellH;
+      const outCX = outX + cellW / 2;
+      const outCY = outY + cellH / 2;
+      let x = outCX - cx;
+      let y = outCY - cy;
+      // undo rotation
+      const xr = x * cosR - y * sinR;
+      const yr = x * sinR + y * cosR;
+      const r = Math.sqrt(xr * xr + yr * yr);
+      if (r < 0.5) {
+        // near center, direct draw small src
+        const rn = r / maxR;
+        const rSrcNorm = rn <= 0 ? 0 : Math.pow(rn, exp);
+        const rSrc = rSrcNorm * maxR;
+        const theta = r > 0.001 ? Math.atan2(yr, xr) : 0;
+        const srcXr = rSrc * Math.cos(theta);
+        const srcYr = rSrc * Math.sin(theta);
+        const srcCX = srcXr + dw / 2;
+        const srcCY = srcYr + dh / 2;
+        // scale derivative
+        const deriv = rn > 0.01 ? exp * Math.pow(rn, exp - 1) : 0.15;
+        const sW = Math.max(1, cellW * deriv * scaleX);
+        const sH = Math.max(1, cellH * deriv * scaleY);
+        const sx = Math.max(0, Math.min(srcW - 1, srcCX * scaleX - sW / 2));
+        const sy = Math.max(0, Math.min(srcH - 1, srcCY * scaleY - sH / 2));
+        try {
+          ctx.drawImage(src, sx, sy, sW, sH, outX, outY, cellW, cellH);
+        } catch {}
+        continue;
+      }
+      const rn = Math.min(1, r / maxR);
+      const rSrcNorm = Math.pow(rn, exp);
+      const rSrc = rSrcNorm * maxR;
+      const theta = Math.atan2(yr, xr);
+      const srcXr = rSrc * Math.cos(theta);
+      const srcYr = rSrc * Math.sin(theta);
+      const srcCX = srcXr + dw / 2;
+      const srcCY = srcYr + dh / 2;
+      const deriv = exp * Math.pow(rn, exp - 1);
+      const sW = Math.max(1, cellW * deriv * scaleX);
+      const sH = Math.max(1, cellH * deriv * scaleY);
+      const sx = Math.max(0, Math.min(srcW - 1, srcCX * scaleX - sW / 2));
+      const sy = Math.max(0, Math.min(srcH - 1, srcCY * scaleY - sH / 2));
+      // clamp source size inside src bounds
+      const clampSW = Math.min(sW, srcW - sx);
+      const clampSH = Math.min(sH, srcH - sy);
+      if (clampSW <= 0 || clampSH <= 0) continue;
+      try {
+        ctx.drawImage(src, sx, sy, clampSW, clampSH, outX, outY, cellW, cellH);
+      } catch {}
+    }
+  }
+}
+
 /**
  * Full-frame draw with the anti-fingerprint treatment: slight punch-in,
  * colour shift, animated grain, vignette, cover bars and an optional frame.
  *
  * When contentOnly=true (default), zoom/blur/rotate/hue/saturate/contrast/
- * brightness/grain/flipContent affect only the content area, leaving the
+ * brightness/grain/flipContent/fisheye affect only the content area, leaving the
  * camera corner untouched. That fixes "reaction cuts my camera / black lines":
  * the camera stays full quality, only the watched video gets disguised.
  * Mirroring is always content-only (`flip` is a legacy alias of flipContent):
  * the camera corner and the card text stay readable. The ffmpeg export does
  * the same (crop + hflip + paste back), so preview and render agree.
+ *
+ * NEW: fisheye lens distortion — strong anti-ContentID, content-only when
+ * contentOnly=true, full-frame otherwise. Off by default.
  */
 function drawCloakedFrame(
   ctx: CanvasRenderingContext2D,
@@ -588,8 +713,11 @@ function drawCloakedFrame(
     return f;
   };
 
-  // Full-frame legacy path when contentOnly is off and no contentFlip
-  if (!contentOnly && !c.flipContent) {
+  const fisheyeOn = !!(c.fisheye && (c.fisheyeAmount ?? 0) > 0.5);
+  const fisheyeAmt = Math.max(0, Math.min(100, c.fisheyeAmount ?? 0)) / 100;
+
+  // Full-frame path when contentOnly is off
+  if (!contentOnly) {
     const zw = W * c.zoom;
     const zh = H * c.zoom;
     const sAsp = src.w / Math.max(1, src.h);
@@ -605,41 +733,82 @@ function drawCloakedFrame(
       sh = src.w / dAsp;
       sy = src.y + (src.h - sh) / 2;
     }
-    ctx.save();
-    if (Math.abs(c.rotate ?? 0) > 0.05) {
-      ctx.translate(W / 2, H / 2);
-      ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
-      ctx.translate(-W / 2, -H / 2);
-    }
-    // Mirror about the picture we are about to draw (never a fixed rect —
-    // the old code flipped the content rect of the *unzoomed* frame, so the
-    // mirrored pixels landed somewhere else: overrun on one side, gap on the
-    // other). `flip` is a legacy alias of flipContent.
-    const dx = (W - zw) / 2;
-    const dy = (H - zh) / 2;
-    if (c.flipContent || c.flip) {
-      ctx.translate(dx * 2 + zw, 0);
-      ctx.scale(-1, 1);
-    }
-    const f = buildFilters();
-    ctx.filter = f.length ? f.join(" ") : "none";
-    try {
-      ctx.drawImage(video, sx, sy, sw, sh, dx, dy, zw, zh);
-    } catch {}
-    ctx.filter = "none";
 
-    if (c.grain > 0.5) {
+    // Build filtered full-frame into offscreen if fisheye needed
+    if (fisheyeOn) {
+      const tmp = getFisheyeSrcCanvas(W, H);
+      const tctx = tmp.getContext("2d");
+      if (tctx) {
+        tctx.save();
+        tctx.clearRect(0, 0, W, H);
+        const f = buildFilters();
+        tctx.filter = f.length ? f.join(" ") : "none";
+        // handle flip as hflip in tmp
+        if (c.flipContent || c.flip) {
+          tctx.translate(W, 0);
+          tctx.scale(-1, 1);
+        }
+        // zoom already accounted via sx/sy/sw/sh crop, but we also need to respect zw/zh centering
+        const dx = (W - zw) / 2;
+        const dy = (H - zh) / 2;
+        try {
+          tctx.drawImage(video, sx, sy, sw, sh, dx, dy, zw, zh);
+        } catch {}
+        tctx.filter = "none";
+        tctx.restore();
+      }
+      // draw fisheye grid to main
       ctx.save();
-      ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
-      const tile = getNoiseTile();
-      const pat = ctx.createPattern(tile, "repeat");
-      if (pat) {
-        ctx.fillStyle = pat;
-        ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
-        ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+      drawFisheyeGrid(ctx, tmp, 0, 0, W, H, fisheyeAmt, c.rotate ?? 0);
+      // grain overlay
+      if (c.grain > 0.5) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+        const tile = getNoiseTile();
+        const pat = ctx.createPattern(tile, "repeat");
+        if (pat) {
+          ctx.fillStyle = pat;
+          ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+          ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+        }
+        ctx.restore();
+      }
+      ctx.restore();
+    } else {
+      ctx.save();
+      if (Math.abs(c.rotate ?? 0) > 0.05) {
+        ctx.translate(W / 2, H / 2);
+        ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+        ctx.translate(-W / 2, -H / 2);
+      }
+      const dx = (W - zw) / 2;
+      const dy = (H - zh) / 2;
+      if (c.flipContent || c.flip) {
+        ctx.translate(dx * 2 + zw, 0);
+        ctx.scale(-1, 1);
+      }
+      const f = buildFilters();
+      ctx.filter = f.length ? f.join(" ") : "none";
+      try {
+        ctx.drawImage(video, sx, sy, sw, sh, dx, dy, zw, zh);
+      } catch {}
+      ctx.filter = "none";
+
+      if (c.grain > 0.5) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+        const tile = getNoiseTile();
+        const pat = ctx.createPattern(tile, "repeat");
+        if (pat) {
+          ctx.fillStyle = pat;
+          ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+          ctx.fillRect(0, 0, W + tile.width, H + tile.height);
+        }
+        ctx.restore();
       }
       ctx.restore();
     }
+
     if (c.vignette > 0.5) {
       const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.36, W / 2, H / 2, Math.max(W, H) * 0.72);
       g.addColorStop(0, "rgba(0,0,0,0)");
@@ -659,7 +828,6 @@ function drawCloakedFrame(
       const o = ctx.lineWidth / 2;
       ctx.strokeRect(o, o, W - ctx.lineWidth, H - ctx.lineWidth);
     }
-    ctx.restore();
     return;
   }
 
@@ -693,6 +861,25 @@ function drawCloakedFrame(
     csy = syc0 + (shc0 - csh) / 2;
   }
 
+  // Prepare filtered content into offscreen canvas
+  const tmp = getFisheyeSrcCanvas(Math.max(2, Math.round(cw)), Math.max(2, Math.round(ch)));
+  const tctx = tmp.getContext("2d");
+  if (tctx) {
+    tctx.save();
+    tctx.clearRect(0, 0, tmp.width, tmp.height);
+    const f = buildFilters();
+    tctx.filter = f.length ? f.join(" ") : "none";
+    if (c.flipContent || c.flip) {
+      tctx.translate(tmp.width, 0);
+      tctx.scale(-1, 1);
+    }
+    try {
+      tctx.drawImage(video, csx, csy, csw, csh, 0, 0, tmp.width, tmp.height);
+    } catch {}
+    tctx.filter = "none";
+    tctx.restore();
+  }
+
   ctx.save();
   // Clip to content rect with same shape as content layer if available
   if (layout?.contentStyle) {
@@ -705,30 +892,19 @@ function drawCloakedFrame(
     ctx.clip();
   }
 
-  // Rotate around content center
-  if (Math.abs(c.rotate ?? 0) > 0.05) {
-    ctx.translate(cx + cw / 2, cy + ch / 2);
-    ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
-    ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
+  if (fisheyeOn && tmp) {
+    drawFisheyeGrid(ctx, tmp, cx, cy, cw, ch, fisheyeAmt, c.rotate ?? 0);
+  } else {
+    // no fisheye: rotate around content center
+    if (Math.abs(c.rotate ?? 0) > 0.05) {
+      ctx.translate(cx + cw / 2, cy + ch / 2);
+      ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+      ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
+    }
+    try {
+      ctx.drawImage(tmp, cx, cy, cw, ch);
+    } catch {}
   }
-
-  // The content draws at its own rect — the full-frame mirror (flip) is
-  // applied to the finished frame at the end of renderScene, never here.
-  const drawX = cx;
-  const drawY = cy;
-
-  // Content mirror (`flip` is a legacy alias — all mirroring is content-only)
-  if (c.flipContent || c.flip) {
-    ctx.translate(drawX * 2 + cw, 0);
-    ctx.scale(-1, 1);
-  }
-
-  const f = buildFilters();
-  ctx.filter = f.length ? f.join(" ") : "none";
-  try {
-    ctx.drawImage(video, csx, csy, csw, csh, drawX, drawY, cw, ch);
-  } catch {}
-  ctx.filter = "none";
 
   if (c.grain > 0.5) {
     ctx.save();
@@ -738,7 +914,7 @@ function drawCloakedFrame(
     if (pat) {
       ctx.fillStyle = pat;
       ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
-      ctx.fillRect(drawX, drawY, cw + tile.width, ch + tile.height);
+      ctx.fillRect(cx, cy, cw + tile.width, ch + tile.height);
     }
     ctx.restore();
   }

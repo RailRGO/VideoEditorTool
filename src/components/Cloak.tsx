@@ -94,6 +94,70 @@ export default function CloakPanel({
       </Section>
 
       <Section
+        title="Voice changer — CapCut style"
+        right={
+          <button
+            type="button"
+            onClick={() => setA({ voiceChanger: !audio.voiceChanger })}
+            className={
+              audio.voiceChanger
+                ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-fuchsia-200"
+                : "rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-400"
+            }
+          >
+            {audio.voiceChanger ? "on" : "off"}
+          </button>
+        }
+      >
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          Complete voice transformation — changes timbre, not just pitch. Like CapCut voice changer: makes voice unrecognizable. Off by default.
+        </p>
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-1.5">
+            {(["anon", "deep", "high", "robot", "custom"] as const).map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                onClick={() => setA({ voicePreset: preset })}
+                className={
+                  audio.voicePreset === preset
+                    ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
+                    : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                }
+              >
+                {preset === "anon" ? "Anon" : preset === "deep" ? "Deep" : preset === "high" ? "High" : preset === "robot" ? "Robot" : "Custom"}
+              </button>
+            ))}
+          </div>
+          <Slider
+            label="Strength"
+            value={audio.voiceStrength}
+            min={0}
+            max={100}
+            step={1}
+            display={`${audio.voiceStrength}%`}
+            onChange={(v) => setA({ voiceStrength: v })}
+            hint="how much to transform — 100% = full change"
+          />
+          {audio.voicePreset === "custom" && (
+            <Slider
+              label="Custom pitch"
+              value={audio.voicePitch}
+              min={-6}
+              max={6}
+              step={0.5}
+              display={`${audio.voicePitch > 0 ? "+" : ""}${audio.voicePitch.toFixed(1)} st`}
+              onChange={(v) => setA({ voicePitch: v })}
+              hint="extra pitch shift for custom preset"
+            />
+          )}
+          <p className="text-[10px] text-amber-300/70">
+            Anon = pitch down + formant shift (most private). Deep = lower, High = chipmunk, Robot = metallic distortion.
+          </p>
+        </div>
+      </Section>
+
+      <Section
         title="Frame cloak"
         right={
           <button
@@ -169,6 +233,18 @@ export default function CloakPanel({
               <button type="button" onClick={() => setV({ flipContent: !(video.flipContent || video.flip), flip: false })} className={video.flipContent || video.flip ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flipContent || video.flip ? "Mirror content ON" : "Mirror content off"}</button>
               <span className="text-[10px] text-slate-500">Mirrors only the watched video — camera and card text stay readable</span>
             </div>
+          </div>
+          <div className="mt-3 rounded border border-violet-400/20 bg-violet-500/10 p-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold text-violet-200">Fisheye lens (content only)</span>
+              <button type="button" onClick={() => setV({ fisheye: !video.fisheye })} className={video.fisheye ? "rounded border border-violet-400/40 bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-violet-100" : "rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-400"}>{video.fisheye ? "on" : "off"}</button>
+            </div>
+            <p className="mt-1 text-[10px] text-slate-500">Distorts content area like a fisheye lens — strong anti-ContentID, camera stays clean. Off by default.</p>
+            {video.fisheye && (
+              <div className="mt-2">
+                <Slider label="Fisheye strength" value={video.fisheyeAmount} min={0} max={100} step={1} display={`${video.fisheyeAmount}%`} onChange={(v) => setV({ fisheyeAmount: v })} hint="higher = more bulge distortion, breaks frame hash" />
+              </div>
+            )}
           </div>
           <div className="mt-2">
             <Slider label="Global speed tweak" value={video.speed} min={0.95} max={1.05} step={0.01} display={`${video.speed.toFixed(2)}×`} onChange={(v) => setV({ speed: v })} hint="breaks audio fingerprint when combined with pitch; re-times video+audio together" />
