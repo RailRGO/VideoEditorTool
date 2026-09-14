@@ -430,14 +430,31 @@ export interface AudioCloak {
   tilt: number;
   /** Haas stereo widening in ms (delays the right channel) */
   widen: number;
-  /** complete voice changer — shifts formant + pitch to make voice unrecognizable */
+  /** voice changer on — applies to YOUR voice only (the mic bus) and only
+   * inside the reaction part; intro/outro keep the natural voice */
   voiceChanger: boolean;
-  /** voice changer preset */
+  /** how the voice is changed:
+   *  - "rvc" = AI character voice from an RVC .pth model (Colab export;
+   *    a real voice conversion, not pitch tricks — this is what survives
+   *    Content ID),
+   *  - "fx"  = the basic ffmpeg presets (pitch/formant/robot) */
+  voiceMode: "rvc" | "fx";
+  /** voice changer preset (fx mode) */
   voicePreset: "anon" | "deep" | "high" | "robot" | "custom";
-  /** voice changer strength 0..100 */
+  /** voice changer strength 0..100 (fx mode) */
   voiceStrength: number;
   /** extra pitch shift for voice changer in semitones (custom preset) */
   voicePitch: number;
+  /** RVC: path to the .pth voice model on the notebook (e.g. a Drive path) */
+  rvcModel: string;
+  /** RVC: optional path to the .index file that comes with the model */
+  rvcIndex: string;
+  /** RVC: pitch shift in semitones (-24..24); +12 = one octave up */
+  rvcTranspose: number;
+  /** RVC: 0..1 — how hard to lean on the .index (voice similarity) */
+  rvcIndexRate: number;
+  /** RVC: pitch extraction method — rmvpe is the robust default */
+  rvcMethod: "rmvpe" | "pm" | "crepe";
 }
 
 export const defaultAudioCloak: AudioCloak = {
@@ -448,9 +465,41 @@ export const defaultAudioCloak: AudioCloak = {
   tilt: 2,
   widen: 6,
   voiceChanger: false,
+  voiceMode: "rvc",
   voicePreset: "anon",
   voiceStrength: 70,
   voicePitch: 0,
+  rvcModel: "",
+  rvcIndex: "",
+  rvcTranspose: 0,
+  rvcIndexRate: 0.5,
+  rvcMethod: "rmvpe",
+};
+
+/**
+ * A user image (subscribe button, like reminder, …) overlaid on the YouTube
+ * cut — drawn on the reaction part only, intro/outro stay clean. Designed
+ * for transparent PNGs: x/y is the top-left corner in normalised frame
+ * coordinates, w the width as a fraction of the frame width (height follows
+ * the image's own aspect), opacity 0..1.
+ */
+export interface Sticker {
+  on: boolean;
+  /** data URL (local) or a file name / path on the notebook (Colab) */
+  src: string;
+  x: number;
+  y: number;
+  w: number;
+  opacity: number;
+}
+
+export const defaultSticker: Sticker = {
+  on: false,
+  src: "",
+  x: 0.72,
+  y: 0.04,
+  w: 0.18,
+  opacity: 1,
 };
 
 /**

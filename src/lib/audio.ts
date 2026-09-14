@@ -78,6 +78,11 @@ export class AudioEngine {
   private haasMerge: ChannelMergerNode | null = null;
   private haasDelay: DelayNode | null = null;
 
+  /* --- intro/outro clean-bypass gates (direct path) ---------------------- */
+  private cloakDry: GainNode | null = null;
+  private cloakGate: GainNode | null = null;
+  private cloakClean = false;
+
   /* --- voice changer (complete voice transformation) -------------------- */
   private voiceIn: GainNode | null = null;
   private voiceDry: GainNode | null = null;
@@ -187,6 +192,15 @@ export class AudioEngine {
     this.buildCloak(ctx);
     this.source.connect(this.directGain);
     this.directGain.connect(this.cloakIn!);
+    // intro/outro bypass: a dry path around the whole cloak chain plus a
+    // gate on the chain's output. Default (dry=0, gate=1) is bit-neutral;
+    // clean spans crossfade to the dry path so they play EXACTLY as recorded.
+    this.cloakDry = ctx.createGain();
+    this.cloakDry.gain.value = 0;
+    this.cloakGate = ctx.createGain();
+    this.cloakGate.gain.value = 1;
+    this.directGain.connect(this.cloakDry);
+    this.cloakDry.connect(this.directTrim);
     this.directTrim.connect(this.master);
     this.directTrim.connect(this.micMeter);
     this.directTrim.connect(this.contentMeter);
@@ -393,7 +407,8 @@ export class AudioEngine {
     this.haasSplit.connect(this.haasMerge, 0, 0);
     this.haasSplit.connect(this.haasDelay, 1, 0);
     this.haasDelay.connect(this.haasMerge, 0, 1);
-    this.haasMerge.connect(this.directTrim!);
+    this.haasMerge.connect(this.cloakGate!);
+    this.cloakGate!.connect(this.directTrim!);
 
     this.lfoSaw.start();
     this.lfoSq.start();
@@ -532,6 +547,23 @@ export class AudioEngine {
     ramp(this.tiltLo!.gain, c.on ? -c.tilt / 2 : 0);
     ramp(this.tiltHi!.gain, c.on ? c.tilt / 2 : 0);
     ramp(this.haasDelay!.delayTime, c.on ? c.widen / 1000 : 0, 0.01);
+  }
+
+  /**
+   * Intro/outro rule for the local engine: while the playhead sits in a
+   * clean span, the whole cloak chain (voice changer included) is bypassed
+   * and the audio plays exactly as recorded. Call once per frame with the
+   * active segment type; cheap when nothing changed.
+   */
+  setCleanSpan(type: string | null) {
+    const clean = type === "intro" || type === "outro";
+    if (clean === this.cloakClean) return;
+    this.cloakClean = clean;
+    const ctx = this.ctx;
+    if (!ctx || !this.cloakDry || !this.cloakGate) return;
+    const t = ctx.currentTime;
+    this.cloakDry.gain.setTargetAtTime(clean ? 1 : 0, t, 0.03);
+    this.cloakGate.gain.setTargetAtTime(clean ? 0 : 1, t, 0.03);
   }
 
   /** true = mixed stereo file straight to master, false = split mic/content buses */
@@ -741,7 +773,7 @@ function makeImpulse(ctx: AudioContext, dur: number, decay: number): AudioBuffer
   return buf;
 }
 
-function makeDistortionCurve(amount: number): Float32Array {
+function makeDistortionCurve(amount: number): Float32Array<ArrayBuffer> {
   const k = Math.max(0, amount);
   if (k < 0.1) {
     // neutral: linear

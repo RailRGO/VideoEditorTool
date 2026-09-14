@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -784,27 +785,76 @@ def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
 # full render (same compositor => preview == output)
 # ---------------------------------------------------------------------------
 
-def _has_nvenc() -> bool:
+_NVENC_OK: Optional[bool] = None
+
+
+def nvenc_available(verbose: bool = True) -> bool:
+    """True only when h264_nvenc can ACTUALLY encode on this machine.
+
+    Listing the encoder is not enough: static ffmpeg builds always ship the
+    nvenc wrapper, but without a loadable libcuda / a CUDA-capable GPU the
+    encoder dies on open ("Cannot load libcuda.so.1") — which is how a
+    chunked render blew up on part 6 after five cached parts. So we run a
+    real one-frame smoke encode once per process and cache the verdict.
+    Set REACT_GPU=0 to force the CPU encoder.
+    """
+    global _NVENC_OK
+    if _NVENC_OK is not None:
+        return _NVENC_OK
+    if os.environ.get("REACT_GPU", "1") == "0":
+        _NVENC_OK = False
+        if verbose:
+            print("  encoder: REACT_GPU=0 — forcing libx264 (CPU)")
+        return False
     if not has_ffmpeg():
+        _NVENC_OK = False
         return False
     try:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, check=False)
-        txt = (out.stdout or "") + (out.stderr or "")
-        return "h264_nvenc" in txt
+        listed = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, check=False,
+                                timeout=30)
+        has = "h264_nvenc" in ((listed.stdout or "") + (listed.stderr or ""))
     except Exception:
+        has = False
+    if not has:
+        _NVENC_OK = False
+        if verbose:
+            print("  encoder: this ffmpeg build has no h264_nvenc — using libx264 (CPU)")
         return False
+    try:
+        smoke = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+             "-an", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, check=False, timeout=60)
+        ok = smoke.returncode == 0
+    except Exception:
+        ok = False
+    _NVENC_OK = ok
+    if verbose:
+        if ok:
+            print("  encoder: h264_nvenc verified with a smoke encode — GPU encoding on")
+        else:
+            print("  encoder: h264_nvenc is listed but cannot open "
+                  "(no usable GPU / libcuda) — falling back to libx264 (CPU)")
+    return ok
+
+
+def _has_nvenc() -> bool:
+    """Back-compat alias — now a real smoke test, not an encoder listing."""
+    return nvenc_available(verbose=False)
 
 
 def _open_writer(path: str, W: int, H: int, fps: float,
                  crf: int = 23, preset: str = "fast"):
     """Prefer an ffmpeg rawvideo pipe; fall back to cv2.VideoWriter.
 
-    If a T4 GPU is present (h264_nvenc encoder exists), use it — ~5-10x
-    faster than libx264 and actually fills the GPU RAM Colab warns about.
+    If a T4 GPU is present AND nvenc passes a real smoke encode, use it —
+    ~5-10x faster than libx264 and actually fills the GPU RAM Colab warns
+    about. Otherwise libx264, so a GPU-less runtime still finishes.
     """
     if has_ffmpeg():
-        use_nvenc = _has_nvenc()
+        use_nvenc = nvenc_available()
         if use_nvenc:
             # nvenc: p4 ~ medium, vbr_hq + cq = quality-controlled VBR
             cmd = ["ffmpeg", "-y", "-v", "error",

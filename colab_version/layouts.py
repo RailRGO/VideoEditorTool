@@ -351,10 +351,36 @@ def default_audio_cloak() -> Dict[str, Any]:
         "reverb": 18.0,  # 0..100
         "tilt": 2.0,     # dB, positive = brighter
         "widen": 6.0,    # ms Haas delay on right channel
-        "voiceChanger": False,  # complete voice change (CapCut-like), off by default
-        "voicePreset": "anon",  # anon|deep|high|robot|custom
-        "voiceStrength": 70.0,  # 0..100 intensity
+        # voice changer — applies to the MIC bus only, reaction part only
+        "voiceChanger": False,
+        "voiceMode": "rvc",     # rvc = AI character voice (.pth), fx = basic presets
+        "voicePreset": "anon",  # fx presets: anon|deep|high|robot|custom
+        "voiceStrength": 70.0,  # 0..100 intensity (fx mode)
         "voicePitch": 0.0,      # extra pitch shift for custom preset, semitones
+        # RVC character voice settings (voiceMode == "rvc")
+        "rvcModel": "",         # path to the .pth voice model
+        "rvcIndex": "",         # optional path to the .index file
+        "rvcTranspose": 0,      # semitones (-24..24)
+        "rvcIndexRate": 0.5,    # 0..1 similarity to the training voice
+        "rvcMethod": "rmvpe",   # pitch extraction: rmvpe|pm|crepe
+    }
+
+
+def default_sticker() -> Dict[str, Any]:
+    """User overlay image (subscribe / like / …) on the YouTube cut.
+
+    Drawn on the reaction part only — intro/outro stay clean like every
+    other effect. x/y = normalised top-left position, w = width as a
+    fraction of the frame width (height follows the image aspect),
+    opacity 0..1.
+    """
+    return {
+        "on": False,
+        "src": "",        # data URL / http(s) / file path (bare name = uploaded asset)
+        "x": 0.72,
+        "y": 0.04,
+        "w": 0.18,
+        "opacity": 1.0,
     }
 
 

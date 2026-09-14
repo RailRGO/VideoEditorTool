@@ -87,6 +87,7 @@ import {
   defaultLayout,
   defaultPolish,
   defaultRetouch,
+  defaultSticker,
   defaultTranscriptCut,
   defaultVideoCloak,
   SEGMENT_META,
@@ -103,6 +104,7 @@ import {
   type Retouch,
   type Segment,
   type SegmentType,
+  type Sticker,
   type Target,
   type TranscriptCutOptions,
   type VideoCloak,
@@ -262,6 +264,7 @@ export default function App() {
   const [target, setTarget] = useState<Target>("patreon");
   const [audioCloak, setAudioCloak] = useState<AudioCloak>(defaultAudioCloak);
   const [videoCloak, setVideoCloak] = useState<VideoCloak>(defaultVideoCloak);
+  const [sticker, setSticker] = useState<Sticker>(defaultSticker);
   const [scanChannel, setScanChannel] = useState<"mic" | "content">("mic");
   const [micEnv, setMicEnv] = useState<Envelope | null>(null);
   const [contentEnv, setContentEnv] = useState<Envelope | null>(null);
@@ -284,6 +287,8 @@ export default function App() {
   audioCloakRef.current = audioCloak;
   const videoCloakRef = useRef(videoCloak);
   videoCloakRef.current = videoCloak;
+  const stickerRef = useRef(sticker);
+  stickerRef.current = sticker;
 
   /* retouch */
   const [retouch, setRetouch] = useState<Retouch>(defaultRetouch);
@@ -331,6 +336,7 @@ export default function App() {
     retouch: Retouch;
     audioCloak: AudioCloak;
     videoCloak: VideoCloak;
+    sticker: Sticker;
     cutOpts: CutOptions;
     transcriptCutOpts: TranscriptCutOptions;
     fairUseOpts: FairUseOptions;
@@ -351,6 +357,7 @@ export default function App() {
     a.retouch === b.retouch &&
     a.audioCloak === b.audioCloak &&
     a.videoCloak === b.videoCloak &&
+    a.sticker === b.sticker &&
     a.cutOpts === b.cutOpts &&
     a.transcriptCutOpts === b.transcriptCutOpts &&
     a.fairUseOpts === b.fairUseOpts &&
@@ -361,11 +368,11 @@ export default function App() {
     a.fps === b.fps;
 
   const editStateRef = useRef<EditState>({
-    segments, layout, audio, retouch, audioCloak, videoCloak,
+    segments, layout, audio, retouch, audioCloak, videoCloak, sticker,
     cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   });
   editStateRef.current = {
-    segments, layout, audio, retouch, audioCloak, videoCloak,
+    segments, layout, audio, retouch, audioCloak, videoCloak, sticker,
     cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   };
 
@@ -419,6 +426,7 @@ export default function App() {
         case "retouch": setRetouch(next as Retouch); break;
         case "audioCloak": setAudioCloak(next as AudioCloak); break;
         case "videoCloak": setVideoCloak(next as VideoCloak); break;
+        case "sticker": setSticker(next as Sticker); break;
         case "cutOpts": setCutOpts(next as CutOptions); break;
         case "transcriptCutOpts": setTranscriptCutOpts(next as TranscriptCutOptions); break;
         case "fairUseOpts": setFairUseOpts(next as FairUseOptions); break;
@@ -461,6 +469,10 @@ export default function App() {
   );
   const setVideoCloakH = useMemo(
     () => makeSetter("videoCloak", "videoCloak"),
+    [makeSetter]
+  );
+  const setStickerH = useMemo(
+    () => makeSetter("sticker", "sticker"),
     [makeSetter]
   );
   const setCutOptsH = useMemo(() => makeSetter("cutOpts", "cutOpts"), [makeSetter]);
@@ -512,6 +524,7 @@ export default function App() {
     setRetouch(st.retouch);
     setAudioCloak(st.audioCloak);
     setVideoCloak(st.videoCloak);
+    setSticker(st.sticker ?? defaultSticker);
     setCutOpts(st.cutOpts);
     setTranscriptCutOpts(st.transcriptCutOpts);
     setFairUseOpts(st.fairUseOpts);
@@ -923,9 +936,21 @@ export default function App() {
               videoCloakRef.current,
               // …and the camera corner is restored on top of it, so the card
               // can never bury the camera even when the rects overlap
-              lay.cam
+              lay.cam,
+              // user overlay image — reaction spans only (preview mirrors
+              // the export: intro/outro stay clean)
+              stickerRef.current
             )
           : buildScene(lay, segs, v.currentTime, halves);
+        // intro/outro rule for the local audio cloak: clean spans bypass the
+        // whole chain and play exactly as recorded (the Colab export does the
+        // same with its run-based audio graph)
+        {
+          const activeSeg = yt
+            ? segs.find((s) => v.currentTime >= s.start && v.currentTime < s.end)
+            : undefined;
+          engine().setCleanSpan(activeSeg?.type ?? null);
+        }
         const hook = !yt && retouchRef.current.enabled ? retouchHook : null;
         if (hook) hook.debugPose = poseRef.current;
 
@@ -1383,6 +1408,7 @@ export default function App() {
         retouch: retouchRef.current,
         audioCloak: audioCloakRef.current,
         videoCloak: videoCloakRef.current,
+        sticker: stickerRef.current,
         crf: 23,
         webm: false,
         fps: passthrough ? null : fps,
@@ -1795,7 +1821,7 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 4,
+    version: 5,
     savedAt: new Date().toISOString(),
     sourceFile: fileName,
     sourceDuration: duration,
@@ -1807,6 +1833,7 @@ export default function App() {
     retouch,
     audioCloak,
     videoCloak,
+    sticker,
     cutOpts,
     transcriptCutOpts,
     fairUseOpts,
@@ -1842,8 +1869,10 @@ export default function App() {
     if (p.layout) setLayout(p.layout as LayoutState);
     if (p.audio) setAudio(p.audio as AudioState);
     if (p.retouch) setRetouch(p.retouch as Retouch);
-    if (p.audioCloak) setAudioCloak(p.audioCloak as AudioCloak);
+    if (p.audioCloak)
+      setAudioCloak({ ...defaultAudioCloak, ...(p.audioCloak as AudioCloak) });
     if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
+    if (p.sticker) setSticker({ ...defaultSticker, ...(p.sticker as Sticker) });
     if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
     if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
     if (p.fairUseOpts)
@@ -1869,7 +1898,7 @@ export default function App() {
     setProjectMsg(`Saved ${segments.length} segments + all settings.`);
   }, [
     fileName, duration, target, segments, claims, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const loadProjectFile = useCallback(
@@ -1915,7 +1944,7 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [
     duration, segments, claims, fileName, target, layout, audio, retouch,
-    audioCloak, videoCloak, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
   ]);
 
   const doRestore = () => {
@@ -2761,6 +2790,9 @@ export default function App() {
                 setAudio={setAudioCloakH}
                 video={videoCloak}
                 setVideo={setVideoCloakH}
+                sticker={sticker}
+                setSticker={setStickerH}
+                remote={isRemote ? remoteRef.current : null}
               />
             )}
             {rightTab === "timeline" && (

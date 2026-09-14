@@ -1008,6 +1008,13 @@ class App:
                 log(f"{'YouTube passthrough' if target == 'youtube' else 'Patreon composite'}: "
                     f"{len(segments)} segments, "
                     f"{C.render_duration(segments, fast):.0f}s")
+                sticker = body.get("sticker")
+                if isinstance(sticker, dict):
+                    sticker = {k: sticker.get(k)
+                               for k in ("on", "src", "x", "y", "w", "opacity")
+                               if sticker.get(k) is not None}
+                else:
+                    sticker = None
                 outs = self.proc.render_project(
                     target=target, name=name, segments=segments,
                     layout=lay,
@@ -1015,6 +1022,7 @@ class App:
                            if target != "youtube" else None),
                     audio_cloak=body.get("audioCloak"),
                     video_cloak=body.get("videoCloak"),
+                    sticker=sticker,
                     card=layout_d.get("card") or body.get("card") or {},
                     fast_speed=fast, master_gain_db=master,
                     crf=int(body.get("crf", 23)),
@@ -1267,6 +1275,54 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return {}
 
+    def _read_upload(self) -> Path:
+        """multipart/form-data image upload -> a file inside the output dir.
+
+        Feeds the sticker overlay (subscribe / like images) and any other
+        asset the UI wants to hand to the renderer. Images only, 20 MB cap,
+        sanitised basename — the /files/ route serves it right back.
+        """
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype or "boundary=" not in ctype:
+            raise ValueError("expected multipart/form-data")
+        boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            raise ValueError("empty upload")
+        if length > 25_000_000:
+            raise ValueError("file too large (max ~20 MB)")
+        data = self.rfile.read(length)
+        for part in data.split(b"--" + boundary):
+            if b"filename=\"" not in part:
+                continue
+            head_end = part.find(b"\r\n\r\n")
+            if head_end < 0:
+                continue
+            head = part[:head_end].decode("utf-8", "ignore")
+            m = re.search(r'filename="([^"]*)"', head)
+            body = part[head_end + 4:]
+            if body.endswith(b"\r\n"):
+                body = body[:-2]
+            name = Path(m.group(1)).name if m else "upload"
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") \
+                or "upload"
+            if not re.search(r"\.(png|jpe?g|webp|gif)$", name, re.I):
+                name += ".png"
+            ok_magic = (body.startswith(b"\x89PNG"),
+                        body.startswith(b"\xff\xd8\xff"),
+                        body[:4] == b"RIFF" and body[8:12] == b"WEBP",
+                        body.startswith(b"GIF8"))
+            if not any(ok_magic):
+                raise ValueError(
+                    "only PNG / JPEG / WebP / GIF images are accepted")
+            saved = Path(self.app.proc.out) / f"u_{int(time.time())}_{name}"
+            saved.write_bytes(body)
+            return saved
+        raise ValueError("no file field in the upload")
+
     def _send_file(self, path: Path, content_type: Optional[str] = None):
         """Serve a file with HTTP Range support (needed for <video> seeking)."""
         if not path.exists() or not path.is_file():
@@ -1378,6 +1434,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path
         try:
+            if path == "/api/upload":
+                # multipart — must be read before the JSON reader touches
+                # the body
+                saved = self._read_upload()
+                self._json({"ok": True, "name": saved.name,
+                            "url": f"/files/{saved.name}"})
+                return
             body = self._read_json()
             if path == "/api/layout":
                 proc.layout = L.LayoutState.from_dict(body.get("layout", {}))
