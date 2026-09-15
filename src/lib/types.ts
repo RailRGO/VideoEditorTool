@@ -472,14 +472,22 @@ export interface AudioCloak {
   /** second seed for the mic when voiceTarget === "both" */
   morphSeedMic: string | number;
   /**
-   * Keep the audio playing under CARD sections while the voice changer is
-   * on. Normally a card mutes the programme audio (the card hides a claimed
-   * stretch); once that audio is re-voiced it no longer matches the
-   * fingerprint, so it can simply keep playing — the whole altered audio
-   * stays continuous instead of going quiet at every card. MUTE sections
-   * still silence, and intro/outro/cut spans are never altered.
+   * Keep the audio playing under CARD sections — on its own, whatever the
+   * audio is. Normally a card mutes the programme (the card hides a claimed
+   * stretch), which is what makes the mix jump quiet at every card. Ticked,
+   * the programme keeps playing through every card, re-voiced or exactly as
+   * recorded; unticked, cards silence it as before. MUTE sections always
+   * silence, and cut / intro / outro spans are never altered. (Projects
+   * saved before v9 stored this as `voiceKeepCardAudio`, where the tick only
+   * did anything with the voice changer on.)
    */
-  voiceKeepCardAudio: boolean;
+  keepCardAudio: boolean;
+  /**
+   * @deprecated pre-v9 name of `keepCardAudio`, when the tick only did
+   * anything with the voice changer on. Never written any more — read once
+   * when an older project is loaded.
+   */
+  voiceKeepCardAudio?: boolean;
   /** voice changer preset (fx mode) */
   voicePreset: "anon" | "deep" | "high" | "robot" | "custom";
   /** voice changer strength 0..100 (fx mode) */
@@ -514,7 +522,7 @@ export const defaultAudioCloak: AudioCloak = {
   morphFormant: 1,
   voicePresetMic: "",
   morphSeedMic: "",
-  voiceKeepCardAudio: false,
+  keepCardAudio: false,
   voicePreset: "anon",
   voiceStrength: 70,
   voicePitch: 0,
@@ -605,12 +613,12 @@ export interface VideoCloak {
    */
   mirrorScope: MirrorScope;
   /**
-   * 0…0.6 — fraction of the content height at the BOTTOM that is left exactly
-   * as recorded. Subtitles live down there, and short cards already show the
-   * bottom 25 % of the programme: mirroring that strip would flip the words.
-   * 0 = mirror the whole content area.
+   * @deprecated v7–v8 kept the bottom strip of a mirrored block as recorded
+   * (`mirrorKeepBottom`). The rule is now per span instead of per strip: a
+   * SHORT card never mirrors what it leaves visible (see `resolveMirror`),
+   * so subtitles stay readable wherever they sit. Never written any more.
    */
-  mirrorKeepBottom: number;
+  mirrorKeepBottom?: number;
   /** subtle blur 0..10 (px at 1080p) — breaks pixel hashes */
   blur: number;
   /** slight rotation -5..5 deg — breaks frame hash, adds black edges */
@@ -641,7 +649,6 @@ export const defaultVideoCloak: VideoCloak = {
   flipContent: false,
   mirrorMode: "off",
   mirrorScope: "reaction",
-  mirrorKeepBottom: 0,
   blur: 0,
   rotate: 0,
   speed: 1,
@@ -677,13 +684,24 @@ export const MIRROR_MODE_META: Record<
  * flag — that path mirrors the whole frame inside the legacy (contentOnly =
  * false) branch and the content rect everywhere else, which is exactly what
  * those projects were rendered with.
+ *
+ * A SHORT card is the one span that never mirrors: it only covers the top of
+ * the programme, so the strip it leaves visible — where burned-in subtitles
+ * live — has to stay readable and upright. The card itself is drawn after
+ * the picture, so unmirroring the span costs nothing. (Full cards cover the
+ * whole content rect and keep whatever the project asked for.)
  */
 export function resolveMirror(
-  c: Pick<VideoCloak, "mirrorMode" | "mirrorScope" | "mirrorKeepBottom" | "flip" | "flipContent"> | null | undefined,
-  seg?: { mirror?: boolean } | null
-): { mode: MirrorMode | "legacy"; keepBottom: number; frameFlip: boolean } {
-  const empty = { mode: "off" as MirrorMode | "legacy", keepBottom: 0, frameFlip: false };
+  c: Pick<VideoCloak, "mirrorMode" | "mirrorScope" | "flip" | "flipContent"> | null | undefined,
+  seg?: {
+    type?: string;
+    mirror?: boolean;
+    card?: { variant?: string } | null;
+  } | null
+): { mode: MirrorMode | "legacy"; frameFlip: boolean } {
+  const empty = { mode: "off" as MirrorMode | "legacy", frameFlip: false };
   if (!c) return empty;
+  if (isShortCard(seg)) return empty;
   const raw = (c as { mirrorMode?: unknown }).mirrorMode;
   let mode: MirrorMode | "legacy" = "off";
   if (raw === "off" || raw === "content" || raw === "frame") mode = raw;
@@ -691,11 +709,19 @@ export function resolveMirror(
   else if (c.flip) mode = "legacy";
   if (mode === "off") return empty;
   if (c.mirrorScope === "blocks" && !seg?.mirror) return empty;
-  const keepBottom =
-    mode === "content"
-      ? Math.max(0, Math.min(0.6, Number(c.mirrorKeepBottom) || 0))
-      : 0;
-  return { mode, keepBottom, frameFlip: mode === "frame" || (mode === "legacy" && false) };
+  return { mode, frameFlip: mode === "frame" };
+}
+
+/**
+ * True for a card span that only covers the top of the programme (the
+ * default `variant` is "full"). The mirror and the ffmpeg pipeline both read
+ * this so preview and render agree.
+ */
+export function isShortCard(
+  seg?: { type?: string; card?: { variant?: string } | null } | null
+): boolean {
+  if (!seg || seg.type !== "card") return false;
+  return String(seg.card?.variant ?? "full").trim().toLowerCase() === "short";
 }
 
 export const defaultCut: CutOptions = {

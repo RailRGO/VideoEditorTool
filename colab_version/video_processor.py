@@ -436,27 +436,26 @@ def _voice_targets(cfg: Optional[Dict[str, Any]]) -> set:
     return {"mic"}
 
 
-def _voice_keep_card_audio(cfg: Optional[Dict[str, Any]]) -> bool:
+def _keep_card_audio(cfg: Optional[Dict[str, Any]]) -> bool:
     """True when CARD sections keep their audio instead of silencing it.
 
-    Only meaningful while the voice changer is on: a card normally mutes the
-    programme because the card HIDES a claimed stretch — but once that audio
-    is re-voiced it no longer matches the fingerprint, so it can keep
-    playing and the altered audio stays continuous through the cards. MUTE
-    spans still silence either way; intro/outro are never altered.
+    A tick of its own, independent of the voice changer: on, the programme
+    keeps playing through every card — re-voiced exactly the same way, or
+    left as recorded; off, a card silences it like it always did. The tick
+    is what decides, not what the audio is.
 
-    The card silences the CONTENT bus, so it may keep playing only when
-    that bus is actually covered by the voice changer — an unaltered
-    programme under a card would hand the fingerprint straight back. A
-    single mixed track is processed through the content bus as well, so the
-    rule is the same either way: the content bus must be a target.
+    The card silences the CONTENT bus (a mic-only bus is never touched by a
+    card); a single mixed track is processed through that same bus, so one
+    rule covers both. MUTE spans always silence; intro/outro/cut spans are
+    never altered either way.
     """
     c = cfg or {}
-    if not c.get("voiceChanger", False):
-        return False
-    if not c.get("voiceKeepCardAudio", False):
-        return False
-    return "content" in _voice_targets(c)
+    if "keepCardAudio" in c:
+        return bool(c.get("keepCardAudio", False))
+    # projects saved before v9: the tick only existed as voiceKeepCardAudio
+    # and only did anything with the voice changer on. It meant "keep the
+    # card audio" then too, so it is read straight back.
+    return bool(c.get("voiceKeepCardAudio", False))
 
 
 def _voice_engine(cfg: Optional[Dict[str, Any]], bus: str) -> str:
@@ -1138,7 +1137,7 @@ def resolve_mirror(video_cloak: Optional[Dict[str, Any]],
                    content_only: bool = True) -> Dict[str, Any]:
     """Python twin of resolveMirror() in src/lib/types.ts.
 
-    Returns {mode, keep_bottom, content_flip, frame_flip}. *clean* spans
+    Returns {mode, content_flip, frame_flip, legacy_whole}. *clean* spans
     (intro/outro) are never mirrored — the rule the whole cloak follows:
     your full-cam solo is exported exactly as recorded.
 
@@ -1150,13 +1149,20 @@ def resolve_mirror(video_cloak: Optional[Dict[str, Any]],
     * mirrorScope "blocks" means only the segments carrying `mirror: true`
       flip — the tick list the Cloak tab shows.
 
+    A SHORT card is the one span that never mirrors (`_card_variant`): it only
+    covers the top of the programme, so the strip it leaves visible — where
+    burned-in subtitles live — has to stay readable and upright. The card is
+    drawn on top of the picture anyway.
+
     *content_only* is the project's `videoCloak.contentOnly`: a legacy `flip`
     on the old full-frame path flips the WHOLE frame in the browser, so it has
     to flip the whole frame here too (the twin of `legacyWhole`).
     """
-    off = {"mode": "off", "keep_bottom": 0.0, "content_flip": False,
+    off = {"mode": "off", "content_flip": False,
            "frame_flip": False, "legacy_whole": False}
     if clean:
+        return off
+    if _is_short_card(seg):
         return off
     c = video_cloak or {}
     raw = c.get("mirrorMode")
@@ -1173,23 +1179,17 @@ def resolve_mirror(video_cloak: Optional[Dict[str, Any]],
     if str(c.get("mirrorScope") or "reaction").lower() == "blocks" \
             and not (seg or {}).get("mirror"):
         return off
-    kb = 0.0
-    if mode == "content":
-        try:
-            kb = max(0.0, min(0.6, float(c.get("mirrorKeepBottom") or 0.0)))
-        except (TypeError, ValueError):
-            kb = 0.0
     if mode == "legacy":
         # pre-v7 `flip`: the whole frame on the legacy (contentOnly=false)
         # path, the content rect everywhere else — bit-for-bit what render.ts
         # does. `legacy_whole` flips the segment's own picture (before the
         # card and the camera restore are drawn), NOT the finished frame:
         # that is the order the browser canvas uses.
-        return {"mode": mode, "keep_bottom": 0.0,
+        return {"mode": mode,
                 "content_flip": bool(content_only),
                 "frame_flip": False,
                 "legacy_whole": not content_only}
-    return {"mode": mode, "keep_bottom": kb,
+    return {"mode": mode,
             "content_flip": mode == "content",
             "frame_flip": mode == "frame",
             "legacy_whole": False}
@@ -1205,20 +1205,17 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
     builds) that _passthrough_graph splices in AFTER these — so intro/outro
     can skip it while body/mute/fast/card keep it.
 
-    The content mirror is NOT part of this list either when a bottom strip
-    has to stay readable (`mirrorKeepBottom`): that needs a crop + hflip +
-    overlay, which the caller builds (see _passthrough_graph). With no strip
-    kept, a plain hflip is all it takes and it lands here.
+    The content mirror is part of it only as a plain `hflip` on the content
+    crop: the caller decides whether the span mirrors at all (see
+    resolve_mirror — a short card never does) and hands the answer in.
     """
     c = cfg or {}
     has_on = bool(c.get("on", False))
     mir = mirror
     if mir is None:
         flip_content = bool(c.get("flipContent") or c.get("flip")) if has_on else False
-        keep_bottom = 0.0
     else:
         flip_content = bool(mir.get("content_flip"))
-        keep_bottom = float(mir.get("keep_bottom") or 0.0)
     if not has_on or not c.get("contentOnly", True):
         if not flip_content:
             return []
@@ -1232,9 +1229,8 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
     rotate = float(c.get("rotate", 0.0)) if has_on else 0.0
 
     f: List[str] = []
-    if flip_content and keep_bottom <= 0.001:
-        # the whole content area flips; with a strip kept, the caller does
-        # the crop + hflip + overlay instead
+    if flip_content:
+        # the content area flips in place (the crop is the caller's)
         f.append("hflip")
     if abs(rotate) > 0.05:
         f.append(f"rotate={rotate}*PI/180:fillcolor=black")
@@ -1352,6 +1348,17 @@ def _card_variant(s: Dict[str, Any]) -> str:
     c = s.get("card") or {}
     return "short" if str(c.get("variant") or "").strip().lower() == "short" \
         else "full"
+
+
+def _is_short_card(seg: Optional[Dict[str, Any]]) -> bool:
+    """A CARD span that only covers the top of the programme.
+
+    The mirror never touches one (the strip it leaves visible — subtitles
+    included — has to stay readable and upright), and the audio under it is
+    the bottom of a short card: the twin of isShortCard() in src/lib/types.ts.
+    """
+    s = seg or {}
+    return str(s.get("type") or "") == "card" and _card_variant(s) == "short"
 
 
 def _card_sig(s: Dict[str, Any]) -> Tuple[str, float]:
@@ -2662,36 +2669,22 @@ class ReactionVideoProcessor:
         global_speed = max(0.5, min(2.0, global_speed))
 
         def mirror_stage(label: str, i: int, mir: Dict[str, Any]) -> str:
-            """hflip a content-sized frame; keep the bottom strip readable.
+            """hflip a content-sized frame (content-only mirror).
 
-            The strip is `mirrorKeepBottom` of the content height, counted
-            from the bottom: a short card already shows the bottom quarter of
-            the programme, and that is exactly where burned-in subtitles sit
-            — flipping it would flip the words. Everything else about the
-            block (the camera in the corner, the card text drawn later) stays
-            readable, which is the promise of a content-only mirror.
+            Nothing is kept back any more: a short card is sent through with
+            no mirror at all (resolve_mirror), so the strip under the card —
+            where burned-in subtitles sit — comes through exactly as
+            recorded. The camera in the corner and the card text drawn later
+            stay upright too, which is the promise of a content-only mirror.
             """
             if mir.get("mode") != "content":
                 # "legacy" (flip/flipContent) rides inside the content
                 # filters, and "frame" flips the whole picture after the
-                # concat — neither has a strip to keep
+                # concat
                 return label
             flipped = f"vmfl{i}"
-            kb = int(round(ch * float(mir.get("keep_bottom") or 0.0)))
-            if kb <= 0:
-                chain.append(f"[{label}]hflip[{flipped}]")
-                return flipped
-            # TWO consumers of the same crop (the flip and the strip that is
-            # pasted back), so the crop has to be split first — an ffmpeg
-            # filtergraph label can only be read once
-            a, b, keep = f"vmspa{i}", f"vmspb{i}", f"vmkeep{i}"
-            out_l = f"vmmix{i}"
-            chain.append(f"[{label}]split=2[{a}][{b}]")
-            chain.append(f"[{a}]hflip[{flipped}]")
-            chain.append(f"[{b}]crop={cw}:{kb}:0:{ch - kb}[{keep}]")
-            chain.append(f"[{flipped}][{keep}]"
-                         f"overlay=x=0:y={ch - kb}:format=auto[{out_l}]")
-            return out_l
+            chain.append(f"[{label}]hflip[{flipped}]")
+            return flipped
 
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
@@ -2720,12 +2713,12 @@ class ReactionVideoProcessor:
 
             want_camfix = (typ == "card" and cam_ok
                            and _ffmpeg_has_filter("overlay"))
-            # this block's mirror: mode, per-block tick and the keep-bottom
-            # strip are already resolved (intro/outro came back "off")
+            # this block's mirror: mode and per-block tick are already
+            # resolved (intro/outro and short cards come back "off")
             content_mirror = bool(mir["content_flip"])
-            # the content-only pipeline is what can keep a mirrored block's
-            # bottom strip readable — take it whenever the mirror needs it,
-            # even with the frame cloak itself switched off
+            # the content-only pipeline is the one that mirrors the content
+            # rect in place — take it whenever the mirror needs it, even with
+            # the frame cloak itself switched off
             use_content_pipe = (not clean[i]) and is_content_only and \
                 (bool(content_filters) or fe is not None or content_mirror)
             # fallback for a contentOnly=False project: mirror the content
@@ -2766,7 +2759,7 @@ class ReactionVideoProcessor:
                     # ensure final size matches content rect
                     cf_vf = ",".join([crop_vf] + cf + [f"scale={cw}:{ch}:flags=lanczos"])
                     chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
-                # mirror the content crop (keeps the bottom strip readable)
+                # mirror the content crop in place
                 content_filt_label = mirror_stage(content_filt_label, i, mir)
                 # overlay filtered content back onto base
                 ov_x = cx
@@ -2798,17 +2791,6 @@ class ReactionVideoProcessor:
                     mcur = f"vm{i}"
                     chain.append(f"[{mbase}][{mfl}]overlay=x={cx}:y={cy}:"
                                  f"format=auto[{mcur}]")
-                    # keep-bottom strip: crop it off the UNFLIPPED base and
-                    # paste it back over the flipped content (subtitles)
-                    kb = int(round(ch * float(mir.get("keep_bottom") or 0.0)))
-                    if kb > 0:
-                        keep = f"vmkb{i}"
-                        chain.append(f"[{cur}]crop={cw}:{kb}:{cx}:"
-                                     f"{cy + ch - kb}[{keep}]")
-                        kn = f"vmk{i}"
-                        chain.append(f"[{mcur}][{keep}]overlay=x={cx}:"
-                                     f"y={cy + ch - kb}:format=auto[{kn}]")
-                        mcur = kn
                     cur = mcur
                 if want_camfix:
                     # a second tap of the trimmed base feeds the camera restore
@@ -2933,9 +2915,10 @@ class ReactionVideoProcessor:
                                  "programme AND your voice together — load a "
                                  "Patreon master with stems to keep your own "
                                  "voice natural")
-            # with the voice changer on, card spans may keep their (re-voiced)
-            # audio instead of silencing it — see _voice_keep_card_audio
-            card_kept = _voice_keep_card_audio(audio_cloak)
+            # "keep the audio under cards" (a tick of its own, any audio):
+            # card spans then keep playing instead of silencing the bus
+            # — see _keep_card_audio
+            card_kept = _keep_card_audio(audio_cloak)
             silenced_types = ("mute",) if card_kept else ("mute", "card")
             states_per_bus = [[
                 ((s.get("type", "body") in silenced_types and j == 0),
@@ -3165,11 +3148,11 @@ class ReactionVideoProcessor:
         # come out of the same segment map and can never drift apart.
         bus_overrides: Dict[int, Path] = {}
         vtargets = _voice_targets(audio_cloak)
-        keep_card_audio = _voice_keep_card_audio(audio_cloak)
+        keep_card_audio = _keep_card_audio(audio_cloak)
         if keep_card_audio:
-            print("  voice: card sections keep their audio — the re-voiced "
-                  "programme plays on through them (mute spans still "
-                  "silence)")
+            print("  audio: card sections keep their audio — the programme "
+                  "plays on through them, re-voiced where the voice changer "
+                  "covers it (mute spans still silence)")
         if vtargets and _voice_mode(audio_cloak) in ("rvc", "morph"):
             if used_stems:
                 gs = max(0.5, min(2.0, float(
@@ -3831,9 +3814,9 @@ class ReactionVideoProcessor:
             look_src: List[Any] = [video_cloak, card, rect, master_gain_db,
                                    sticker,
                                    # whether card spans carry audio is baked
-                                   # into each part's bus wavs, so a toggle
-                                   # must rebuild the parts
-                                   _voice_keep_card_audio(audio_cloak)]
+                                   # into each part's bus wavs, so the tick
+                                   # must rebuild the parts when it changes
+                                   _keep_card_audio(audio_cloak)]
         else:
             look_src = [lay.to_dict() if lay is not None else None,
                         dict(self.audio_cfg), dict(self.retouch_cfg),
@@ -3989,7 +3972,7 @@ class ReactionVideoProcessor:
                     (video_cloak or {}).get("speed", 1.0) or 1.0)))
                 achain, alabels = self._part_audio_chain(
                     part, fast, fade_s=audio_fade_s, global_speed=gspeed,
-                    mute_card=not _voice_keep_card_audio(audio_cloak))
+                    mute_card=not _keep_card_audio(audio_cloak))
                 label_field = {"cout": "ac", "mout": "am", "aout": "a"}
                 label_file = {"cout": "c", "mout": "m", "aout": "a"}
                 acmd = ["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
@@ -4120,9 +4103,9 @@ class ReactionVideoProcessor:
         stems the buses leave UNMIXED ([cout], [mout]) so the join stage
         can run the voice changer on the mic alone; otherwise one [aout].
 
-        *mute_card* False keeps the audio playing through CARD spans (the
-        voice changer is re-voicing it anyway — see
-        _voice_keep_card_audio); mute spans silence either way.
+        *mute_card* False keeps the audio playing through CARD spans
+        ("keep the audio under cards" — see _keep_card_audio); mute spans
+        silence either way.
         """
         inputs, used = self._passthrough_streams(None)
         n = len(part)

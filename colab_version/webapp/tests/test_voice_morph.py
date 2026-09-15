@@ -22,7 +22,8 @@ What is covered, and why each check exists:
   built-in morph works without stems while RVC keeps demanding them.
 * a GPU-less runtime never picks h264_nvenc (the bug that killed a render
   on part 6 and killed the preview proxy with it).
-* voiceKeepCardAudio keeps the re-voiced audio playing under card spans
+* keepCardAudio keeps the audio playing under card spans — a tick of its
+  own, on top of whatever the voice changer does
   (single-pass AND chunked renders) while mute spans still silence and
   intro/outro stay exactly as recorded.
 * the re-voiced bus is saved to the Drive voice_cache and pulled from there
@@ -659,30 +660,22 @@ def _band_energy(a: np.ndarray, lo: float = 500.0, hi: float = 8000.0) -> float:
 
 def test_keep_card_audio_flag():
     print("keep-card-audio flag")
-    check(V._voice_keep_card_audio(None) is False,
+    check(V._keep_card_audio(None) is False,
           "off by default — cards keep muting")
-    check(V._voice_keep_card_audio(
-        {"voiceChanger": False, "voiceKeepCardAudio": True,
-         "voiceTarget": "content"}) is False,
-        "the flag alone does nothing — the voice changer must be on")
-    check(V._voice_keep_card_audio(
-        {"voiceChanger": True, "voiceKeepCardAudio": True,
-         "voiceTarget": "content"}) is True,
-        "voice changer on the content bus + flag → cards keep the audio")
-    check(V._voice_keep_card_audio(
-        {"voiceChanger": True, "voiceKeepCardAudio": True,
-         "voiceTarget": "both"}) is True,
-        "the everyone-same-voice target also keeps the card audio")
-    check(V._voice_keep_card_audio(
-        {"voiceChanger": True, "voiceKeepCardAudio": True,
-         "voiceTarget": "mic"}) is False,
-        "mic-only leaves the programme unaltered — cards keep muting it")
-    check(V._voice_keep_card_audio(
-        {"voiceChanger": True, "voiceKeepCardAudio": True}) is False,
-        "legacy project (no voiceTarget = mic-only) keeps muting cards")
-    check(V._voice_keep_card_audio({"voiceChanger": True,
-                                    "voiceTarget": "content"}) is False,
-        "voice changer without the flag still mutes cards (old behaviour)")
+    check(V._keep_card_audio({}) is False, "…an empty config too")
+    check(V._keep_card_audio({"keepCardAudio": True}) is True,
+          "the tick alone keeps the card audio (voice changer off)")
+    check(V._keep_card_audio({"keepCardAudio": True, "voiceChanger": False,
+                              "voiceTarget": "mic"}) is True,
+          "…whatever the voice changer is set to")
+    check(V._keep_card_audio({"keepCardAudio": False, "voiceChanger": True,
+                              "voiceTarget": "content"}) is False,
+          "unticked mutes the cards even with the voice changed")
+    check(V._keep_card_audio({"voiceKeepCardAudio": True}) is True,
+          "a v8 project's tick is read back under its old name")
+    check(V._keep_card_audio({"keepCardAudio": False,
+                              "voiceKeepCardAudio": True}) is False,
+          "the new field wins when both are present")
 
 
 def _card_segments() -> List[Dict[str, Any]]:
@@ -696,12 +689,13 @@ def _card_segments() -> List[Dict[str, Any]]:
 
 
 def test_cards_keep_the_revoiced_audio():
-    """voiceKeepCardAudio: the whole altered audio plays through the cards.
+    """keepCardAudio: the whole altered audio plays through the cards.
 
-    Cards normally mute the programme (they hide a claimed stretch); once the
-    voice changer re-voices it there is nothing left to hide, so with the
-    flag on the re-voiced audio keeps playing. Mute spans still silence, and
-    intro/outro are never altered — only the reaction part is.
+    Cards normally mute the programme (they hide a claimed stretch). The
+    tick is independent of the voice changer: on, the audio keeps playing
+    through every card — here the re-voiced programme, which is why the
+    spectrums can still tell the card span has sound in it. Mute spans still
+    silence, and intro/outro are never altered — only the reaction part is.
     """
     print("render: cards keep the re-voiced audio")
     if not shutil.which("ffmpeg"):
@@ -734,10 +728,10 @@ def test_cards_keep_the_revoiced_audio():
 
         # -- full renders -----------------------------------------------------
         muted = proc.render_passthrough(
-            segs, audio_cloak=dict(cloak, voiceKeepCardAudio=False),
+            segs, audio_cloak=dict(cloak, keepCardAudio=False),
             name="cards_muted")
         kept = proc.render_passthrough(
-            segs, audio_cloak=dict(cloak, voiceKeepCardAudio=True),
+            segs, audio_cloak=dict(cloak, keepCardAudio=True),
             name="cards_kept")
         md = proc._media_duration(muted["mp4"])
         kd = proc._media_duration(kept["mp4"])
@@ -775,7 +769,7 @@ def test_cards_keep_the_revoiced_audio():
         # -- the same flag through the chunked render path --------------------
         chunk = proc.render_project(
             target="youtube", name="chunk_cards_kept", segments=segs,
-            audio_cloak=dict(cloak, voiceKeepCardAudio=True),
+            audio_cloak=dict(cloak, keepCardAudio=True),
             part_target=2.0, min_part=1.0)
         check(bool(chunk.get("chunked")),
               "the 8 s programme really rendered in parts")

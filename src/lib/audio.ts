@@ -10,6 +10,29 @@ export interface Levels {
 const dbToLin = (db: number) => Math.pow(10, db / 20);
 
 /**
+ * One AudioContext + MediaElementAudioSourceNode per media element, kept for
+ * the life of the page.
+ *
+ * `createMediaElementSource()` throws the second time it is called for the
+ * same element — "HTMLMediaElement already connected previously to a
+ * different MediaElementSourceNode" — and closing the context does NOT hand
+ * the element back: it stays bound to the dead node for good. The old code
+ * closed the context on every `detach()` (the playback watchdog does that on
+ * a stall, and the play-failure fallback does it too), so the very next
+ * `attach()` threw and the preview was stuck on "playing with the file's own
+ * audio" — picture running, mix gone — until the page was reloaded.
+ *
+ * So the context and the source node are created once per element and never
+ * thrown away. `detach()` only reroutes the element's own audio around the
+ * mix (a bypass gain straight to the output) and `attach()` rebuilds the
+ * downstream nodes on the same source node.
+ */
+const ELEMENT_GRAPH = new WeakMap<
+  HTMLMediaElement,
+  { ctx: AudioContext; source: MediaElementAudioSourceNode; bypass: GainNode }
+>();
+
+/**
  * Web Audio graph for a stereo OBS recording where mic and content audio are
  * recorded as separate channels of one file:
  *
@@ -32,6 +55,13 @@ export class AudioEngine {
 
   private video: HTMLVideoElement | null = null;
   private source: MediaElementAudioSourceNode | null = null;
+  /**
+   * The element's own audio, straight to the output. It is the ONLY way to
+   * give the element its sound back without closing the context (which would
+   * poison the source node for the rest of the session): gain 1 = the mix is
+   * out of the path, gain 0 = the mix is live.
+   */
+  private bypassGain: GainNode | null = null;
   private splitter: ChannelSplitterNode | null = null;
   private micIn: GainNode | null = null;
   private micPan: StereoPannerNode | null = null;
@@ -149,8 +179,11 @@ export class AudioEngine {
       this.setMicChannel(micChannel);
       return true;
     }
+    // a different element is taking over: hand the old one its own audio
+    // back first (it keeps its own context, so it is never left silent)
+    if (this.video && this.video !== video) this.routeOwnAudio();
     // a previous attempt left a shell behind (or the element changed)
-    this.detach();
+    this.teardown();
     const Ctor: typeof AudioContext =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -166,10 +199,182 @@ export class AudioEngine {
         "The preview audio mix could not start (" +
         (e instanceof Error ? e.message : String(e)) +
         ") — playing with the file's own audio.";
-      // never leave the element wired into a broken graph
-      this.detach();
+      // never leave the element wired into a broken graph — but never close
+      // the context either, or this element can never be mixed again
+      this.teardown();
+      this.routeOwnAudio();
       return false;
     }
+  }
+
+  /**
+   * The element's AudioContext + source node, created once and reused.
+   *
+   * Reusing them is not an optimisation: a media element accepts exactly ONE
+   * MediaElementAudioSourceNode in its whole life, so a second
+   * `createMediaElementSource()` on the same element throws (and the context
+   * that holds the first one can never be closed without losing the element
+   * to it). The bypass gain is wired here as well — a node that exists from
+   * the start can always give the element its own audio back.
+   */
+  private acquireGraph(video: HTMLVideoElement, Ctor: typeof AudioContext) {
+    const known = ELEMENT_GRAPH.get(video);
+    if (known && known.ctx.state !== "closed") {
+      // a previous engine (or a previous build of this one) may still be
+      // hanging off the source node — unplug it before rewiring. The
+      // element's own bypass stays, so it is never left silent.
+      try {
+        known.source.disconnect();
+      } catch {
+        /* nothing connected */
+      }
+      try {
+        known.source.connect(known.bypass);
+        known.bypass.gain.value = 1;
+      } catch {
+        /* the bypass is gone — the mix below still works */
+      }
+      return known;
+    }
+    const ctx = new Ctor();
+    const source = ctx.createMediaElementSource(video);
+    const bypass = ctx.createGain();
+    bypass.gain.value = 1;
+    source.connect(bypass);
+    bypass.connect(ctx.destination);
+    const rec = { ctx, source, bypass };
+    ELEMENT_GRAPH.set(video, rec);
+    return rec;
+  }
+
+  /** Route the element's own audio straight to the output (mix bypassed). */
+  private routeOwnAudio(): void {
+    const src = this.source;
+    const by = this.bypassGain;
+    const ctx = this.ctx;
+    if (!src || !by || !ctx) return;
+    try {
+      src.disconnect();
+    } catch {
+      /* nothing connected */
+    }
+    try {
+      src.connect(by);
+      by.gain.value = 1;
+    } catch {
+      /* the graph is beyond saving — the element keeps its own audio */
+    }
+    // a suspended context holds a wired-in element back, so wake it up
+    if (ctx.state === "suspended") void ctx.resume();
+  }
+
+  /**
+   * Drop the whole mix graph, keep the element's context + source node.
+   *
+   * Nothing flows out of the graph afterwards (the source and the output
+   * stages are unplugged and every LFO is stopped), so a later `detach()` /
+   * `attach()` can rebuild on the same nodes instead of poisoning the
+   * element with a second source node.
+   */
+  private teardown(): void {
+    try {
+      this.source?.disconnect();
+    } catch {
+      /* already detached */
+    }
+    for (const o of [
+      this.lfoSaw,
+      this.lfoSq,
+      this.chorusLfo,
+      this.voiceLfoSaw,
+      this.voiceLfoSq,
+      this.voiceTremoloLfo,
+    ]) {
+      try {
+        o?.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    for (const n of [this.master, this.safety, this.directTrim, this.scanSink]) {
+      try {
+        n?.disconnect();
+      } catch {
+        /* nothing connected */
+      }
+    }
+    this.splitter = null;
+    this.micIn = null;
+    this.micPan = null;
+    this.comp = null;
+    this.limiter = null;
+    this.makeup = null;
+    this.micMeter = null;
+    this.contentIn = null;
+    this.duckGain = null;
+    this.contentMeter = null;
+    this.master = null;
+    this.safety = null;
+    this.fastTrim = null;
+    this.directGain = null;
+    this.directTrim = null;
+    this.cloakIn = null;
+    this.cloakDry = null;
+    this.cloakGate = null;
+    this.streamDest = null;
+    this.voiceIn = null;
+    this.voiceDry = null;
+    this.voiceWetA = null;
+    this.voiceWetB = null;
+    this.voiceSum = null;
+    this.voiceDelayA = null;
+    this.voiceDelayB = null;
+    this.voiceLfoSaw = null;
+    this.voiceLfoSq = null;
+    this.voiceDepthA = null;
+    this.voiceDepthB = null;
+    this.voiceXfadeA = null;
+    this.voiceXfadeB = null;
+    this.voiceFormantLo = null;
+    this.voiceFormantHi = null;
+    this.voiceRobotFilter = null;
+    this.voiceDistort = null;
+    this.voiceTremolo = null;
+    this.voiceTremoloLfo = null;
+    this.voiceTremoloDepth = null;
+    this.voiceOut = null;
+    this.shiftDry = null;
+    this.shiftWetA = null;
+    this.shiftWetB = null;
+    this.shiftSum = null;
+    this.shiftDelayA = null;
+    this.shiftDelayB = null;
+    this.lfoSaw = null;
+    this.lfoSq = null;
+    this.depthA = null;
+    this.depthB = null;
+    this.xfadeA = null;
+    this.xfadeB = null;
+    this.chorusDry = null;
+    this.chorusWet = null;
+    this.chorusSum = null;
+    this.chorusDelay = null;
+    this.chorusLfo = null;
+    this.chorusDepth = null;
+    this.tiltLo = null;
+    this.tiltHi = null;
+    this.verbDry = null;
+    this.verbWet = null;
+    this.verbSum = null;
+    this.verb = null;
+    this.haasSplit = null;
+    this.haasMerge = null;
+    this.haasDelay = null;
+    this.graphOk = false;
+    this.cloakClean = false;
+    this.scanning = false;
+    this.scanNode = null;
+    this.scanSink = null;
   }
 
   /** Build every node + connection. Throws only into `attach`'s try/catch. */
@@ -179,11 +384,20 @@ export class AudioEngine {
     micChannel: "left" | "right"
   ) {
     this.video = video;
-    const ctx = new Ctor();
+    // reuse the element's context + source node (creating a second one for
+    // the same element is what threw) and take the mix on the bypass
+    const graph = this.acquireGraph(video, Ctor);
+    const ctx = graph.ctx;
     this.ctx = ctx;
-    this.source = ctx.createMediaElementSource(video);
+    this.source = graph.source;
+    this.bypassGain = graph.bypass;
     this.splitter = ctx.createChannelSplitter(2);
-
+    // the mix is about to carry the element's audio: silence the bypass
+    try {
+      graph.bypass.gain.value = 0;
+    } catch {
+      /* a bypass that cannot be muted still leaves the mix working */
+    }
     this.micIn = ctx.createGain();
     this.micPan = ctx.createStereoPanner();
     this.comp = ctx.createDynamicsCompressor();
@@ -688,48 +902,21 @@ export class AudioEngine {
   }
 
   /**
-   * Hand the element its own audio back and forget the graph.
+   * Hand the element its own audio back and take the mix out of the path.
    *
-   * Closing the context detaches the MediaElementAudioSourceNode, so the
-   * preview can start even when the audio graph is what the browser is
-   * unhappy about. The mix (compressor / ducking / cloak) is gone, which is
-   * far better than a preview that will not move at all. Never throws.
+   * The context and the MediaElementAudioSourceNode are deliberately NOT
+   * closed: an element can only ever be bound to one source node, so
+   * throwing the pair away is exactly what made the next attach throw
+   * "already connected previously to a different MediaElementSourceNode" and
+   * left the preview without a mix (and with a "could not start" note) for
+   * the rest of the session. The mix graph is torn down instead and the
+   * element's audio is routed straight to the output through its bypass
+   * gain, so the picture plus the file's own audio keep playing — and the
+   * next play / scan / render can build the mix again. Never throws.
    */
   detach(): void {
-    try {
-      this.source?.disconnect();
-    } catch {
-      /* already detached */
-    }
-    const ctx = this.ctx;
-    this.video = null;
-    this.source = null;
-    this.splitter = null;
-    this.micIn = null;
-    this.contentIn = null;
-    this.master = null;
-    this.fastTrim = null;
-    this.duckGain = null;
-    this.micMeter = null;
-    this.contentMeter = null;
-    this.directGain = null;
-    this.directTrim = null;
-    this.cloakIn = null;
-    this.cloakDry = null;
-    this.cloakGate = null;
-    this.streamDest = null;
-    this.ctx = null;
-    this.graphOk = false;
-    this.scanning = false;
-    this.scanNode = null;
-    this.scanSink = null;
-    if (ctx) {
-      try {
-        void ctx.close();
-      } catch {
-        /* nothing else to do */
-      }
-    }
+    this.teardown();
+    this.routeOwnAudio();
   }
 
   /** Last resort: see `detach()`. */

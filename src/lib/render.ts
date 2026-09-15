@@ -41,7 +41,6 @@ const EMPTY_CLOAK: VideoCloak = {
   flipContent: false,
   mirrorMode: "off",
   mirrorScope: "reaction",
-  mirrorKeepBottom: 0,
   blur: 0,
   rotate: 0,
   speed: 1,
@@ -81,7 +80,7 @@ export interface Scene {
    * Present even when `cloak` is null — mirroring is its own effect now, so
    * it still applies with the frame cloak bypassed.
    */
-  mirror?: { mode: MirrorMode | "legacy"; keepBottom: number } | null;
+  mirror?: { mode: MirrorMode | "legacy" } | null;
   /** whole-picture mirror: the camera corner is restored from a flipped rect */
   mirrorFrame?: boolean;
   /** user overlay image — reaction spans only (YouTube passthrough) */
@@ -832,6 +831,11 @@ function drawFisheyeGrid(
  * the camera corner and the card text stay readable. The ffmpeg export does
  * the same (crop + hflip + paste back), so preview and render agree.
  *
+ * `mirror` is already resolved per span (see resolveMirror): intro/outro come
+ * through unmirrored, and a SHORT card resolves to "off" as well, because it
+ * only covers the top of the programme — the strip it leaves visible has to
+ * stay readable, subtitles and all.
+ *
  * NEW: fisheye lens distortion — strong anti-ContentID, content-only when
  * contentOnly=true, full-frame otherwise. Off by default.
  */
@@ -862,8 +866,6 @@ function drawCloakedFrame(
   const legacyWhole = mirror?.mode === "legacy" && !contentOnly;
   const frameFlip = mirror?.mode === "frame" || legacyWhole;
   const contentFlip = mirror?.mode === "content" || (mirror?.mode === "legacy" && contentOnly);
-  /** fraction of the content height left as recorded at the bottom (subtitles) */
-  const keepBottom = contentFlip ? Math.max(0, Math.min(0.6, mirror?.keepBottom ?? 0)) : 0;
 
   const buildFilters = () => {
     const f: string[] = [];
@@ -972,8 +974,7 @@ function drawCloakedFrame(
     }
 
     // Content-only mirror on the legacy path: re-draw the programme flipped
-    // on top of the finished frame, clipped to the content box (and to the
-    // part above the subtitle strip when one is kept).
+    // on top of the finished frame, clipped to the content box.
     if (contentFlip) {
       const cx = cr.x * W;
       const cy = cr.y * H;
@@ -982,10 +983,9 @@ function drawCloakedFrame(
       const dx = (W - zw) / 2;
       const dy = (H - zh) / 2;
       ctx.save();
-      // clip in unflipped coordinates: the content box, minus the strip at
-      // the bottom that has to stay exactly as recorded
+      // clip in unflipped coordinates: the content box
       ctx.beginPath();
-      ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
+      ctx.rect(cx, cy, cw, ch);
       ctx.clip();
       // …then redraw the very same zoomed frame flipped over its own centre
       ctx.translate(dx * 2 + zw, 0);
@@ -1106,16 +1106,10 @@ function drawCloakedFrame(
     }
     ctx.restore();
 
-    // content-only mirror with the fisheye: map the same grid flipped, over
-    // the part of the content box that is allowed to be mirrored
+    // content-only mirror with the fisheye: map the same grid flipped
     if (contentFlip) {
       ctx.save();
       clipContent();
-      if (keepBottom > 0.001) {
-        ctx.beginPath();
-        ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
-        ctx.clip();
-      }
       ctx.translate(cx * 2 + cw, 0);
       ctx.scale(-1, 1);
       drawFisheyeGrid(ctx, tmp, cx, cy, cw, ch, fisheyeAmt, c.rotate ?? 0);
@@ -1126,11 +1120,6 @@ function drawCloakedFrame(
     const drawContent = (mirrored: boolean) => {
       ctx.save();
       clipContent();
-      if (mirrored && keepBottom > 0.001) {
-        ctx.beginPath();
-        ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
-        ctx.clip();
-      }
       if (Math.abs(c.rotate ?? 0) > 0.05) {
         ctx.translate(cx + cw / 2, cy + ch / 2);
         ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
@@ -1148,8 +1137,7 @@ function drawCloakedFrame(
       ctx.filter = "none";
       ctx.restore();
     };
-    // as recorded first (that is what the bottom strip keeps), then the
-    // mirrored programme over everything above the subtitle band. Under a
+    // as recorded first, then the mirrored programme over it. Under a
     // whole-picture mirror the box itself already sits at the flipped rect
     // AND its copy has to be flipped too — otherwise re-pasting the source
     // would undo the flip inside the content box, so the box would disagree

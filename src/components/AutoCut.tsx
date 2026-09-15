@@ -943,9 +943,9 @@ export default function AutoCut({
           in ffmpeg (gblur, eq, rotate).
         </p>
         <p className="mb-2 text-[11px] leading-relaxed text-sky-300/80">
-          <b>Mirroring moved to the Cloak tab</b> — mode (content only / whole picture), the
-          per-block ticks and the “keep the subtitles readable” strip all live in its own
-          <b> Mirroring</b> section there.
+          <b>Mirroring moved to the Cloak tab</b> — mode (content only / whole picture) and the
+          per-block ticks live in its own <b>Mirroring</b> section there. Short cards are never
+          mirrored, which is what keeps the subtitles under them readable.
         </p>
         <p className="mb-2 text-[11px] leading-relaxed text-emerald-300/80">
           Intro and outro are always excluded — every disguise here lands on the reaction part only,
