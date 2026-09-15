@@ -477,7 +477,7 @@ function drawCard(b, card) {
   // short cards anchor to the top of the content — the subtitles stay visible
   const h = (variant === "short" ? b.h * shortH : b.h);
   // exact opacity: 1 = fully opaque, 0 = no card at all
-  const opacity = Math.max(0, Math.min(1, L.card.opacity ?? .9));
+  const opacity = Math.max(0, Math.min(1, L.card.opacity ?? .96));
   if (opacity <= .001 || b.w <= 1 || h <= 1) return;
   const shape = (L.contentStyle && L.contentStyle.shape) || "rounded";
   const radius = shape === "rect" ? 0
@@ -743,7 +743,7 @@ function buildLayoutTab(el) {
   const sc = sec(el, "Card (Patreon placeholder)");
   // 0 % hides the card completely, 100 % is fully opaque — the render and the
   // browser editor read the same numbers, this preview used to ignore them.
-  slider(sc, { label: "Opacity", min: 0, max: 1, step: .01, get: () => L.card.opacity ?? .9,
+  slider(sc, { label: "Opacity", min: 0, max: 1, step: .01, get: () => L.card.opacity ?? .96,
     set: v => L.card.opacity = v, fmt: pct, after });
   slider(sc, { label: "Short height", min: .3, max: 1, step: .01, get: () => L.card.shortHeight ?? .75,
     set: v => L.card.shortHeight = v, fmt: v => (v * 100).toFixed(0) + "% of content", after });

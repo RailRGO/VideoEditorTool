@@ -198,19 +198,35 @@ export default function CloakPanel({
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
           Content ID fingerprints the <b>programme audio</b>, so by default this re-voices the{" "}
           <b>content</b> track and leaves your own commentary untouched — the show comes out
-          sounding dubbed, which is exactly what stops a match. Your intro/outro always stay clean.
-          Splitting the two needs the Patreon master with stems; a single mixed track gets
-          re-voiced as one piece.
+          sounding dubbed, which is exactly what stops a match. Pick{" "}
+          <b>Everyone</b> for the CapCut-style move: every voice in the reaction part (yours and
+          the show&apos;s) comes out as the <b>same new character voice</b>. Your intro/outro
+          always stay clean. Splitting the two needs the Patreon master with stems; a single mixed
+          track gets re-voiced as one piece.
         </p>
         <Segmented
           value={audio.voiceTarget ?? "content"}
           options={[
             { value: "content", label: "Content (the show)" },
             { value: "mic", label: "My mic" },
-            { value: "both", label: "Both" },
+            { value: "both", label: "Everyone" },
           ]}
           onChange={(t) => setA({ voiceTarget: t })}
         />
+        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-white/10 bg-black/25 p-2">
+          <input
+            type="checkbox"
+            checked={!!audio.voiceKeepCardAudio}
+            onChange={(e) => setA({ voiceKeepCardAudio: e.target.checked })}
+            className="mt-0.5 accent-fuchsia-400"
+          />
+          <span className="text-[10px] leading-relaxed text-slate-400">
+            <b className="text-slate-200">Keep the audio under cards</b> — with the voice changed,
+            card sections don&apos;t need muting: the whole altered audio keeps playing through
+            every card. Mute sections still silence; cut parts, intro and outro are never altered
+            (only the reaction part is).
+          </span>
+        </label>
         <Segmented
           value={audio.voiceMode ?? "morph"}
           options={[
@@ -320,7 +336,10 @@ export default function CloakPanel({
             )}
             <Note>
               The morph runs on the export backend in one pass over the whole programme — a few
-              seconds per minute of video, no GPU, no torch, no model file.
+              seconds per minute of video, no GPU, no torch, no model file. The re-voiced audio is
+              saved on Drive (<code>output/voice_cache</code>): a re-render with the same voice
+              settings pulls it from there instead of running the engine again — so you can tweak
+              cards or mirroring and re-export without paying for the voice a second time.
             </Note>
           </div>
         ) : (audio.voiceMode ?? "morph") === "rvc" ? (

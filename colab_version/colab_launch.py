@@ -210,6 +210,17 @@ def status() -> None:
     print(f"timeline {len(st['segments'])} sections -> "
           f"{st.get('render_duration') or 0:.0f}s out   "
           f"mic bus: {st.get('mic_channel')}")
+    enc = st.get("encoder") or {}
+    if enc.get("gpu"):
+        print("GPU     encoding on the GPU (h264_nvenc smoke-tested)")
+    elif enc.get("pinned_by_failure"):
+        print(f"GPU     a failure pinned encoding to the CPU "
+              f"({enc.get('pin_reason') or 'unknown'}) — the next render "
+              "re-tests the GPU automatically")
+    elif enc.get("forced_cpu_by_user"):
+        print("GPU     bypassed on purpose (REACT_GPU=0) — encoding on the CPU")
+    else:
+        print("GPU     no usable GPU / nvenc here — encoding on the CPU")
     if proxy.get("ready"):
         print("proxy   ready (smooth preview)")
     else:

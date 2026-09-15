@@ -61,9 +61,9 @@ render the same map.
   *drawn* content picture (fit + zoom + offset), so it can neither overrun the
   picture nor leave a gap at its right/bottom edge; in YouTube mode it covers
   the same content rect the file was composed with. Opacity is literal: 100 %
-  is fully opaque, 0 % draws no card at all, and backdrop, accent bar, words
-  and ring share that one alpha. Short cards cover the top 75 % of the content
-  by default, so subtitles stay visible.
+  is fully opaque, 0 % draws no card at all (default 96 %), and backdrop,
+  accent bar, words and ring share that one alpha. Short cards cover the top
+  75 % of the content by default, so subtitles stay visible.
 - **Fair-use limiter** — *Short cards (cut nothing)* keeps every second of the
   reaction and lays short cards over the long talking stretches (8 s of talking
   → 4 s card, repeating; a 30 s stretch gets cards at 8–12 s and 20–24 s), and
@@ -126,14 +126,28 @@ GUI and manual render cells). See `colab_version/README.md`.
 
 The Cloak tab's voice changer targets the **content** bus by default: the
 show gets re-voiced (that is the audio Content ID fingerprints) while your
-commentary and the intro/outro stay natural. The default engine is built in
+commentary and the intro/outro stay natural. The **Everyone** target is the
+CapCut-style move — every voice in the reaction part (yours and the show's)
+comes out as the same new character voice. The default engine is built in
 (`colab_version/voice_morph.py`) — numpy and ffmpeg only, no model file, no
 download, ~10× realtime on the Colab CPU, duration-exact so A/V can never
 drift. RVC character voices are an opt-in engine: paste a path, an `https://`
-URL or `hf:owner/repo/file.pth` and the notebook fetches it. Encoder choices
-are smoke-tested, and a GPU that dies mid-render re-runs the pass on
-`libx264` rather than failing the export; the preview proxy falls back the
-same way and can be rebuilt from the UI (`POST /api/proxy/retry`).
+URL or `hf:owner/repo/file.pth` and the notebook fetches it.
+
+Two more voice-changer options: **Keep the audio under cards** stops card
+sections from muting — once the audio is re-voiced it no longer matches the
+fingerprint, so the whole altered audio simply plays on through every card
+(mute sections still silence; cut parts, intro and outro are never altered —
+only the reaction part is). And the re-voiced bus is cached on Drive
+(`output/voice_cache/`, keyed by the audio + voice settings, pruned to the
+newest 8 entries), so a re-render with the same voice settings pulls it from
+there instead of running the engine again. Encoder choices are smoke-tested,
+and a GPU that dies mid-render re-runs the pass on `libx264` rather than
+failing the export — the pin is a *failure* pin: the next render re-tests
+the GPU automatically (a user-set `REACT_GPU=0` is never overridden), and
+`/api/state` → `encoder` plus `tools("link + status")` say which encoder is
+active. The preview proxy falls back the same way and can be rebuilt from
+the UI (`POST /api/proxy/retry`).
 
 Server renders are chunked and journaled, so a runtime that gets reclaimed
 mid-render costs one part instead of the whole encode — the editor's Export

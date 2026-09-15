@@ -2166,9 +2166,11 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    // 7 adds the mirroring block (mode / scope / keep-bottom) and the
-    // per-segment `mirror` tick; 6 added the transcript
-    version: 7,
+    // 8 moves the card-opacity default to 96 % and adds the voice-changer
+    // options (keep audio under cards); 7 added the mirroring block
+    // (mode / scope / keep-bottom) and the per-segment `mirror` tick;
+    // 6 added the transcript
+    version: 8,
     savedAt: new Date().toISOString(),
     sourceFile: fileNameRef.current || fileName,
     sourceDuration: durRef.current || duration,
@@ -2220,8 +2222,15 @@ export default function App() {
     }
     if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
     if (p.layout) {
-      setLayout(p.layout as LayoutState);
-      layoutRef.current = p.layout as LayoutState;
+      const lay = p.layout as LayoutState;
+      // v8: the card-opacity default moved 0.9 -> 0.96. Saved projects carry
+      // the old default as an explicit number, so one that still says
+      // exactly 0.9 gets the new default instead of the stale one.
+      if (lay.card && lay.card.opacity === 0.9) {
+        lay.card = { ...lay.card, opacity: 0.96 };
+      }
+      setLayout(lay);
+      layoutRef.current = lay;
     }
     if (p.audio) {
       setAudio(p.audio as AudioState);
@@ -3427,6 +3436,7 @@ export default function App() {
                         onCancel: () => void cancelRemoteExport(),
                         onResume: () => void resumeRemoteExport(),
                         fileUrl: (n) => remote?.fileUrl(n) ?? "#",
+                        encoder: remoteInfo?.encoder ?? null,
                       }
                     : null
                 }

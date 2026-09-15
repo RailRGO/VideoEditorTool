@@ -79,7 +79,7 @@ class CardStyle:
     shortHeight: float = 0.75
     # card opacity 0..1, exact: 1 = fully opaque, 0 = no card is drawn at all
     # (the whole card — backdrop, bar, words, ring — shares this alpha)
-    opacity: float = 0.9
+    opacity: float = 0.96
 
 
 @dataclass
@@ -169,7 +169,7 @@ class LayoutState:
                 # into the default — only a missing/None value may default
                 shortHeight=(0.75 if card.get("shortHeight") is None
                              else float(card["shortHeight"])),
-                opacity=(0.9 if card.get("opacity") is None
+                opacity=(0.96 if card.get("opacity") is None
                          else float(card["opacity"])),
             ),
         )
@@ -369,6 +369,9 @@ def default_audio_cloak() -> Dict[str, Any]:
         "morphFormant": 1.0,         # 0.5..2.0 vocal-tract override (1 = preset)
         "voicePresetMic": "",        # 2nd character for the mic when target=both
         "morphSeedMic": "",          # 2nd seed for the mic when target=both
+        # while the voice changer is on, card sections keep the (re-voiced)
+        # audio playing instead of silencing it — mute spans still silence
+        "voiceKeepCardAudio": False,
         # RVC character voice settings (voiceMode == "rvc")
         "rvcModel": "",         # path, https:// URL or hf:owner/repo/file.pth
         "rvcIndex": "",         # optional path to the .index file

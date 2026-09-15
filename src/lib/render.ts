@@ -545,7 +545,7 @@ function drawCard(
   // Opacity is exact: 1 = fully opaque, 0 = the card isn't drawn at all.
   // (The old code clamped it to 0.05 and the gradient carried its own 0.94 /
   // 0.96 alpha, so 0 % still showed a card and 100 % was never opaque.)
-  const opacity = Math.max(0, Math.min(1, layout.card.opacity ?? 0.9));
+  const opacity = Math.max(0, Math.min(1, layout.card.opacity ?? 0.96));
   if (opacity <= 0.001 || w <= 1 || h <= 1) return;
   // Use the same shape/radius as the content layer so the card fully covers it
   // (old fixed 28px radius left tiny gaps in the corners)

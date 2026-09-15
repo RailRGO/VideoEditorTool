@@ -22,11 +22,17 @@ What is covered, and why each check exists:
   built-in morph works without stems while RVC keeps demanding them.
 * a GPU-less runtime never picks h264_nvenc (the bug that killed a render
   on part 6 and killed the preview proxy with it).
+* voiceKeepCardAudio keeps the re-voiced audio playing under card spans
+  (single-pass AND chunked renders) while mute spans still silence and
+  intro/outro stay exactly as recorded.
+* the re-voiced bus is saved to the Drive voice_cache and pulled from there
+  on a re-render with the same voice settings (bit-identical, bounded size).
 
 Needs ffmpeg on PATH plus numpy. No pytest required.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -47,6 +53,7 @@ for p in (str(COLAB), str(COLAB / "webapp")):
         sys.path.insert(0, p)
 
 import compose as C  # noqa: E402
+import layouts as L  # noqa: E402
 import video_processor as V  # noqa: E402
 import voice_morph as M  # noqa: E402
 
@@ -537,7 +544,8 @@ def test_render_morphs_the_content_bus():
         gs = 1.0
         runs, _off, _tot = V._passthrough_runs(segs, 4.0, gs)
         con = proc._conform_passthrough_bus(segs, 4.0, gs, 0.08, "0:a:1",
-                                            mute_in_card=True, tag="t_con")
+                                            silence_types=("mute", "card"),
+                                            tag="t_con")
         mic = proc._conform_passthrough_bus(segs, 4.0, gs, 0.08, "0:a:2",
                                             tag="t_mic")
         check(abs(proc._media_duration(str(con)) - 8.0) < 0.05,
@@ -647,6 +655,199 @@ def _band_energy(a: np.ndarray, lo: float = 500.0, hi: float = 8000.0) -> float:
     mag = np.abs(np.fft.rfft(a * np.hanning(len(a))))
     band = (f >= lo) & (f <= hi)
     return float(np.sum(mag[band] ** 2)) if band.any() else 0.0
+
+
+def test_keep_card_audio_flag():
+    print("keep-card-audio flag")
+    check(V._voice_keep_card_audio(None) is False,
+          "off by default — cards keep muting")
+    check(V._voice_keep_card_audio(
+        {"voiceChanger": False, "voiceKeepCardAudio": True,
+         "voiceTarget": "content"}) is False,
+        "the flag alone does nothing — the voice changer must be on")
+    check(V._voice_keep_card_audio(
+        {"voiceChanger": True, "voiceKeepCardAudio": True,
+         "voiceTarget": "content"}) is True,
+        "voice changer on the content bus + flag → cards keep the audio")
+    check(V._voice_keep_card_audio(
+        {"voiceChanger": True, "voiceKeepCardAudio": True,
+         "voiceTarget": "both"}) is True,
+        "the everyone-same-voice target also keeps the card audio")
+    check(V._voice_keep_card_audio(
+        {"voiceChanger": True, "voiceKeepCardAudio": True,
+         "voiceTarget": "mic"}) is False,
+        "mic-only leaves the programme unaltered — cards keep muting it")
+    check(V._voice_keep_card_audio(
+        {"voiceChanger": True, "voiceKeepCardAudio": True}) is False,
+        "legacy project (no voiceTarget = mic-only) keeps muting cards")
+    check(V._voice_keep_card_audio({"voiceChanger": True,
+                                    "voiceTarget": "content"}) is False,
+        "voice changer without the flag still mutes cards (old behaviour)")
+
+
+def _card_segments() -> List[Dict[str, Any]]:
+    return [
+        {"id": "i", "type": "intro", "start": 0.0, "end": 1.0},
+        {"id": "b", "type": "body", "start": 1.0, "end": 4.0},
+        {"id": "c", "type": "card", "start": 4.0, "end": 6.0},
+        {"id": "m", "type": "mute", "start": 6.0, "end": 7.0},
+        {"id": "o", "type": "outro", "start": 7.0, "end": 8.0},
+    ]
+
+
+def test_cards_keep_the_revoiced_audio():
+    """voiceKeepCardAudio: the whole altered audio plays through the cards.
+
+    Cards normally mute the programme (they hide a claimed stretch); once the
+    voice changer re-voices it there is nothing left to hide, so with the
+    flag on the re-voiced audio keeps playing. Mute spans still silence, and
+    intro/outro are never altered — only the reaction part is.
+    """
+    print("render: cards keep the re-voiced audio")
+    if not shutil.which("ffmpeg"):
+        print("  (skipped — no ffmpeg)")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="voice_card_"))
+    try:
+        src = _master(tmp / "master.mp4", dur=8)
+        proc = V.ReactionVideoProcessor(str(src), work_dir=str(tmp / "work"),
+                                        output_dir=str(tmp / "out"))
+        segs = _card_segments()
+        cloak = dict(L.default_audio_cloak())
+        cloak.update({"on": False, "voiceChanger": True, "voiceMode": "morph",
+                      "voiceTarget": "content", "morphPreset": "deep",
+                      "morphStrength": 100, "morphSeed": 2})
+
+        # -- the bus level: the silence set is the knob ----------------------
+        con_m = proc._conform_passthrough_bus(segs, 4.0, 1.0, 0.08, "0:a:1",
+                                              silence_types=("mute", "card"),
+                                              tag="kc_m")
+        con_k = proc._conform_passthrough_bus(segs, 4.0, 1.0, 0.08, "0:a:1",
+                                              silence_types=("mute",),
+                                              tag="kc_k")
+        check(_band_energy(_read_wav(con_m, 4.5, 1.0)) < 1e-4,
+              "as before: the conformed content bus is silent in a card span")
+        check(_band_energy(_read_wav(con_k, 4.5, 1.0)) > 1.0,
+              "flag on: the conformed content bus keeps playing in the card")
+        check(_band_energy(_read_wav(con_k, 6.4, 0.4)) < 1e-4,
+              "flag on or off: a MUTE span still silences the content bus")
+
+        # -- full renders -----------------------------------------------------
+        muted = proc.render_passthrough(
+            segs, audio_cloak=dict(cloak, voiceKeepCardAudio=False),
+            name="cards_muted")
+        kept = proc.render_passthrough(
+            segs, audio_cloak=dict(cloak, voiceKeepCardAudio=True),
+            name="cards_kept")
+        md = proc._media_duration(muted["mp4"])
+        kd = proc._media_duration(kept["mp4"])
+        check(abs(md - kd) < 0.2,
+              f"both renders are the same length ({md:.2f}s vs {kd:.2f}s)")
+        card_m = _band_energy(_spectrum(muted["mp4"], 4.5, 0, dur=1.0))
+        card_k = _band_energy(_spectrum(kept["mp4"], 4.5, 0, dur=1.0))
+        check(card_k > 10.0 * max(card_m, 1e-9),
+              f"the card span carries the altered audio when the flag is on "
+              f"(card energy {card_m:.2g} → {card_k:.2g} above 500 Hz)")
+        mute_m = _band_energy(_spectrum(muted["mp4"], 6.4, 0, dur=0.4))
+        mute_k = _band_energy(_spectrum(kept["mp4"], 6.4, 0, dur=0.4))
+        check(mute_k < max(2.0 * mute_m, 1e-6),
+              f"the mute span stays silent either way "
+              f"({mute_m:.2g} vs {mute_k:.2g})")
+        body_k = _band_energy(_spectrum(kept["mp4"], 2.0, 0, dur=0.8))
+        check(body_k > 10.0 * max(card_m, 1e-9),
+              "the reaction body carries the re-voiced content as always")
+        # intro/outro pass through untouched: identical energy in both renders
+        intro_m = _band_energy(_spectrum(muted["mp4"], 0.3, 0, dur=0.5),
+                               lo=400.0)
+        intro_k = _band_energy(_spectrum(kept["mp4"], 0.3, 0, dur=0.5),
+                               lo=400.0)
+        check(intro_m > 0 and abs(intro_k - intro_m) / intro_m < 0.15,
+              f"the intro is exactly as recorded either way "
+              f"({intro_m:.2g} vs {intro_k:.2g})")
+        outro_m = _band_energy(_spectrum(muted["mp4"], 7.3, 0, dur=0.5),
+                               lo=400.0)
+        outro_k = _band_energy(_spectrum(kept["mp4"], 7.3, 0, dur=0.5),
+                               lo=400.0)
+        check(outro_m > 0 and abs(outro_k - outro_m) / outro_m < 0.15,
+              f"the outro is exactly as recorded either way "
+              f"({outro_m:.2g} vs {outro_k:.2g})")
+
+        # -- the same flag through the chunked render path --------------------
+        chunk = proc.render_project(
+            target="youtube", name="chunk_cards_kept", segments=segs,
+            audio_cloak=dict(cloak, voiceKeepCardAudio=True),
+            part_target=2.0, min_part=1.0)
+        check(bool(chunk.get("chunked")),
+              "the 8 s programme really rendered in parts")
+        cchunk = _band_energy(_spectrum(chunk["mp4"], 4.5, 0, dur=1.0))
+        mchunk = _band_energy(_spectrum(chunk["mp4"], 6.4, 0, dur=0.4))
+        check(cchunk > 10.0 * max(card_m, 1e-9),
+              f"chunked render: the card span keeps the altered audio "
+              f"({cchunk:.2g} above 500 Hz)")
+        check(mchunk < max(2.0 * mute_m, 1e-6),
+              f"chunked render: the mute span still silences ({mchunk:.2g})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_voice_cache_on_drive():
+    """The re-voiced bus is saved on Drive and pulled from there on re-render:
+    same audio + same voice settings = cache hit; any knob change = re-run."""
+    print("voice cache on Drive")
+    if not shutil.which("ffmpeg"):
+        print("  (skipped — no ffmpeg)")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="voice_cache_"))
+    try:
+        src = _master(tmp / "master.mp4", dur=8)
+        proc = V.ReactionVideoProcessor(str(src), work_dir=str(tmp / "work"),
+                                        output_dir=str(tmp / "out"))
+        segs = _segments(8.0)
+        cloak = dict(L.default_audio_cloak())
+        cloak.update({"on": False, "voiceChanger": True, "voiceMode": "morph",
+                      "voiceTarget": "content", "morphPreset": "deep",
+                      "morphStrength": 100, "morphSeed": 5})
+        runs, _off, _tot = V._passthrough_runs(segs, 4.0, 1.0)
+        con = proc._conform_passthrough_bus(segs, 4.0, 1.0, 0.08, "0:a:1",
+                                            silence_types=("mute", "card"),
+                                            tag="cache_con")
+        cache = proc.out / "voice_cache"
+
+        v1 = V._voice_apply(proc, con, runs, cloak, "content", tag="c1")
+        hits = sorted(cache.glob("content_*.wav"))
+        check(len(hits) == 1,
+              f"the re-voiced bus was saved on Drive ({[h.name for h in hits]})")
+        cached = hits[0]
+        mtime = cached.stat().st_mtime
+
+        def md5(p: Path) -> str:
+            return hashlib.md5(p.read_bytes()).hexdigest()
+
+        h1 = md5(v1)
+        v2 = V._voice_apply(proc, con, runs, cloak, "content", tag="c2")
+        check(v2 == cached, "the second call pulls the bus from the Drive cache")
+        check(abs(cached.stat().st_mtime - mtime) < 1e-6,
+              "the cache entry was not rewritten (the engine did not re-run)")
+        check(md5(v2) == h1, "the cached bus is bit-identical to the first run")
+
+        cloak2 = dict(cloak, morphSeed=6)
+        V._voice_apply(proc, con, runs, cloak2, "content", tag="c3")
+        check(len(sorted(cache.glob("content_*.wav"))) == 2,
+              "a different voice setting stores its own entry (no collision)")
+
+        # pruning keeps the Drive folder bounded
+        now = time.time()
+        for i in range(14):
+            junk = cache / f"content_junk{i:02d}.wav"
+            junk.write_bytes(b"x")
+            os.utime(junk, (now - 1000 + i, now - 1000 + i))
+        V._prune_voice_cache(cache)
+        left = sorted(cache.glob("*.wav"))
+        check(len(left) <= V._VOICE_CACHE_KEEP,
+              f"pruning keeps the newest {V._VOICE_CACHE_KEEP} entries "
+              f"({len(left)} left)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_preview_proxy_survives_no_gpu():
@@ -800,7 +1001,10 @@ def main() -> int:
     test_no_gpu_never_picks_nvenc()
     test_preview_proxy_survives_no_gpu()
     test_model_spec_resolution()
+    test_keep_card_audio_flag()
     test_render_morphs_the_content_bus()
+    test_cards_keep_the_revoiced_audio()
+    test_voice_cache_on_drive()
     print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed ({time.time() - t0:.0f}s)")
     for f in FAILS:
         print(f"  FAILED: {f}")

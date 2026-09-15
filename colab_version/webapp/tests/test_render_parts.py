@@ -1412,6 +1412,39 @@ def test_encoder_fallback():
             os.environ["REACT_GPU"] = saved_gpu
         C._NVENC_OK = saved_cache
 
+    # A GPU failure pins the process to the CPU (force_cpu_encode) — but
+    # that pin must be a FAILURE pin: the next render re-tests the GPU
+    # (retry_gpu_encode), otherwise one hiccup leaves the GPU idle for the
+    # rest of the session (the state Colab reports as "GPU not being used").
+    saved_gpu, saved_cache, saved_pin = (os.environ.get("REACT_GPU"),
+                                         C._NVENC_OK, C._GPU_PINNED)
+    try:
+        os.environ.pop("REACT_GPU", None)
+        C._GPU_USER_FORCED = False
+        C.force_cpu_encode(why="test hiccup")
+        check(os.environ.get("REACT_GPU") == "0" and C._NVENC_OK is False,
+              "a GPU failure pins the rest of this run to the CPU")
+        st = C.encoder_status()
+        check(st["pinned_by_failure"] is True and "test hiccup" in st["pin_reason"],
+              "encoder_status reports the failure pin (and why)")
+        C.retry_gpu_encode()
+        check(os.environ.get("REACT_GPU") != "0" and C._GPU_PINNED == "",
+              "the next job clears the failure pin and re-runs the smoke test")
+        check(C.encoder_status()["gpu"] == C.nvenc_available(verbose=False),
+              "encoder_status agrees with the smoke test after the retry")
+        # a REACT_GPU=0 set by the USER before launch is never overridden
+        C._GPU_USER_FORCED = True
+        check(C.retry_gpu_encode() is False,
+              "a user-forced CPU (REACT_GPU=0 at launch) survives the retry")
+    finally:
+        if saved_gpu is None:
+            os.environ.pop("REACT_GPU", None)
+        else:
+            os.environ["REACT_GPU"] = saved_gpu
+        C._NVENC_OK = saved_cache
+        C._GPU_PINNED = saved_pin
+        C._GPU_USER_FORCED = os.environ.get("REACT_GPU", "1") == "0"
+
 
 # ---------------------------------------------------------------------------
 

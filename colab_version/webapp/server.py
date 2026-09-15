@@ -819,6 +819,9 @@ class App:
             "proxy": self.proxy_status,
             "mic_channel": self.mic_channel,
             "bus_proxies": self.bus_proxies,
+            # lets the UI (and you) see whether the renders encode on the
+            # GPU or why they fell back to the CPU
+            "encoder": C.encoder_status(),
             "job": self.job_state(),
         }
 
@@ -1051,6 +1054,14 @@ class App:
             try:
                 from video_processor import (browser_audio_to_cfg,  # noqa
                                              RenderPaused, StallTimeout)
+                # a GPU that died during a previous job usually comes back:
+                # re-test it once so this render uses h264_nvenc when it can
+                # (staying on the CPU is what makes Colab say the GPU is
+                # unused)
+                try:
+                    C.retry_gpu_encode()
+                except Exception:  # noqa: BLE001 — CPU fallback is fine
+                    pass
                 if not segments:
                     raise ValueError("empty timeline — nothing to render")
                 preflight_output(self.proc.out, log)
@@ -1660,6 +1671,12 @@ def _start_proxy_worker(app: App, proxy_width: int) -> None:
 
     def _proxy_worker():
         try:
+            # a GPU that died during an earlier job usually comes back —
+            # re-test it so the preview (and later renders) use it again
+            try:
+                C.retry_gpu_encode()
+            except Exception:  # noqa: BLE001 — CPU fallback is fine
+                pass
             print("Preparing streamable proxy (one-time, cached on Drive)…")
             ensure_proxy(proc, proxy_width, app.proxy_status)
             if gen != app.proxy_gen:
