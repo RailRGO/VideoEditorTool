@@ -117,7 +117,11 @@ export default function Stage({
           visibility: box.w ? "visible" : "hidden",
         }}
       >
-        <canvas ref={canvasRef} className="block h-full w-full" />
+        <canvas
+          ref={canvasRef}
+          onClick={onTogglePlay}
+          className="block h-full w-full cursor-pointer"
+        />
 
         {showGuides && (
           <div className="pointer-events-none absolute inset-0">
@@ -143,7 +147,7 @@ export default function Stage({
           <button
             type="button"
             onClick={onTogglePlay}
-            className="group absolute inset-0 flex items-center justify-center bg-black/25 backdrop-blur-[1px]"
+            className="group absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px]"
           >
             <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white/15 ring-1 ring-white/30 backdrop-blur transition group-hover:bg-white/25">
               <svg viewBox="0 0 24 24" className="ml-0.5 h-6 w-6 fill-white">
@@ -171,7 +175,7 @@ export default function Stage({
         )}
 
         <div
-          className="absolute inset-0"
+          className="pointer-events-none absolute inset-0 z-10"
           onPointerMove={move}
           onPointerUp={end}
           onPointerCancel={end}
@@ -182,7 +186,7 @@ export default function Stage({
               <div
                 key={key}
                 className={cn(
-                  "absolute cursor-move",
+                  "pointer-events-auto absolute cursor-move",
                   active ? "z-20" : "z-10"
                 )}
                 style={{
@@ -195,6 +199,9 @@ export default function Stage({
                   setEditLayer(key);
                   start(e, key, "move");
                 }}
+                onPointerMove={move}
+                onPointerUp={end}
+                onPointerCancel={end}
               >
                 <div
                   className={cn(
@@ -231,8 +238,14 @@ export default function Stage({
                       ))}
                     </div>
                     <div
-                      className="absolute -bottom-1 -right-1 h-4 w-4 cursor-nwse-resize rounded-sm bg-sky-400 ring-2 ring-slate-900"
-                      onPointerDown={(e) => start(e, key, "resize")}
+                      className="pointer-events-auto absolute -bottom-1 -right-1 h-4 w-4 cursor-nwse-resize rounded-sm bg-sky-400 ring-2 ring-slate-900"
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        start(e, key, "resize");
+                      }}
+                      onPointerMove={move}
+                      onPointerUp={end}
+                      onPointerCancel={end}
                     />
                   </>
                 )}

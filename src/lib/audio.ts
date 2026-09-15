@@ -135,9 +135,15 @@ export class AudioEngine {
     const Ctor: typeof AudioContext =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return;
     const ctx = new Ctor();
     this.ctx = ctx;
-    this.source = ctx.createMediaElementSource(video);
+    try {
+      this.source = ctx.createMediaElementSource(video);
+    } catch {
+      /* already attached or failed */
+      return;
+    }
     this.splitter = ctx.createChannelSplitter(2);
 
     this.micIn = ctx.createGain();

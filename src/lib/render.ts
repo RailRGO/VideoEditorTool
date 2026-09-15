@@ -923,64 +923,96 @@ function drawCloakedFrame(
     csy = syc0 + (shc0 - csh) / 2;
   }
 
-  // Prepare filtered content into offscreen canvas
-  const tmp = getFisheyeSrcCanvas(Math.max(2, Math.round(cw)), Math.max(2, Math.round(ch)));
-  const tctx = tmp.getContext("2d");
-  if (tctx) {
-    tctx.save();
-    tctx.clearRect(0, 0, tmp.width, tmp.height);
-    const f = buildFilters();
-    tctx.filter = f.length ? f.join(" ") : "none";
-    if (c.flipContent || c.flip) {
-      tctx.translate(tmp.width, 0);
-      tctx.scale(-1, 1);
+  if (fisheyeOn) {
+    // Prepare filtered content into offscreen canvas for fisheye grid mapping
+    const tmp = getFisheyeSrcCanvas(Math.max(2, Math.round(cw)), Math.max(2, Math.round(ch)));
+    const tctx = tmp.getContext("2d");
+    if (tctx) {
+      tctx.save();
+      tctx.clearRect(0, 0, tmp.width, tmp.height);
+      const f = buildFilters();
+      tctx.filter = f.length ? f.join(" ") : "none";
+      if (c.flipContent || c.flip) {
+        tctx.translate(tmp.width, 0);
+        tctx.scale(-1, 1);
+      }
+      try {
+        tctx.drawImage(video, csx, csy, csw, csh, 0, 0, tmp.width, tmp.height);
+      } catch {}
+      tctx.filter = "none";
+      tctx.restore();
     }
-    try {
-      tctx.drawImage(video, csx, csy, csw, csh, 0, 0, tmp.width, tmp.height);
-    } catch {}
-    tctx.filter = "none";
-    tctx.restore();
-  }
 
-  ctx.save();
-  // Clip to content rect with same shape as content layer if available
-  if (layout?.contentStyle) {
-    const rad = (layout.contentStyle.radius ?? 10) * k;
-    shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
-    ctx.clip();
-  } else {
-    ctx.beginPath();
-    ctx.rect(cx, cy, cw, ch);
-    ctx.clip();
-  }
+    ctx.save();
+    // Clip to content rect with same shape as content layer if available
+    if (layout?.contentStyle) {
+      const rad = (layout.contentStyle.radius ?? 10) * k;
+      shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
+      ctx.clip();
+    } else {
+      ctx.beginPath();
+      ctx.rect(cx, cy, cw, ch);
+      ctx.clip();
+    }
 
-  if (fisheyeOn && tmp) {
     drawFisheyeGrid(ctx, tmp, cx, cy, cw, ch, fisheyeAmt, c.rotate ?? 0);
+
+    if (c.grain > 0.5) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+      const tile = getNoiseTile();
+      const pat = ctx.createPattern(tile, "repeat");
+      if (pat) {
+        ctx.fillStyle = pat;
+        ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+        ctx.fillRect(cx, cy, cw + tile.width, ch + tile.height);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
   } else {
-    // no fisheye: rotate around content center
+    // Direct content draw with transforms & filters
+    ctx.save();
+    if (layout?.contentStyle) {
+      const rad = (layout.contentStyle.radius ?? 10) * k;
+      shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
+      ctx.clip();
+    } else {
+      ctx.beginPath();
+      ctx.rect(cx, cy, cw, ch);
+      ctx.clip();
+    }
+
     if (Math.abs(c.rotate ?? 0) > 0.05) {
       ctx.translate(cx + cw / 2, cy + ch / 2);
       ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
       ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
     }
+    if (c.flipContent || c.flip) {
+      ctx.translate(cx * 2 + cw, 0);
+      ctx.scale(-1, 1);
+    }
+    const f = buildFilters();
+    ctx.filter = f.length ? f.join(" ") : "none";
     try {
-      ctx.drawImage(tmp, cx, cy, cw, ch);
+      ctx.drawImage(video, csx, csy, csw, csh, cx, cy, cw, ch);
     } catch {}
-  }
+    ctx.filter = "none";
 
-  if (c.grain > 0.5) {
-    ctx.save();
-    ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
-    const tile = getNoiseTile();
-    const pat = ctx.createPattern(tile, "repeat");
-    if (pat) {
-      ctx.fillStyle = pat;
-      ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
-      ctx.fillRect(cx, cy, cw + tile.width, ch + tile.height);
+    if (c.grain > 0.5) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
+      const tile = getNoiseTile();
+      const pat = ctx.createPattern(tile, "repeat");
+      if (pat) {
+        ctx.fillStyle = pat;
+        ctx.translate(-Math.random() * tile.width, -Math.random() * tile.height);
+        ctx.fillRect(cx, cy, cw + tile.width, ch + tile.height);
+      }
+      ctx.restore();
     }
     ctx.restore();
   }
-  ctx.restore();
 
   // 3) Full-frame overlays (bars, border, vignette) — always on top, not content-only
   if (c.vignette > 0.5) {
