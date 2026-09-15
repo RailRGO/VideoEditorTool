@@ -158,6 +158,8 @@ const RIGHT_TABS: Record<Target, { id: string; label: string }[]> = {
   ],
 };
 
+const AUTOSAVE_KEY = "reaction-studio:autosave:v1";
+
 export default function App() {
   /* ---------------------------------------------------------------- refs */
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -170,6 +172,7 @@ export default function App() {
   const chunksRef = useRef<Blob[]>([]);
   const objectUrl = useRef<string | null>(null);
   const timeRef = useRef({ src: 0, out: 0 });
+  const fileNameRef = useRef("");
   const lastProgress = useRef(0);
   const lastFastDb = useRef(0);
   const trackStatusRef = useRef<TrackStatus>("idle");
@@ -193,6 +196,11 @@ export default function App() {
 
   /* --------------------------------------------------------------- state */
   const [fileName, setFileName] = useState("");
+  const [lastAutosaveInfo, setLastAutosaveInfo] = useState<{
+    savedAt: string;
+    sourceFile: string;
+    segmentCount: number;
+  } | null>(null);
   const [duration, setDuration] = useState(0);
   const [dims, setDims] = useState({ w: 0, h: 0 });
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -748,6 +756,21 @@ export default function App() {
       cv.width = 1280;
       cv.height = 720;
     }
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as Record<string, unknown>;
+        if (p.app === "reaction-studio" && typeof p.savedAt === "string") {
+          setLastAutosaveInfo({
+            savedAt: p.savedAt,
+            sourceFile: String(p.sourceFile || "Untitled"),
+            segmentCount: Array.isArray(p.segments) ? p.segments.length : 0,
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   useEffect(() => {
@@ -783,15 +806,28 @@ export default function App() {
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
-    if (!v || !durRef.current || scanningRef.current) return;
+    if (!v || scanningRef.current) return;
+    const d = durRef.current || v.duration || 0;
+    if (!d) return;
+    if (durRef.current <= 0 && d > 0) {
+      durRef.current = d;
+      setDuration(d);
+    }
     engine().resume();
-    if (v.paused) {
-      void v.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    if (v.paused || v.ended) {
+      if (v.currentTime >= d - 0.05) {
+        v.currentTime = 0;
+        seekSrc(0);
+      }
+      void v.play().then(() => setPlaying(true)).catch((err) => {
+        console.warn("Video play failed:", err);
+        setPlaying(false);
+      });
     } else {
       v.pause();
       setPlaying(false);
     }
-  }, []);
+  }, [seekSrc]);
 
   const finish = useCallback(() => {
     exportingRef.current = false;
@@ -841,7 +877,7 @@ export default function App() {
       raf = requestAnimationFrame(loop);
       const v = videoRef.current;
       const cv = previewRef.current;
-      if (!v || !cv || !v.videoWidth || v.readyState < 2) return;
+      if (!v || !cv || !v.videoWidth || v.readyState < 1) return;
 
       const segs = segsRef.current;
       const lay = layoutRef.current;
@@ -1080,7 +1116,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (e.code === "Space") {
+      if (e.code === "Space" || e.key === " " || e.keyCode === 32) {
         e.preventDefault();
         if (e.repeat) return;
         // Space on a focused <button> would also fire that button's native
@@ -1135,12 +1171,14 @@ export default function App() {
     if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
     const url = URL.createObjectURL(f);
     objectUrl.current = url;
+    fileNameRef.current = f.name;
     setFileName(f.name);
     setResult(null);
     setEnv(null);
     setDetection(null);
     setTranscript(null);
     setPlaying(false);
+    v.removeAttribute("crossOrigin");
     v.src = url;
     v.muted = false;
     v.volume = 1;
@@ -1150,10 +1188,12 @@ export default function App() {
 
   const onMeta = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     const v = e.currentTarget;
-    const d = v.duration || 0;
-    setDuration(d);
+    const d = (Number.isFinite(v.duration) && v.duration > 0) ? v.duration : 0;
+    if (d > 0) {
+      setDuration(d);
+      durRef.current = d;
+    }
     setDims({ w: v.videoWidth, h: v.videoHeight });
-    durRef.current = d;
     const asp = v.videoWidth / Math.max(1, v.videoHeight);
     if (targetRef.current === "patreon") {
       setLayoutH((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
@@ -1163,19 +1203,18 @@ export default function App() {
     clearHistory();
     setSelectedId(null);
     // offer to restore an autosaved edit of this exact file
+    const curName = fileNameRef.current || fileName;
     try {
       const raw = localStorage.getItem(AUTOSAVE_KEY);
       if (raw) {
         const p = JSON.parse(raw) as Record<string, unknown>;
-        const sameFile =
-          p.app === "reaction-studio" &&
-          fileName !== "" &&
-          p.sourceFile === fileName &&
-          Math.abs(Number(p.sourceDuration ?? NaN) - d) < 1.5;
-        if (sameFile && typeof p.savedAt === "string") {
+        const sameName = Boolean(curName && p.sourceFile === curName);
+        const sameDuration = d > 0 && Math.abs(Number(p.sourceDuration ?? NaN) - d) < 2.0;
+        const isMatch = p.app === "reaction-studio" && (sameName || sameDuration);
+        if (isMatch && typeof p.savedAt === "string") {
           const savedAt = p.savedAt;
-          const sourceFile = String(p.sourceFile);
-          setRestoreOffer((o) => o ?? { savedAt, sourceFile });
+          const sourceFile = String(p.sourceFile || curName);
+          setRestoreOffer({ savedAt, sourceFile });
         }
       }
     } catch {
@@ -1211,6 +1250,7 @@ export default function App() {
           const v = videoRef.current;
           if (!v) return;
           setProxyEta(0);
+          fileNameRef.current = st.info.path;
           setFileName(st.info.path);
           setResult(null);
           setEnv(null);
@@ -1219,6 +1259,7 @@ export default function App() {
           setPlaying(false);
           setPreviewBus("mix");
           // cache-bust so a re-transcoded proxy is never served stale
+          v.crossOrigin = "anonymous";
           v.src = `${client.proxyUrl()}?t=${Date.now()}`;
           v.muted = false;
           v.volume = 1;
@@ -1248,6 +1289,7 @@ export default function App() {
       setPreviewBus(bus);
       busSwitchRef.current = { time: v.currentTime };
       v.pause();
+      v.crossOrigin = "anonymous";
       v.src = `${client.proxyUrl(bus)}?t=${Date.now()}`;
       v.load();
     },
@@ -1861,8 +1903,8 @@ export default function App() {
     app: "reaction-studio" as const,
     version: 6,
     savedAt: new Date().toISOString(),
-    sourceFile: fileName,
-    sourceDuration: duration,
+    sourceFile: fileNameRef.current || fileName,
+    sourceDuration: durRef.current || duration,
     target,
     segments,
     claims,
@@ -1880,6 +1922,7 @@ export default function App() {
     leadCfg,
     res,
     fps,
+    transcript: transcript ?? undefined,
   });
 
   /** Apply a parsed project object (file load or autosave restore). */
@@ -1900,28 +1943,54 @@ export default function App() {
           ? { card: s.card as Segment["card"] }
           : {}),
       }));
-      setSegments(durRef.current > 0 ? normalize(clean, durRef.current) : clean);
+      const d = durRef.current > 0 ? durRef.current : Number(p.sourceDuration) || 0;
+      const normalized = d > 0 ? normalize(clean, d) : clean;
+      setSegments(normalized);
+      segsRef.current = normalized;
       clearHistory();
     }
     if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
-    if (p.layout) setLayout(p.layout as LayoutState);
-    if (p.audio) setAudio(p.audio as AudioState);
-    if (p.retouch) setRetouch(p.retouch as Retouch);
+    if (p.layout) {
+      setLayout(p.layout as LayoutState);
+      layoutRef.current = p.layout as LayoutState;
+    }
+    if (p.audio) {
+      setAudio(p.audio as AudioState);
+      audioRef.current = p.audio as AudioState;
+      engine().update(p.audio as AudioState);
+    }
+    if (p.retouch) {
+      setRetouch(p.retouch as Retouch);
+      retouchRef.current = p.retouch as Retouch;
+    }
     if (p.audioCloak) {
       const ac = p.audioCloak as Partial<AudioCloak>;
       // v5 and older had no voiceTarget: the voice changer was mic-only, so
       // an old project keeps meaning that instead of silently re-voicing the
       // show (the new default is "content")
       const legacyVoice = ac.voiceChanger === true && !ac.voiceTarget;
-      setAudioCloak({
+      const merged = {
         ...defaultAudioCloak,
         ...ac,
         ...(legacyVoice ? { voiceTarget: "mic" as const } : {}),
-      } as AudioCloak);
+      } as AudioCloak;
+      setAudioCloak(merged);
+      audioCloakRef.current = merged;
+      engine().updateCloak(merged);
     }
-    if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
-    if (p.sticker) setSticker({ ...defaultSticker, ...(p.sticker as Sticker) });
-    if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
+    if (p.videoCloak) {
+      setVideoCloak(p.videoCloak as VideoCloak);
+      videoCloakRef.current = p.videoCloak as VideoCloak;
+    }
+    if (p.sticker) {
+      const st = { ...defaultSticker, ...(p.sticker as Sticker) };
+      setSticker(st);
+      stickerRef.current = st;
+    }
+    if (p.cutOpts) {
+      setCutOpts(p.cutOpts as CutOptions);
+      cutRef.current = p.cutOpts as CutOptions;
+    }
     if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
     if (p.fairUseOpts)
       setFairUseOpts({ ...defaultFairUse, ...(p.fairUseOpts as FairUseOptions) });
@@ -1930,8 +1999,12 @@ export default function App() {
     if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
     if (p.res === 720 || p.res === 1080) setRes(p.res);
     if (p.fps === 24 || p.fps === 30 || p.fps === 60) setFps(p.fps);
+    if (p.transcript && typeof p.transcript === "object" && Array.isArray((p.transcript as Transcript).words)) {
+      setTranscript(p.transcript as Transcript);
+    } else {
+      setTranscript(null);
+    }
     setSelectedId(null);
-    setTranscript(null);
     return null;
   }, [switchTarget, clearHistory]);
 
@@ -1946,7 +2019,7 @@ export default function App() {
     setProjectMsg(`Saved ${segments.length} segments + all settings.`);
   }, [
     fileName, duration, target, segments, claims, layout, audio, retouch,
-    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps, transcript,
   ]);
 
   const loadProjectFile = useCallback(
@@ -1977,14 +2050,18 @@ export default function App() {
   );
 
   /* ------------------------------------------------------- autosave */
-  const AUTOSAVE_KEY = "reaction-studio:autosave:v1";
-
   /** Debounced: the whole edit lands in localStorage ~1.5 s after it stops. */
   useEffect(() => {
     if (!duration || !segments.length) return;
     const t = window.setTimeout(() => {
       try {
-        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(projectData()));
+        const data = projectData();
+        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(data));
+        setLastAutosaveInfo({
+          savedAt: data.savedAt,
+          sourceFile: String(data.sourceFile || "Untitled"),
+          segmentCount: data.segments.length,
+        });
       } catch {
         /* storage unavailable — manual save still works */
       }
@@ -1992,10 +2069,10 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [
     duration, segments, claims, fileName, target, layout, audio, retouch,
-    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps,
+    audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps, transcript,
   ]);
 
-  const doRestore = () => {
+  const doRestore = useCallback(() => {
     try {
       const raw = localStorage.getItem(AUTOSAVE_KEY);
       if (!raw) throw new Error("empty");
@@ -2006,7 +2083,7 @@ export default function App() {
       setProjectMsg("Could not read the autosaved edit.");
     }
     setRestoreOffer(null);
-  };
+  }, [applyProject]);
 
   /* -------------------------------------------------------------- render */
   const startExport = async () => {
@@ -2676,6 +2753,18 @@ export default function App() {
                     Choose a video file
                   </Btn>
                 )}
+
+                {!isRemote && lastAutosaveInfo && (
+                  <div className="mt-4 rounded-xl border border-emerald-400/25 bg-emerald-500/10 p-2.5 text-left text-[11px] text-emerald-200">
+                    <p className="font-semibold text-white">Previous autosaved session found</p>
+                    <p className="text-slate-400 mt-0.5 truncate">
+                      “{lastAutosaveInfo.sourceFile}” ({new Date(lastAutosaveInfo.savedAt).toLocaleString()})
+                    </p>
+                    <p className="text-slate-500 text-[10px] mt-0.5">
+                      Open that video to restore your {lastAutosaveInfo.segmentCount} segments and settings.
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -2895,6 +2984,7 @@ export default function App() {
                 mime={mime}
                 onSaveProject={saveProject}
                 onLoadProject={loadProjectFile}
+                onRestoreAutosave={doRestore}
                 projectMsg={projectMsg}
                 passthrough={isYT}
                 partTarget={partTarget}
@@ -2958,8 +3048,26 @@ export default function App() {
         className="pointer-events-none fixed -left-[9999px] top-0 h-1 w-1"
         playsInline
         preload="auto"
-        crossOrigin="anonymous"
         onLoadedMetadata={onMeta}
+        onLoadedData={() => {
+          const v = videoRef.current;
+          if (v && v.videoWidth && v.videoHeight) {
+            setDims({ w: v.videoWidth, h: v.videoHeight });
+          }
+        }}
+        onDurationChange={(e) => {
+          const v = e.currentTarget;
+          if (v.duration && Number.isFinite(v.duration) && v.duration > 0) {
+            setDuration(v.duration);
+            durRef.current = v.duration;
+          }
+        }}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => {
+          setPlaying(false);
+          finish();
+        }}
         onError={() => setFileName((n) => n)}
       />
       <canvas

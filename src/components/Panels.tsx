@@ -740,6 +740,7 @@ export function ExportPanel({
   mime,
   onSaveProject,
   onLoadProject,
+  onRestoreAutosave,
   projectMsg,
   passthrough = false,
   remote = null,
@@ -769,6 +770,7 @@ export function ExportPanel({
   mime: string;
   onSaveProject: () => void;
   onLoadProject: (f: File) => void;
+  onRestoreAutosave?: () => void;
   projectMsg: string;
   /** YouTube: the render is a straight cut of the finished file (no resizing) */
   passthrough?: boolean;
@@ -805,6 +807,11 @@ export function ExportPanel({
           <Btn className="flex-1" onClick={() => projectRef.current?.click()}>
             Load project
           </Btn>
+          {onRestoreAutosave && (
+            <Btn className="flex-1" onClick={onRestoreAutosave}>
+              Restore autosave
+            </Btn>
+          )}
           <input
             ref={projectRef}
             type="file"
