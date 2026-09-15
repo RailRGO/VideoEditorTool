@@ -34,6 +34,7 @@ import {
   contentPicture,
   pickRecorderMime,
   renderScene,
+  setStickerResolver,
   sourceHalves,
 } from "./lib/render";
 import {
@@ -159,6 +160,8 @@ const RIGHT_TABS: Record<Target, { id: string; label: string }[]> = {
 };
 
 const AUTOSAVE_KEY = "reaction-studio:autosave:v1";
+/** ?backend=<tunnel url> — kept in the address bar so a refresh reconnects */
+const BACKEND_PARAM = "backend";
 
 export default function App() {
   /* ---------------------------------------------------------------- refs */
@@ -186,11 +189,20 @@ export default function App() {
     layout: null as LayoutState | null,
     cloak: null as VideoCloak | null,
     retouch: null as Retouch | null,
+    sticker: null as Sticker | null,
     face: false,
     img: -1,
   });
   /** when the proxy transcode made its first measurable progress */
   const proxyStartRef = useRef(0);
+  /** play was pressed before the file's metadata arrived — start when it does */
+  const pendingPlay = useRef(false);
+  /** a new source is loading: don't autosave the outgoing one over it */
+  const loadingSource = useRef(false);
+  /** playback watchdog: last src time we saw move, and how many nudges we gave */
+  const stallRef = useRef({ at: 0, t: -1, nudges: 0 });
+  /** always-fresh autosave writer (assigned every render) */
+  const writeAutosaveRef = useRef<() => void>(() => {});
 
   const engine = () => (engineRef.current ??= new AudioEngine());
 
@@ -201,6 +213,10 @@ export default function App() {
     sourceFile: string;
     segmentCount: number;
   } | null>(null);
+  /** why the last autosave was not a plain success (storage full, …) */
+  const [autosaveNote, setAutosaveNote] = useState("");
+  /** why the preview could not start — shown over the stage, never silent */
+  const [playNote, setPlayNote] = useState("");
   const [duration, setDuration] = useState(0);
   const [dims, setDims] = useState({ w: 0, h: 0 });
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -804,30 +820,131 @@ export default function App() {
     timeRef.current.out = srcToOut(segsRef.current, v.currentTime, layoutRef.current.fastSpeed);
   }, []);
 
+  /**
+   * Build the audio graph on a real user gesture.
+   *
+   * This used to happen in `onLoadedMetadata`, which is *not* a gesture, so
+   * the AudioContext was born suspended — and a media element wired into a
+   * suspended context is held back by the browser: `play()` resolved, the
+   * button flipped to pause, and the picture never moved. Creating it here
+   * (first play / scan / render — all clicks or key presses) starts it
+   * running, and `unlock()` below guarantees it before we ask to play.
+   */
+  const ensureAudio = useCallback((v: HTMLVideoElement) => {
+    const eng = engine();
+    const had = eng.ready;
+    eng.attach(v, audioRef.current.mic.channel);
+    if (!had && eng.ready) {
+      eng.setDirect(targetRef.current === "youtube" || !!remoteRef.current);
+      eng.update(audioRef.current);
+      eng.updateCloak(audioCloakRef.current);
+    }
+    eng.resume();
+    return eng;
+  }, []);
+
+  /** Resolve when a pending seek settles — a seek in flight aborts play(). */
+  const waitSeek = useCallback((v: HTMLVideoElement) => {
+    if (!v.seeking) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        v.removeEventListener("seeked", done);
+        window.clearTimeout(timer);
+        resolve();
+      };
+      const timer = window.setTimeout(done, 1500);
+      v.addEventListener("seeked", done);
+    });
+  }, []);
+
+  /**
+   * Ask the preview element to play, working around the three ways browsers
+   * refuse: a suspended AudioContext, a seek still in flight, and the
+   * not-allowed-by-autoplay-policy rejection. Returns false only when the
+   * picture genuinely cannot move; `playNote` then says why.
+   */
+  const startPlayback = useCallback(
+    async (v: HTMLVideoElement): Promise<boolean> => {
+      const eng = ensureAudio(v);
+      await eng.unlock();
+      await waitSeek(v);
+      try {
+        await v.play();
+        setPlayNote("");
+        return true;
+      } catch (err) {
+        const name = err instanceof DOMException ? err.name : "Error";
+        if (name === "AbortError") {
+          // a seek landed on top of us — one more go is almost always enough
+          try {
+            await v.play();
+            setPlayNote("");
+            return true;
+          } catch (e2) {
+            setPlayNote(
+              `Playback was interrupted (${
+                e2 instanceof DOMException ? e2.name : "error"
+              }). Press play again.`
+            );
+            return false;
+          }
+        }
+        // last resort: give the element its own audio back and try again
+        await eng.bypass();
+        try {
+          await v.play();
+          setPlayNote(
+            "Playing without the audio mix — the browser blocked the audio graph. Reload the page to get it back."
+          );
+          return true;
+        } catch {
+          /* fall through to the message below */
+        }
+        setPlayNote(
+          name === "NotAllowedError"
+            ? "The browser blocked playback — press play once more (it nearly always works on the second press)."
+            : `Playback could not start (${name}). Check the preview file and press play again.`
+        );
+        return false;
+      }
+    },
+    [ensureAudio, waitSeek]
+  );
+
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
     if (!v || scanningRef.current) return;
-    const d = durRef.current || v.duration || 0;
-    if (!d) return;
+    const vd = Number.isFinite(v.duration) ? v.duration : 0;
+    const d = durRef.current || vd || 0;
+    if (!d) {
+      // metadata hasn't landed yet — remember the request and start on arrival
+      pendingPlay.current = true;
+      setPlayNote("Waiting for the video…");
+      return;
+    }
     if (durRef.current <= 0 && d > 0) {
       durRef.current = d;
       setDuration(d);
     }
-    engine().resume();
+    setPlayNote("");
     if (v.paused || v.ended) {
-      if (v.currentTime >= d - 0.05) {
+      // parked at the very end, or inside a cut that runs to it: start over
+      // instead of playing one frame and stopping
+      const tail = activeSegment(segsRef.current, v.currentTime);
+      const stuck = v.ended || v.currentTime >= d - 0.05 ||
+        (!!tail && tail.type === "cut" && v.currentTime >= tail.end - 0.05);
+      if (stuck) {
         v.currentTime = 0;
-        seekSrc(0);
+        timeRef.current.src = 0;
+        timeRef.current.out = 0;
       }
-      void v.play().then(() => setPlaying(true)).catch((err) => {
-        console.warn("Video play failed:", err);
-        setPlaying(false);
-      });
+      stallRef.current = { at: 0, t: -1, nudges: 0 };
+      void startPlayback(v).then((ok) => setPlaying(ok));
     } else {
       v.pause();
       setPlaying(false);
     }
-  }, [seekSrc]);
+  }, [startPlayback]);
 
   const finish = useCallback(() => {
     exportingRef.current = false;
@@ -918,8 +1035,33 @@ export default function App() {
         lay !== lastDrawRef.current.layout ||
         videoCloakRef.current !== lastDrawRef.current.cloak ||
         retouchRef.current !== lastDrawRef.current.retouch ||
+        stickerRef.current !== lastDrawRef.current.sticker ||
         showFaceBoxRef.current !== lastDrawRef.current.face ||
         imgEpoch !== lastDrawRef.current.img;
+
+      // ---- playback watchdog ---------------------------------------------
+      // Some engines report `paused === false` and still refuse to advance
+      // (a tunnel stall, a context that never really resumed). Rather than
+      // leaving a frozen preview, nudge play() a couple of times and then
+      // say so out loud.
+      if (!v.paused && !v.ended && !v.seeking && !scanningRef.current) {
+        const st = stallRef.current;
+        if (Math.abs(v.currentTime - st.t) > 1e-3) {
+          st.t = v.currentTime;
+          st.at = now;
+          st.nudges = 0;
+        } else if (st.at && now - st.at > 1500 && st.nudges < 3 && v.readyState >= 3) {
+          st.nudges += 1;
+          st.at = now + 1000;
+          void v.play().catch(() => {});
+        } else if (st.at && now - st.at > 6000 && st.nudges >= 3) {
+          setPlaying(false);
+          setPlayNote(
+            "The preview stopped moving — the stream may have stalled. Scrub the timeline to wake it, or reconnect the backend."
+          );
+          st.at = 0;
+        }
+      }
       const busy = exportingRef.current || scanningRef.current;
       const throttled =
         (continuous || busy) && !exportingRef.current && !scanningRef.current &&
@@ -932,6 +1074,7 @@ export default function App() {
         lastDrawRef.current.layout = lay;
         lastDrawRef.current.cloak = videoCloakRef.current;
         lastDrawRef.current.retouch = retouchRef.current;
+        lastDrawRef.current.sticker = stickerRef.current;
         lastDrawRef.current.face = showFaceBoxRef.current;
         lastDrawRef.current.img = imgEpoch;
 
@@ -1176,8 +1319,12 @@ export default function App() {
     setResult(null);
     setEnv(null);
     setDetection(null);
-    setTranscript(null);
     setPlaying(false);
+    setPlayNote("");
+    // the transcript is deliberately NOT cleared here: opening the same file
+    // again keeps the words (onMeta drops them when the file really differs),
+    // and autosave is held off until this source's metadata has landed
+    loadingSource.current = true;
     v.removeAttribute("crossOrigin");
     v.src = url;
     v.muted = false;
@@ -1202,39 +1349,86 @@ export default function App() {
     setSegments((s) => (s.length ? normalize(s, d) : defaultSegments(d)));
     clearHistory();
     setSelectedId(null);
-    // offer to restore an autosaved edit of this exact file
+    // Match an autosaved edit of this exact file. The transcript is the
+    // expensive part (a whisper pass over the whole recording), so it comes
+    // back with the file instead of waiting for the Restore banner — and it
+    // is dropped only when the file really is a different one.
     const curName = fileNameRef.current || fileName;
+    let saved: Record<string, unknown> | null = null;
     try {
       const raw = localStorage.getItem(AUTOSAVE_KEY);
-      if (raw) {
-        const p = JSON.parse(raw) as Record<string, unknown>;
-        const sameName = Boolean(curName && p.sourceFile === curName);
-        const sameDuration = d > 0 && Math.abs(Number(p.sourceDuration ?? NaN) - d) < 2.0;
-        const isMatch = p.app === "reaction-studio" && (sameName || sameDuration);
-        if (isMatch && typeof p.savedAt === "string") {
-          const savedAt = p.savedAt;
-          const sourceFile = String(p.sourceFile || curName);
-          setRestoreOffer({ savedAt, sourceFile });
-        }
-      }
+      if (raw) saved = JSON.parse(raw) as Record<string, unknown>;
     } catch {
-      /* corrupted autosave — ignore */
+      saved = null;
+    }
+    const matched =
+      !!saved &&
+      saved.app === "reaction-studio" &&
+      (Boolean(curName && saved.sourceFile === curName) ||
+        (d > 0 && Math.abs(Number(saved.sourceDuration ?? NaN) - d) < 2.0));
+    if (matched && saved && typeof saved.savedAt === "string") {
+      setRestoreOffer({
+        savedAt: saved.savedAt,
+        sourceFile: String(saved.sourceFile || curName),
+      });
+      const tr = saved.transcript as Transcript | undefined;
+      if (tr && Array.isArray(tr.words) && tr.words.length) {
+        setTranscript(tr);
+        setProjectMsg(
+          `Transcript restored — ${tr.words.length.toLocaleString()} words` +
+            (tr.source ? ` (${tr.source})` : "") +
+            ". Restore brings the whole edit back."
+        );
+      }
+    } else {
+      // a different file: the old words belong to something else
+      setTranscript(null);
     }
     try {
-      // the remote preview stream is always a mix, even in Patreon mode
+      // the remote preview stream is always a mix, even in Patreon mode.
+      // The graph itself is built on the first real gesture (see
+      // ensureAudio) — a context created here would be born suspended and
+      // hold the element back.
       engine().setDirect(targetRef.current === "youtube" || !!remoteRef.current);
-      engine().attach(v, audioRef.current.mic.channel);
       engine().update(audioRef.current);
       engine().updateCloak(audioCloakRef.current);
     } catch {
-      /* audio graph already bound to this element */
+      /* audio graph not ready yet */
     }
     // a bus swap reloads the same file — restore the playhead instead of top
     const bs = busSwitchRef.current;
     busSwitchRef.current = null;
     if (bs) v.currentTime = bs.time;
     else seekSrc(0);
+    // the source is fully known: autosave may write again
+    loadingSource.current = false;
+    // …and a play pressed while it was loading can finally start
+    if (pendingPlay.current) {
+      pendingPlay.current = false;
+      setPlayNote("");
+      void startPlayback(v).then((ok) => setPlaying(ok));
+    }
   };
+
+  /* one-click connect: the notebook prints a link with ?backend=<tunnel url> */
+  /**
+   * Keep `?backend=` in the address bar.
+   *
+   * It used to be stripped on connect, which meant a refresh (or a crash, or
+   * the runtime being reclaimed) dropped you back to "paste the tunnel URL
+   * from the notebook" — a round trip to Colab for every reload. Now the
+   * link stays shareable and self-healing.
+   */
+  const syncBackendParam = useCallback((url: string) => {
+    try {
+      const u = new URL(window.location.href);
+      if (url) u.searchParams.set(BACKEND_PARAM, url);
+      else u.searchParams.delete(BACKEND_PARAM);
+      window.history.replaceState({}, "", u.toString());
+    } catch {
+      /* non-standard location — nothing to preserve */
+    }
+  }, []);
 
   /* ------------------------------------------------------------- remote */
   /** wait for the preview proxy, then load it into the shared video element */
@@ -1255,9 +1449,12 @@ export default function App() {
           setResult(null);
           setEnv(null);
           setDetection(null);
-          setTranscript(null);
           setPlaying(false);
+          setPlayNote("");
           setPreviewBus("mix");
+          // see loadFile: the transcript survives a reconnect to the same
+          // source, and autosave waits for this file's metadata
+          loadingSource.current = true;
           // cache-bust so a re-transcoded proxy is never served stale
           v.crossOrigin = "anonymous";
           v.src = `${client.proxyUrl()}?t=${Date.now()}`;
@@ -1322,6 +1519,7 @@ export default function App() {
         const st = await client.state();
         if (connectToken.current !== token) return;
         localStorage.setItem("remoteUrl", client.base);
+        syncBackendParam(client.base);
         setRemote(client);
         setRemoteInfo(st);
         try {
@@ -1356,7 +1554,7 @@ export default function App() {
         if (connectToken.current === token) setConnecting(false);
       }
     },
-    [awaitProxy]
+    [awaitProxy, syncBackendParam]
   );
 
   /** rebuild the preview stream after a failed transcode */
@@ -1395,6 +1593,7 @@ export default function App() {
       setProxyProgress(0);
       setProxyEta(0);
       proxyStartRef.current = 0;
+      loadingSource.current = true;
       try {
         await client.setSource(name, folder);
         if (connectToken.current !== token) return;
@@ -1412,7 +1611,7 @@ export default function App() {
         if (connectToken.current === token) setConnecting(false);
       }
     },
-    [awaitProxy]
+    [awaitProxy, syncBackendParam]
   );
 
   const disconnectRemote = useCallback(() => {
@@ -1420,6 +1619,7 @@ export default function App() {
     trToken.current++;
     setTrBusy(false);
     setTranscript(null);
+    syncBackendParam("");
     const v = videoRef.current;
     if (v) {
       v.pause();
@@ -1436,7 +1636,7 @@ export default function App() {
     setDims({ w: 0, h: 0 });
     setSegments([]);
     setPlaying(false);
-  }, []);
+  }, [syncBackendParam]);
 
   const switchEngine = useCallback(
     (m: "local" | "remote") => {
@@ -1463,6 +1663,19 @@ export default function App() {
     },
     [engineMode, disconnectRemote]
   );
+
+  /** the notebook's link (``…?backend=https://…``) connects on load */
+  const autoBackend = useRef(false);
+  useEffect(() => {
+    if (autoBackend.current) return;
+    autoBackend.current = true;
+    const q = new URLSearchParams(window.location.search).get(BACKEND_PARAM);
+    if (q) {
+      setRemoteDraft(q);
+      switchEngine("remote");
+      void connectRemote(q);
+    }
+  }, [connectRemote, switchEngine]);
 
   const startRemoteExport = useCallback(async () => {
     const client = remoteRef.current;
@@ -1570,16 +1783,13 @@ export default function App() {
     };
   }, [remote, remoteJob?.state]);
 
-  /* one-click connect: the notebook prints a link with ?backend=<tunnel url> */
-  const autoBackend = useRef(false);
   useEffect(() => {
     if (autoBackend.current) return;
     autoBackend.current = true;
-    const q = new URLSearchParams(window.location.search).get("backend");
+    const q = new URLSearchParams(window.location.search).get(BACKEND_PARAM);
     if (q) {
       setRemoteDraft(q);
       switchEngine("remote");
-      window.history.replaceState({}, "", window.location.pathname);
       void connectRemote(q);
     }
   }, [connectRemote, switchEngine]);
@@ -1901,7 +2111,9 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 6,
+    // 7 adds the mirroring block (mode / scope / keep-bottom) and the
+    // per-segment `mirror` tick; 6 added the transcript
+    version: 7,
     savedAt: new Date().toISOString(),
     sourceFile: fileNameRef.current || fileName,
     sourceDuration: durRef.current || duration,
@@ -2050,27 +2262,90 @@ export default function App() {
   );
 
   /* ------------------------------------------------------- autosave */
+  /**
+   * Write the edit to localStorage.
+   *
+   * Reassigned every render so the debounced timer always flushes the newest
+   * state. Storage is small (~5 MB) and the overlay image alone can be
+   * bigger than that, so a full write is followed by progressively slimmer
+   * ones — losing the sticker beats losing the timeline — and any problem is
+   * reported instead of being swallowed by an empty catch.
+   */
+  writeAutosaveRef.current = () => {
+    if (!duration || !segments.length || loadingSource.current) return;
+    const full = projectData();
+    type Proj = typeof full;
+    const put = (data: Proj) => {
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(data));
+      setLastAutosaveInfo({
+        savedAt: data.savedAt,
+        sourceFile: String(data.sourceFile || "Untitled"),
+        segmentCount: data.segments.length,
+      });
+    };
+    try {
+      put(full);
+      setAutosaveNote("");
+      return;
+    } catch {
+      /* storage full or unavailable — shed the heavy parts and retry */
+    }
+    const withoutSticker: Proj = {
+      ...full,
+      sticker: { ...full.sticker, src: "" },
+    };
+    try {
+      put(withoutSticker);
+      setAutosaveNote(
+        "Browser storage is full: the edit is saved, but not the overlay image. Use Save project for a complete copy."
+      );
+      return;
+    } catch {
+      /* still too big */
+    }
+    try {
+      put({ ...withoutSticker, transcript: undefined });
+      setAutosaveNote(
+        "Browser storage is full: the edit is saved without the overlay image and the transcript. Use Save project for a complete copy."
+      );
+    } catch {
+      setAutosaveNote(
+        "Autosave failed — browser storage is full. Use Save project to keep this edit."
+      );
+    }
+  };
+
   /** Debounced: the whole edit lands in localStorage ~1.5 s after it stops. */
   useEffect(() => {
     if (!duration || !segments.length) return;
-    const t = window.setTimeout(() => {
-      try {
-        const data = projectData();
-        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(data));
-        setLastAutosaveInfo({
-          savedAt: data.savedAt,
-          sourceFile: String(data.sourceFile || "Untitled"),
-          segmentCount: data.segments.length,
-        });
-      } catch {
-        /* storage unavailable — manual save still works */
-      }
-    }, 1500);
+    const t = window.setTimeout(() => writeAutosaveRef.current(), 1500);
     return () => window.clearTimeout(t);
   }, [
     duration, segments, claims, fileName, target, layout, audio, retouch,
     audioCloak, videoCloak, sticker, cutOpts, transcriptCutOpts, fairUseOpts, polish, disruptRules, leadCfg, res, fps, transcript,
   ]);
+
+  /**
+   * Opening the Render panel is the moment people expect the work to be
+   * safe (it is where the project file lives) — so flush right away instead
+   * of waiting for the debounce, and again when the tab goes away.
+   */
+  useEffect(() => {
+    if (rightTab === "export") writeAutosaveRef.current();
+  }, [rightTab, duration, segments.length]);
+
+  useEffect(() => {
+    const flush = () => writeAutosaveRef.current();
+    const onVis = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   const doRestore = useCallback(() => {
     try {
@@ -2084,6 +2359,46 @@ export default function App() {
     }
     setRestoreOffer(null);
   }, [applyProject]);
+
+  /* ---------------------------------------------------- sticker overlay */
+  /**
+   * In Colab mode the overlay image lives on the notebook — `sticker.src` is
+   * a name there, not a URL the browser can fetch, so the canvas silently
+   * drew nothing. Hand the renderer the same resolver the panel thumbnail
+   * uses and the preview shows what the render will paste in.
+   */
+  useEffect(() => {
+    const client = remoteRef.current;
+    setStickerResolver(client ? (src) => client.fileUrl(src) : null);
+    return () => setStickerResolver(null);
+  }, [remote, engineMode]);
+
+  /* ------------------------------------------------------------ mirroring */
+  /** Tick one block for the content mirror (Cloak tab → Mirroring). */
+  const toggleSegmentMirror = useCallback(
+    (id: string) => {
+      withTxn(
+        segsRef.current.map((s) =>
+          s.id === id ? { ...s, mirror: !s.mirror } : s
+        )
+      );
+    },
+    [withTxn]
+  );
+
+  /** Tick every reaction block at once (or untick them all). */
+  const setAllSegmentMirror = useCallback(
+    (on: boolean) => {
+      withTxn(
+        segsRef.current.map((s) =>
+          s.type === "intro" || s.type === "outro"
+            ? s
+            : { ...s, mirror: on }
+        )
+      );
+    },
+    [withTxn]
+  );
 
   /* -------------------------------------------------------------- render */
   const startExport = async () => {

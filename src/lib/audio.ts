@@ -619,6 +619,58 @@ export class AudioEngine {
     if (this.ctx && this.ctx.state === "suspended") void this.ctx.resume();
   }
 
+  /** true once the graph is built and can carry the element's audio. */
+  get ready(): boolean {
+    return !!this.ctx && !!this.source;
+  }
+
+  /**
+   * Make the context actually run.
+   *
+   * A media element wired into a suspended AudioContext is held back by the
+   * browser — `play()` resolves and the clock never moves — so this has to be
+   * awaited *before* asking the element to play, not kicked off next to it.
+   */
+  async unlock(): Promise<void> {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    if (ctx.state === "running") return;
+    try {
+      await ctx.resume();
+    } catch {
+      /* a rejected resume is not fatal — playback can still start silently */
+    }
+  }
+
+  /**
+   * Last resort: hand the element its own audio back.
+   *
+   * Closing the context detaches the MediaElementAudioSourceNode, so the
+   * preview can start even when the audio graph is what the browser is
+   * unhappy about. The mix (compressor / ducking / cloak) is gone, which is
+   * far better than a preview that will not move at all.
+   */
+  async bypass(): Promise<void> {
+    const ctx = this.ctx;
+    try {
+      this.source?.disconnect();
+    } catch {
+      /* already detached */
+    }
+    this.source = null;
+    this.video = null;
+    this.ctx = null;
+    this.directGain = null;
+    this.splitter = null;
+    if (ctx) {
+      try {
+        await ctx.close();
+      } catch {
+        /* nothing else to do */
+      }
+    }
+  }
+
   /**
    * Pass 1 of the auto-cut: play the recording (fast, silently) and record the
    * RMS of the raw mic channel into fixed-size time bins. Every sample block is

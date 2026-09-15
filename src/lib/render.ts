@@ -1,4 +1,14 @@
-import type { LayerStyle, LayoutState, Rect, Segment, Shape, Sticker, VideoCloak } from "./types";
+import type {
+  LayerStyle,
+  LayoutState,
+  MirrorMode,
+  Rect,
+  Segment,
+  Shape,
+  Sticker,
+  VideoCloak,
+} from "./types";
+import { resolveMirror } from "./types";
 import { fitRect, type FacePose } from "./retouch";
 
 export type SrcRect = { x: number; y: number; w: number; h: number };
@@ -10,6 +20,35 @@ export interface SceneLayer {
   /** the camera layer gets the retouch pipeline applied */
   isCam?: boolean;
 }
+
+/**
+ * Neutral cloak used when only the mirror is on (frame cloak bypassed): every
+ * stage is bit-neutral, so the sole visible effect is the mirror itself.
+ */
+const EMPTY_CLOAK: VideoCloak = {
+  on: false,
+  zoom: 1,
+  bars: 0,
+  border: 0,
+  borderColor: "#0ea5e9",
+  saturate: 100,
+  contrast: 100,
+  brightness: 100,
+  hue: 0,
+  grain: 0,
+  vignette: 0,
+  flip: false,
+  flipContent: false,
+  mirrorMode: "off",
+  mirrorScope: "reaction",
+  mirrorKeepBottom: 0,
+  blur: 0,
+  rotate: 0,
+  speed: 1,
+  contentOnly: true,
+  fisheye: false,
+  fisheyeAmount: 35,
+};
 
 export interface RetouchHook {
   /** Draw the camera into a work canvas and run the beauty stack on it. */
@@ -37,6 +76,14 @@ export interface Scene {
   cardText?: { title?: string; sub?: string; accent?: string; variant?: "full" | "short" };
   /** anti-fingerprint frame treatment (YouTube passthrough only) */
   cloak?: VideoCloak | null;
+  /**
+   * Resolved anti-Content-ID mirror for this frame (YouTube passthrough).
+   * Present even when `cloak` is null — mirroring is its own effect now, so
+   * it still applies with the frame cloak bypassed.
+   */
+  mirror?: { mode: MirrorMode | "legacy"; keepBottom: number } | null;
+  /** whole-picture mirror: the camera corner is restored from a flipped rect */
+  mirrorFrame?: boolean;
   /** user overlay image — reaction spans only (YouTube passthrough) */
   sticker?: Sticker | null;
 }
@@ -257,6 +304,12 @@ export function buildPassthroughScene(
   const solo = type === "intro" || type === "outro";
   const c = solo ? null : cloak && (cloak.on || feOn) ? cloak : null;
   const stick = solo ? null : sticker && sticker.on && sticker.src ? sticker : null;
+  // The mirror is a reaction-part effect of its own: it lands even when the
+  // frame cloak is bypassed, and it follows the per-block ticks when the
+  // scope says so. Intro/outro are always excluded (like every disguise).
+  const mir = solo ? null : resolveMirror(cloak, active);
+  const mirror = mir && mir.mode !== "off" ? mir : null;
+  const mirrorFrame = mirror?.mode === "frame";
   if (type === "card") {
     // YouTube card: keep the full composited frame (camera corner stays
     // visible), cover only the content area of the finished file — the layout
@@ -272,12 +325,14 @@ export function buildPassthroughScene(
       camRect,
       cardText: active?.card,
       cloak: c,
+      mirror,
+      mirrorFrame,
       sticker: stick,
     };
   }
   if (type === "fast")
-    return { bg: null, layers: [layer], mode: "fast", speed, cloak: c, sticker: stick };
-  return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c, sticker: stick };
+    return { bg: null, layers: [layer], mode: "fast", speed, cloak: c, mirror, mirrorFrame, sticker: stick };
+  return { bg: null, layers: [layer], mode: "body", speed: 1, cloak: c, mirror, mirrorFrame, sticker: stick };
 }
 
 /** Clip/stroke path for any of the supported layer shapes. */
@@ -389,23 +444,52 @@ function getCardImage(url: string): HTMLImageElement | null {
 
 /** User sticker overlays (subscribe / like images) — same cache/epoch idea. */
 const stickerImgCache = new Map<string, { img: HTMLImageElement; ready: boolean }>();
+
+/**
+ * Colab mode keeps the overlay image on the notebook: `sticker.src` is a name
+ * on the server ("subscribe.png"), not something the browser can fetch — the
+ * canvas silently drew nothing and the preview looked broken while the panel
+ * happily showed the uploaded thumbnail. The app installs a resolver that
+ * turns the stored name into a URL the browser can actually load, so the
+ * preview shows exactly what the ffmpeg render will paste in.
+ */
+let stickerResolver: ((src: string) => string) | null = null;
+export function setStickerResolver(fn: ((src: string) => string) | null) {
+  const next = fn ?? null;
+  if (next === stickerResolver) return;
+  stickerResolver = next;
+  stickerImgCache.clear();
+  cardImgEpoch++; // force one repaint with the newly resolvable source
+}
+/** What the browser will actually load for `sticker.src` right now. */
+export function stickerPreviewUrl(src: string): string {
+  if (!src) return "";
+  if (/^(data|blob|https?):/i.test(src)) return src;
+  return stickerResolver ? stickerResolver(src) : src;
+}
+
 function getStickerImage(src: string): HTMLImageElement | null {
-  let e = stickerImgCache.get(src);
+  const url = stickerPreviewUrl(src);
+  if (!url) return null;
+  let e = stickerImgCache.get(url);
   if (!e) {
     if (stickerImgCache.size > 12) stickerImgCache.clear();
     const img = new Image();
+    // a notebook-hosted image is cross-origin: ask for CORS so the preview
+    // canvas stays readable (the card needs getImageData on it)
+    if (/^https?:/i.test(url)) img.crossOrigin = "anonymous";
     e = { img, ready: false };
-    stickerImgCache.set(src, e);
+    stickerImgCache.set(url, e);
     img.onload = () => {
-      const cur = stickerImgCache.get(src);
+      const cur = stickerImgCache.get(url);
       if (cur) cur.ready = true;
       cardImgEpoch++; // same repaint trigger as card images
     };
     img.onerror = () => {
-      stickerImgCache.delete(src);
+      stickerImgCache.delete(url);
       cardImgEpoch++;
     };
-    img.src = src;
+    img.src = url;
   }
   return e.ready && e.img.naturalWidth > 0 ? e.img : null;
 }
@@ -759,11 +843,27 @@ function drawCloakedFrame(
   H: number,
   c: VideoCloak,
   contentRect?: Rect,
-  layout?: LayoutState
+  layout?: LayoutState,
+  mirror?: Scene["mirror"]
 ) {
   const k = H / 1080;
   const cr = contentRect ?? layout?.content ?? { x: 0.294, y: 0.289, w: 0.7, h: 0.7 };
   const contentOnly = c.contentOnly ?? true;
+
+  /**
+   * Mirroring, resolved for this frame:
+   *  - "frame"   → the whole finished picture is flipped (camera included),
+   *  - "content" → only the watched programme, so the camera corner and the
+   *                card text stay readable,
+   *  - "legacy"  → projects saved before v7: the old `flip` flag mirrored the
+   *                whole frame on the legacy (contentOnly=false) path and the
+   *                content rect everywhere else. Kept bit-for-bit.
+   */
+  const legacyWhole = mirror?.mode === "legacy" && !contentOnly;
+  const frameFlip = mirror?.mode === "frame" || legacyWhole;
+  const contentFlip = mirror?.mode === "content" || (mirror?.mode === "legacy" && contentOnly);
+  /** fraction of the content height left as recorded at the bottom (subtitles) */
+  const keepBottom = contentFlip ? Math.max(0, Math.min(0.6, mirror?.keepBottom ?? 0)) : 0;
 
   const buildFilters = () => {
     const f: string[] = [];
@@ -805,8 +905,8 @@ function drawCloakedFrame(
         tctx.clearRect(0, 0, W, H);
         const f = buildFilters();
         tctx.filter = f.length ? f.join(" ") : "none";
-        // handle flip as hflip in tmp
-        if (c.flipContent || c.flip) {
+        // handle the whole-picture flip as hflip in tmp
+        if (frameFlip) {
           tctx.translate(W, 0);
           tctx.scale(-1, 1);
         }
@@ -845,7 +945,7 @@ function drawCloakedFrame(
       }
       const dx = (W - zw) / 2;
       const dy = (H - zh) / 2;
-      if (c.flipContent || c.flip) {
+      if (frameFlip) {
         ctx.translate(dx * 2 + zw, 0);
         ctx.scale(-1, 1);
       }
@@ -868,6 +968,34 @@ function drawCloakedFrame(
         }
         ctx.restore();
       }
+      ctx.restore();
+    }
+
+    // Content-only mirror on the legacy path: re-draw the programme flipped
+    // on top of the finished frame, clipped to the content box (and to the
+    // part above the subtitle strip when one is kept).
+    if (contentFlip) {
+      const cx = cr.x * W;
+      const cy = cr.y * H;
+      const cw = cr.w * W;
+      const ch = cr.h * H;
+      const dx = (W - zw) / 2;
+      const dy = (H - zh) / 2;
+      ctx.save();
+      // clip in unflipped coordinates: the content box, minus the strip at
+      // the bottom that has to stay exactly as recorded
+      ctx.beginPath();
+      ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
+      ctx.clip();
+      // …then redraw the very same zoomed frame flipped over its own centre
+      ctx.translate(dx * 2 + zw, 0);
+      ctx.scale(-1, 1);
+      const f = buildFilters();
+      ctx.filter = f.length ? f.join(" ") : "none";
+      try {
+        ctx.drawImage(video, sx, sy, sw, sh, dx, dy, zw, zh);
+      } catch {}
+      ctx.filter = "none";
       ctx.restore();
     }
 
@@ -894,14 +1022,22 @@ function drawCloakedFrame(
   }
 
   // Content-only path (default): camera stays untouched, content gets disguised
-  // 1) Base full frame, unflipped (the full-frame mirror goes on the
-  // finished frame at the end of renderScene, like the ffmpeg export)
+  // 1) Base full frame. A whole-picture mirror goes here, on the source
+  // pixels, so the camera corner and the card stay where the ffmpeg export
+  // puts them (the export flips the trimmed frame before overlaying them).
+  ctx.save();
+  if (frameFlip) {
+    ctx.translate(W, 0);
+    ctx.scale(-1, 1);
+  }
   try {
     ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, W, H);
   } catch {}
+  ctx.restore();
 
-  // 2) Content area cloaked
-  const cx = cr.x * W;
+  // 2) Content area cloaked. With a whole-picture mirror the programme now
+  // sits at the horizontally flipped rect, so the cloak has to follow it.
+  const cx = (frameFlip ? 1 - cr.x - cr.w : cr.x) * W;
   const cy = cr.y * H;
   const cw = cr.w * W;
   const ch = cr.h * H;
@@ -923,28 +1059,8 @@ function drawCloakedFrame(
     csy = syc0 + (shc0 - csh) / 2;
   }
 
-  if (fisheyeOn) {
-    // Prepare filtered content into offscreen canvas for fisheye grid mapping
-    const tmp = getFisheyeSrcCanvas(Math.max(2, Math.round(cw)), Math.max(2, Math.round(ch)));
-    const tctx = tmp.getContext("2d");
-    if (tctx) {
-      tctx.save();
-      tctx.clearRect(0, 0, tmp.width, tmp.height);
-      const f = buildFilters();
-      tctx.filter = f.length ? f.join(" ") : "none";
-      if (c.flipContent || c.flip) {
-        tctx.translate(tmp.width, 0);
-        tctx.scale(-1, 1);
-      }
-      try {
-        tctx.drawImage(video, csx, csy, csw, csh, 0, 0, tmp.width, tmp.height);
-      } catch {}
-      tctx.filter = "none";
-      tctx.restore();
-    }
-
-    ctx.save();
-    // Clip to content rect with same shape as content layer if available
+  /** Clip to the content box (same shape the layer is drawn with). */
+  const clipContent = () => {
     if (layout?.contentStyle) {
       const rad = (layout.contentStyle.radius ?? 10) * k;
       shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
@@ -954,7 +1070,26 @@ function drawCloakedFrame(
       ctx.rect(cx, cy, cw, ch);
       ctx.clip();
     }
+  };
 
+  if (fisheyeOn) {
+    // Prepare filtered content into offscreen canvas for fisheye grid mapping
+    const tmp = getFisheyeSrcCanvas(Math.max(2, Math.round(cw)), Math.max(2, Math.round(ch)));
+    const tctx = tmp.getContext("2d");
+    if (tctx) {
+      tctx.save();
+      tctx.clearRect(0, 0, tmp.width, tmp.height);
+      const f = buildFilters();
+      tctx.filter = f.length ? f.join(" ") : "none";
+      try {
+        tctx.drawImage(video, csx, csy, csw, csh, 0, 0, tmp.width, tmp.height);
+      } catch {}
+      tctx.filter = "none";
+      tctx.restore();
+    }
+
+    ctx.save();
+    clipContent();
     drawFisheyeGrid(ctx, tmp, cx, cy, cw, ch, fisheyeAmt, c.rotate ?? 0);
 
     if (c.grain > 0.5) {
@@ -970,37 +1105,57 @@ function drawCloakedFrame(
       ctx.restore();
     }
     ctx.restore();
-  } else {
-    // Direct content draw with transforms & filters
-    ctx.save();
-    if (layout?.contentStyle) {
-      const rad = (layout.contentStyle.radius ?? 10) * k;
-      shapePath(ctx, layout.contentStyle.shape ?? "rounded", cx, cy, cw, ch, rad);
-      ctx.clip();
-    } else {
-      ctx.beginPath();
-      ctx.rect(cx, cy, cw, ch);
-      ctx.clip();
-    }
 
-    if (Math.abs(c.rotate ?? 0) > 0.05) {
-      ctx.translate(cx + cw / 2, cy + ch / 2);
-      ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
-      ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
-    }
-    if (c.flipContent || c.flip) {
+    // content-only mirror with the fisheye: map the same grid flipped, over
+    // the part of the content box that is allowed to be mirrored
+    if (contentFlip) {
+      ctx.save();
+      clipContent();
+      if (keepBottom > 0.001) {
+        ctx.beginPath();
+        ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
+        ctx.clip();
+      }
       ctx.translate(cx * 2 + cw, 0);
       ctx.scale(-1, 1);
+      drawFisheyeGrid(ctx, tmp, cx, cy, cw, ch, fisheyeAmt, c.rotate ?? 0);
+      ctx.restore();
     }
-    const f = buildFilters();
-    ctx.filter = f.length ? f.join(" ") : "none";
-    try {
-      ctx.drawImage(video, csx, csy, csw, csh, cx, cy, cw, ch);
-    } catch {}
-    ctx.filter = "none";
+  } else {
+    // Direct content draw with transforms & filters
+    const drawContent = (mirrored: boolean) => {
+      ctx.save();
+      clipContent();
+      if (mirrored && keepBottom > 0.001) {
+        ctx.beginPath();
+        ctx.rect(cx, cy, cw, ch * (1 - keepBottom));
+        ctx.clip();
+      }
+      if (Math.abs(c.rotate ?? 0) > 0.05) {
+        ctx.translate(cx + cw / 2, cy + ch / 2);
+        ctx.rotate(((c.rotate ?? 0) * Math.PI) / 180);
+        ctx.translate(-(cx + cw / 2), -(cy + ch / 2));
+      }
+      if (mirrored) {
+        ctx.translate(cx * 2 + cw, 0);
+        ctx.scale(-1, 1);
+      }
+      const f = buildFilters();
+      ctx.filter = f.length ? f.join(" ") : "none";
+      try {
+        ctx.drawImage(video, csx, csy, csw, csh, cx, cy, cw, ch);
+      } catch {}
+      ctx.filter = "none";
+      ctx.restore();
+    };
+    // as recorded first (that is what the bottom strip keeps), then the
+    // mirrored programme over everything above the subtitle band
+    drawContent(false);
+    if (contentFlip) drawContent(true);
 
     if (c.grain > 0.5) {
       ctx.save();
+      clipContent();
       ctx.globalAlpha = Math.min(0.3, (c.grain / 100) * 0.3);
       const tile = getNoiseTile();
       const pat = ctx.createPattern(tile, "repeat");
@@ -1011,7 +1166,6 @@ function drawCloakedFrame(
       }
       ctx.restore();
     }
-    ctx.restore();
   }
 
   // 3) Full-frame overlays (bars, border, vignette) — always on top, not content-only
@@ -1093,9 +1247,21 @@ export function renderScene(
   // radius / border are authored in 1080p pixels, scale them for this canvas
   const k = H / 1080;
   for (const l of scene.layers) {
-    // cloaked full-frame layer (YouTube passthrough) takes its own path
-    if (scene.cloak && !l.isCam) {
-      drawCloakedFrame(ctx, video, l.src, W, H, scene.cloak, scene.cardRect, layout);
+    // cloaked / mirrored full-frame layer (YouTube passthrough) takes its
+    // own path — mirroring is a first-class effect, so it runs with the
+    // frame cloak bypassed too
+    if ((scene.cloak || scene.mirror) && !l.isCam) {
+      drawCloakedFrame(
+        ctx,
+        video,
+        l.src,
+        W,
+        H,
+        scene.cloak ?? EMPTY_CLOAK,
+        scene.cardRect,
+        layout,
+        scene.mirror
+      );
       continue;
     }
     const style: LayerStyle =
@@ -1145,7 +1311,13 @@ export function renderScene(
     // camera layer to paint over the card — snapshot the camera corner first
     // (post-cloak pixels) and restore it after the card. Same guarantee as
     // the Patreon path above: full content cover, camera never touched.
-    const cr = scene.camRect;
+    // With a whole-picture mirror the camera has moved to the flipped rect,
+    // so the snapshot follows it.
+    const camBox = scene.camRect;
+    const cr =
+      camBox && scene.mirrorFrame
+        ? { ...camBox, x: 1 - camBox.x - camBox.w }
+        : camBox;
     let snap: ImageData | null = null;
     let sx = 0;
     let sy = 0;

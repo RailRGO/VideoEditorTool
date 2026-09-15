@@ -25,13 +25,19 @@ export interface Segment {
     accent?: string;
     /** full = whole content rect, short = top only so subtitles stay visible */
     variant?: "full" | "short";
-    /**
-     * Playback speed while the card is on screen (1 = normal). The card covers
-     * the content anyway, so nudging it to ~1.25× makes a breaker card cost a
-     * quarter less programme time; the voice speeds up with it.
-     */
+  /**
+   * Playback speed while the card is on screen (1 = normal). The card covers
+   * the content anyway, so nudging it to ~1.25× makes a breaker card cost a
+   * quarter less programme time; the voice speeds up with it.
+   */
     speed?: number;
   };
+  /**
+   * Mirror this block only (Cloak tab → Mirroring → "Only the blocks I tick").
+   * Intro and outro are never mirrored whatever this says — every disguise is
+   * a reaction-part effect.
+   */
+  mirror?: boolean;
 }
 
 export interface Claim {
@@ -565,10 +571,36 @@ export interface VideoCloak {
   /** edge darkening 0..100 */
   vignette: number;
   /** legacy whole-frame mirror — behaves exactly like flipContent now.
-   * All mirroring is content-only: the camera and the card text stay readable. */
+   * All mirroring is content-only: the camera and the card text stay readable.
+   * Only read when `mirrorMode` is missing (projects saved before v7). */
   flip: boolean;
-  /** mirror only the content area — keeps camera readable */
+  /** mirror only the content area — keeps camera readable.
+   * Only read when `mirrorMode` is missing (projects saved before v7). */
   flipContent: boolean;
+  /**
+   * Where the mirror lands:
+   *  - "off"     → nothing is mirrored,
+   *  - "content" → only the content rect (the watched programme). The camera
+   *                corner and the card text stay readable — the safe default,
+   *  - "frame"   → the whole finished picture, camera included.
+   */
+  mirrorMode: MirrorMode;
+  /**
+   * Which blocks the mirror covers:
+   *  - "reaction" → every reaction block (body / lead / fast / card / mute),
+   *                 intro and outro always stay as recorded,
+   *  - "blocks"   → only the segments carrying `mirror: true`, so a stretch
+   *                 you want untouched (a quote, a chart, subtitles you need
+   *                 readable) can be left alone.
+   */
+  mirrorScope: MirrorScope;
+  /**
+   * 0…0.6 — fraction of the content height at the BOTTOM that is left exactly
+   * as recorded. Subtitles live down there, and short cards already show the
+   * bottom 25 % of the programme: mirroring that strip would flip the words.
+   * 0 = mirror the whole content area.
+   */
+  mirrorKeepBottom: number;
   /** subtle blur 0..10 (px at 1080p) — breaks pixel hashes */
   blur: number;
   /** slight rotation -5..5 deg — breaks frame hash, adds black edges */
@@ -597,6 +629,9 @@ export const defaultVideoCloak: VideoCloak = {
   vignette: 0,
   flip: false,
   flipContent: false,
+  mirrorMode: "off",
+  mirrorScope: "reaction",
+  mirrorKeepBottom: 0,
   blur: 0,
   rotate: 0,
   speed: 1,
@@ -604,6 +639,54 @@ export const defaultVideoCloak: VideoCloak = {
   fisheye: false,
   fisheyeAmount: 35,
 };
+
+/** Where the anti-Content-ID mirror lands. See `VideoCloak.mirrorMode`. */
+export type MirrorMode = "off" | "content" | "frame";
+/** Which blocks the mirror covers. See `VideoCloak.mirrorScope`. */
+export type MirrorScope = "reaction" | "blocks";
+
+export const MIRROR_MODE_META: Record<
+  MirrorMode,
+  { label: string; hint: string }
+> = {
+  off: { label: "Off", hint: "the picture stays as recorded" },
+  content: {
+    label: "Content only",
+    hint: "mirrors the watched programme — your camera and the card text stay readable",
+  },
+  frame: {
+    label: "Whole picture",
+    hint: "mirrors the finished frame, camera and all — strongest evasion, but your face is flipped too",
+  },
+};
+
+/**
+ * Resolve the mirror for one segment.
+ *
+ * Returns "legacy" for projects saved before v7 that used the old `flip`
+ * flag — that path mirrors the whole frame inside the legacy (contentOnly =
+ * false) branch and the content rect everywhere else, which is exactly what
+ * those projects were rendered with.
+ */
+export function resolveMirror(
+  c: Pick<VideoCloak, "mirrorMode" | "mirrorScope" | "mirrorKeepBottom" | "flip" | "flipContent"> | null | undefined,
+  seg?: { mirror?: boolean } | null
+): { mode: MirrorMode | "legacy"; keepBottom: number; frameFlip: boolean } {
+  const empty = { mode: "off" as MirrorMode | "legacy", keepBottom: 0, frameFlip: false };
+  if (!c) return empty;
+  const raw = (c as { mirrorMode?: unknown }).mirrorMode;
+  let mode: MirrorMode | "legacy" = "off";
+  if (raw === "off" || raw === "content" || raw === "frame") mode = raw;
+  else if (c.flipContent) mode = "content";
+  else if (c.flip) mode = "legacy";
+  if (mode === "off") return empty;
+  if (c.mirrorScope === "blocks" && !seg?.mirror) return empty;
+  const keepBottom =
+    mode === "content"
+      ? Math.max(0, Math.min(0.6, Number(c.mirrorKeepBottom) || 0))
+      : 0;
+  return { mode, keepBottom, frameFlip: mode === "frame" || (mode === "legacy" && false) };
+}
 
 export const defaultCut: CutOptions = {
   marginDb: 7,
