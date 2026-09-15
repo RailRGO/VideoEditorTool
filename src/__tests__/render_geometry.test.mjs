@@ -234,6 +234,7 @@ const ENTRY = `
 export * from "./render";
 export * from "./timeline";
 export * from "./fairUseCut";
+export * from "./types";
 `;
 const bundle = await esbuild.build({
   stdin: { contents: ENTRY, resolveDir: srcDir, loader: "ts", sourcefile: "entry.ts" },
@@ -586,6 +587,103 @@ console.log("\n== fair-use limiter: trim mode");
     oldCards.every((c) => c.end - c.start <= legacy.cardDuration + 0.01),
     "pointer cards never run longer than cardDuration"
   );
+}
+
+/* ================= 10. the Cloak tab's mirror (mode / ticks / strip) ===== */
+console.log("\n== Cloak mirror: modes, per-block ticks, keep-bottom strip");
+{
+  const R0 = (cloak, seg = null) => R.resolveMirror(cloak, seg);
+  check(R0(null).mode === "off", "no cloak at all -> nothing is mirrored");
+  check(R0({}).mode === "off", "the default cloak -> nothing is mirrored");
+
+  const content = R0({ mirrorMode: "content" });
+  check(content.mode === "content" && content.frameFlip === false,
+    "content mode flips the programme, not the whole picture");
+  const frame = R0({ mirrorMode: "frame" });
+  check(frame.mode === "frame" && frame.frameFlip === true,
+    "whole-picture mode flips the frame (camera included)");
+  check(R0({ mirrorMode: "off" }).mode === "off", "off stays off");
+
+  check(near(R0({ mirrorMode: "content", mirrorKeepBottom: 0.25 }).keepBottom, 0.25),
+    "mirrorKeepBottom is read back");
+  check(near(R0({ mirrorMode: "content", mirrorKeepBottom: 0.9 }).keepBottom, 0.6),
+    "…and clamps at 60% of the content height");
+  check(R0({ mirrorMode: "content", mirrorKeepBottom: -2 }).keepBottom === 0,
+    "…and never goes negative");
+  check(R0({ mirrorMode: "frame", mirrorKeepBottom: 0.4 }).keepBottom === 0,
+    "a whole-picture mirror keeps no strip");
+
+  // projects saved before v7 (the old flip / flipContent flags)
+  check(R0({ flipContent: true }).mode === "content", "legacy flipContent reads as content mode");
+  check(R0({ flip: true }).mode === "legacy", "legacy flip keeps its own mode");
+  check(R0({ mirrorMode: "frame", flip: true }).mode === "frame",
+    "the v7 mode wins over a leftover legacy flag");
+
+  // scope = the tick list
+  const blocks = { mirrorMode: "content", mirrorScope: "blocks" };
+  check(R0(blocks).mode === "off", "blocks scope: an unticked block is left alone");
+  check(R0(blocks, { mirror: true }).mode === "content", "blocks scope: a ticked block flips");
+  check(R0({ mirrorMode: "content" }, { mirror: false }).mode === "content",
+    "reaction scope ignores the ticks");
+
+  // the scene the canvas draws from — this is what the preview shows
+  const halves = R.sourceHalves(1920, 1080, "single", "left");
+  const cloak = {
+    on: false, zoom: 1, bars: 0, border: 0, borderColor: "#0ea5e9", saturate: 100,
+    contrast: 100, brightness: 100, hue: 0, grain: 0, vignette: 0, flip: false,
+    flipContent: false, blur: 0, rotate: 0, speed: 1, contentOnly: true,
+    mirrorMode: "content", mirrorScope: "blocks", mirrorKeepBottom: 0,
+  };
+  const segs = [
+    { id: "i", type: "intro", start: 0, end: 2, mirror: true },
+    { id: "b", type: "body", start: 2, end: 8, mirror: true },
+    { id: "c", type: "body", start: 8, end: 10 },
+  ];
+  const sceneAt = (t, c = cloak) =>
+    R.buildPassthroughScene(segs, t, halves.full, 4, LAYOUT.content, c, LAYOUT.cam, null);
+  check(sceneAt(1).mirror === null, "an intro span is never mirrored, tick or no tick");
+  check(sceneAt(3).mirror?.mode === "content", "the ticked reaction block is mirrored");
+  check(sceneAt(9).mirror === null, "an unticked block is not");
+  check(sceneAt(3, { ...cloak, on: true }).mirror?.mode === "content",
+    "the mirror lands even with the frame cloak on");
+
+  const frameScene = sceneAt(3, { ...cloak, mirrorMode: "frame", on: true });
+  check(frameScene.mirrorFrame === true, "whole-picture mode sets mirrorFrame");
+  const log = draw(LAYOUT, frameScene);
+  const flipped = log.filter((e) => e.type === "drawImage" && e.m[0] < 0);
+  check(flipped.length >= 1, "the frame is drawn with a mirror transform");
+  const contentScene = sceneAt(3, { ...cloak, on: true });
+  const log2 = draw(LAYOUT, contentScene);
+  const flipped2 = log2.filter((e) => e.type === "drawImage" && e.m[0] < 0);
+  check(flipped2.length >= 1 && flipped2.length < flipped.length,
+    "content mode flips less than the whole picture",
+    `${flipped2.length} vs ${flipped.length}`);
+  check(bboxNear(flipped2[0]?.bbox, rectPx(LAYOUT.content), 2.0),
+    "the content flip lands exactly on the content rect", fmt(flipped2[0]?.bbox));
+}
+
+/* ================ 11. a mirror tick is a real edit (timeline) ============ */
+console.log("\n== a mirror tick is a real edit");
+{
+  const a = [{ id: "a", type: "body", start: 0, end: 5 }];
+  const b = [{ id: "a", type: "body", start: 0, end: 5, mirror: true }];
+  check(!R.sameSegs(a, b), "ticking a block counts as a change (it used to be dropped)");
+  check(R.sameSegs(b, [{ ...b[0] }]), "an identical tick list is still 'no change'");
+
+  // tidy() rebuilds the list on every edit — a ticked and an unticked
+  // neighbour must never be merged into one block
+  const merged = R.tidy([
+    { id: "a", type: "body", start: 0, end: 5, mirror: true },
+    { id: "b", type: "body", start: 5, end: 9 },
+  ]);
+  check(merged.length === 2, "tidy keeps a ticked block apart from its unticked neighbour", String(merged.length));
+  check(merged[0].mirror === true, "…and the tick survives the rebuild");
+  const merged2 = R.tidy([
+    { id: "a", type: "body", start: 0, end: 5, mirror: true },
+    { id: "b", type: "body", start: 5, end: 9, mirror: true },
+  ]);
+  check(merged2.length === 1 && merged2[0].mirror === true,
+    "two ticked neighbours still merge, tick intact");
 }
 
 fs.rmSync(tmp, { force: true });

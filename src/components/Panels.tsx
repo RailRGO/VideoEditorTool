@@ -742,6 +742,8 @@ export function ExportPanel({
   onLoadProject,
   onRestoreAutosave,
   projectMsg,
+  autosave = null,
+  autosaveNote = "",
   passthrough = false,
   remote = null,
   partTarget = 0,
@@ -772,6 +774,10 @@ export function ExportPanel({
   onLoadProject: (f: File) => void;
   onRestoreAutosave?: () => void;
   projectMsg: string;
+  /** receipt of the last localStorage autosave (null = nothing saved yet) */
+  autosave?: { at: string; blocks: number; sourceFile: string } | null;
+  /** why the autosave could not store everything ("" = saved cleanly) */
+  autosaveNote?: string;
   /** YouTube: the render is a straight cut of the finished file (no resizing) */
   passthrough?: boolean;
   remote?: {
@@ -828,6 +834,19 @@ export function ExportPanel({
           {projectMsg ||
             "The timeline and every setting as one tiny .json — keep it next to the video, it survives closed tabs and dead sessions."}
         </p>
+        {autosaveNote ? (
+          <p className="mt-1 text-[10px] leading-relaxed text-amber-300/90">{autosaveNote}</p>
+        ) : autosave ? (
+          <p className="mt-1 text-[10px] leading-relaxed text-emerald-300/80">
+            Autosaved {new Date(autosave.at).toLocaleTimeString()} · {autosave.blocks} blocks —
+            opening this panel writes it straight away, and the video holds a copy keyed to{" "}
+            {autosave.sourceFile || "this file"}.
+          </p>
+        ) : (
+          <p className="mt-1 text-[10px] leading-relaxed text-slate-600">
+            Nothing autosaved yet — it starts as soon as a video and a timeline exist.
+          </p>
+        )}
       </Section>
 
       <Section title="Render">

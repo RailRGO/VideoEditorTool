@@ -53,7 +53,10 @@ export function tidy(segs: Segment[]): Segment[] {
       s.type !== "card" ||
       ((prev?.card?.variant ?? "full") === (s.card?.variant ?? "full") &&
         Math.abs((prev?.card?.speed ?? 1) - (s.card?.speed ?? 1)) < 0.001);
-    if (prev && prev.type === s.type && Math.abs(prev.end - s.start) < 0.02 && sameVariant) {
+    // a mirrored block and an as-recorded one are different pictures — never
+    // merge them either (the tick would silently spread to a whole stretch)
+    const sameMirror = !!s.mirror === !!prev?.mirror;
+    if (prev && prev.type === s.type && Math.abs(prev.end - s.start) < 0.02 && sameVariant && sameMirror) {
       prev.end = Math.max(prev.end, s.end);
     } else {
       out.push({ ...s });
@@ -155,7 +158,17 @@ export function reposition(
 /** Structural equality (order, ids, types, bounds) — used by undo/redo. */
 export const sameSegs = (a: Segment[], b: Segment[]) =>
   a.length === b.length &&
-  a.every((s, i) => s.id === b[i].id && s.type === b[i].type && s.start === b[i].start && s.end === b[i].end);
+  a.every(
+    (s, i) =>
+      s.id === b[i].id &&
+      s.type === b[i].type &&
+      s.start === b[i].start &&
+      s.end === b[i].end &&
+      // the per-block mirror tick (Cloak → Mirroring) is a real edit: without
+      // it here a ticked block was reported as "no change" and the tick was
+      // silently dropped before it ever reached the timeline
+      !!s.mirror === !!b[i].mirror
+  );
 
 /** Parse "90", "1:30", "1:30.5", "1:02:03" or "1:02:03.5" into seconds. */
 export function parseTimecode(text: string): number | null {

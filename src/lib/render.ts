@@ -1149,8 +1149,12 @@ function drawCloakedFrame(
       ctx.restore();
     };
     // as recorded first (that is what the bottom strip keeps), then the
-    // mirrored programme over everything above the subtitle band
-    drawContent(false);
+    // mirrored programme over everything above the subtitle band. Under a
+    // whole-picture mirror the box itself already sits at the flipped rect
+    // AND its copy has to be flipped too — otherwise re-pasting the source
+    // would undo the flip inside the content box, so the box would disagree
+    // with the rest of the frame (and with the ffmpeg export).
+    drawContent(!!frameFlip);
     if (contentFlip) drawContent(true);
 
     if (c.grain > 0.5) {
@@ -1318,6 +1322,13 @@ export function renderScene(
       camBox && scene.mirrorFrame
         ? { ...camBox, x: 1 - camBox.x - camBox.w }
         : camBox;
+    // the card covers the watched programme, and a whole-picture mirror moved
+    // that programme to the flipped rect — so the card follows it (the ffmpeg
+    // export flips the overlay x the same way)
+    const cardR =
+      scene.cardRect && scene.mirrorFrame
+        ? { ...scene.cardRect, x: 1 - scene.cardRect.x - scene.cardRect.w }
+        : scene.cardRect;
     let snap: ImageData | null = null;
     let sx = 0;
     let sy = 0;
@@ -1336,7 +1347,7 @@ export function renderScene(
         }
       }
     }
-    drawCard(ctx, layout, W, H, scene.cardRect, scene.cardText);
+    drawCard(ctx, layout, W, H, cardR, scene.cardText);
     if (snap) {
       try {
         ctx.putImageData(snap, sx, sy);

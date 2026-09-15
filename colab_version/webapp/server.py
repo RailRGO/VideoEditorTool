@@ -1005,27 +1005,7 @@ class App:
         name = str(body.get("name", "youtube_final" if target == "youtube" else "render"))
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "render"
         self.last_render_key = name
-        def _clean_card(s: Dict[str, Any]) -> Optional[Dict[str, str]]:
-            c = s.get("card")
-            if not isinstance(c, dict):
-                return None
-            out = {}
-            for k in ("title", "sub", "accent"):
-                v = c.get(k)
-                if isinstance(v, str) and v.strip():
-                    out[k] = v.strip()
-            if str(c.get("variant") or "").strip().lower() == "short":
-                out["variant"] = "short"
-            return out or None
-
-        raw_segs = body.get("segments") or []
-        segments = [
-            {"type": str(s.get("type", "body")),
-             "start": float(s.get("start", 0)), "end": float(s.get("end", 0)),
-             "card": _clean_card(s)}
-            for s in raw_segs
-            if float(s.get("end", 0)) > float(s.get("start", 0))
-        ]
+        segments = clean_render_segments(body.get("segments") or [])
         layout_d = body.get("layout") or {}
         fast = float(layout_d.get("fastSpeed", 4.0) or 4.0)
         _fade_ms = body.get("audioFadeMs", 80)
@@ -1737,6 +1717,49 @@ def _start_bus_worker(app: "App", proxy_width: int) -> None:
                 app.bus_proxies[bus].update(ready=False, error=str(e)[:200])
 
     threading.Thread(target=_bus_worker, daemon=True).start()
+
+
+def _clean_card(s: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The card fields the renderer honours (everything else is preview-only)."""
+    c = s.get("card")
+    if not isinstance(c, dict):
+        return None
+    out = {}
+    for k in ("title", "sub", "accent"):
+        v = c.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    if str(c.get("variant") or "").strip().lower() == "short":
+        out["variant"] = "short"
+    return out or None
+
+
+def clean_render_segments(raw_segs: List[Any]) -> List[Dict[str, Any]]:
+    """Sanitize the browser's segment list for the renderer.
+
+    Everything the preview knows and the export must reproduce has to survive
+    this function. `mirror` is the per-block content mirror (Cloak tab →
+    Mirroring, scope = blocks): it used to be dropped here, which made the
+    tick list a preview-only setting — the downloaded file came back
+    unmirrored.
+    """
+    segments: List[Dict[str, Any]] = []
+    for s in raw_segs:
+        if not isinstance(s, dict):
+            continue
+        try:
+            a, b = float(s.get("start", 0)), float(s.get("end", 0))
+        except (TypeError, ValueError):
+            continue
+        if b <= a:
+            continue
+        seg: Dict[str, Any] = {"type": str(s.get("type", "body")),
+                               "start": a, "end": b,
+                               "card": _clean_card(s)}
+        if s.get("mirror"):
+            seg["mirror"] = True
+        segments.append(seg)
+    return segments
 
 
 def serve_forever(proc, port: int = 8000,

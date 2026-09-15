@@ -126,24 +126,62 @@ export class AudioEngine {
   private duckingNow = 0;
   private readonly levels: Levels = { mic: -60, content: -60, reduction: 0, ducking: 0 };
 
-  attach(video: HTMLVideoElement, micChannel: "left" | "right") {
-    if (this.video === video && this.ctx) {
+  /** the whole graph is built and safe to touch */
+  private graphOk = false;
+  /** why the last graph build failed ("" = fine) — surfaced in the UI */
+  error = "";
+
+  /**
+   * Build the graph on a real user gesture.
+   *
+   * Everything is wrapped: a half-built graph used to throw out of here (a
+   * node that did not exist yet was connected with `!`), and that exception
+   * travelled up through `play()` so the FIRST press of play did nothing at
+   * all — the audio element was wired into a broken graph and the browser
+   * held the picture back. Now the element always gets its own audio back
+   * when the graph cannot be built, and the caller is told instead of being
+   * dragged into an exception.
+   *
+   * Returns true when the mix graph is live.
+   */
+  attach(video: HTMLVideoElement, micChannel: "left" | "right"): boolean {
+    if (this.video === video && this.ctx && this.graphOk) {
       this.setMicChannel(micChannel);
-      return;
+      return true;
     }
-    this.video = video;
+    // a previous attempt left a shell behind (or the element changed)
+    this.detach();
     const Ctor: typeof AudioContext =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!Ctor) return;
+    if (!Ctor) {
+      this.error = "This browser has no Web Audio support — playing with the file's own audio.";
+      return false;
+    }
+    try {
+      this.buildGraph(video, Ctor, micChannel);
+      return true;
+    } catch (e) {
+      this.error =
+        "The preview audio mix could not start (" +
+        (e instanceof Error ? e.message : String(e)) +
+        ") — playing with the file's own audio.";
+      // never leave the element wired into a broken graph
+      this.detach();
+      return false;
+    }
+  }
+
+  /** Build every node + connection. Throws only into `attach`'s try/catch. */
+  private buildGraph(
+    video: HTMLVideoElement,
+    Ctor: typeof AudioContext,
+    micChannel: "left" | "right"
+  ) {
+    this.video = video;
     const ctx = new Ctor();
     this.ctx = ctx;
-    try {
-      this.source = ctx.createMediaElementSource(video);
-    } catch {
-      /* already attached or failed */
-      return;
-    }
+    this.source = ctx.createMediaElementSource(video);
     this.splitter = ctx.createChannelSplitter(2);
 
     this.micIn = ctx.createGain();
@@ -197,16 +235,20 @@ export class AudioEngine {
     this.directGain = ctx.createGain();
     this.directGain.gain.value = 0;
     this.directTrim = ctx.createGain();
-    this.buildCloak(ctx);
-    this.source.connect(this.directGain);
-    this.directGain.connect(this.cloakIn!);
     // intro/outro bypass: a dry path around the whole cloak chain plus a
     // gate on the chain's output. Default (dry=0, gate=1) is bit-neutral;
     // clean spans crossfade to the dry path so they play EXACTLY as recorded.
+    //
+    // These two MUST exist before buildCloak() runs: the end of the cloak
+    // chain connects into the gate, and building it in the other order is
+    // exactly what threw "Overload resolution failed" on the first play.
     this.cloakDry = ctx.createGain();
     this.cloakDry.gain.value = 0;
     this.cloakGate = ctx.createGain();
     this.cloakGate.gain.value = 1;
+    this.buildCloak(ctx);
+    this.source.connect(this.directGain);
+    this.directGain.connect(this.cloakIn!);
     this.directGain.connect(this.cloakDry);
     this.cloakDry.connect(this.directTrim);
     this.directTrim.connect(this.master);
@@ -214,6 +256,9 @@ export class AudioEngine {
     this.directTrim.connect(this.contentMeter);
 
     this.setMicChannel(micChannel);
+    // engines start suspended on most browsers — `unlock()` resumes for real
+    this.graphOk = true;
+    this.error = "";
   }
 
   setMicChannel(micChannel: "left" | "right") {
@@ -429,7 +474,7 @@ export class AudioEngine {
   /** Apply the YouTube audio-cloak settings to the direct chain. */
   updateCloak(c: AudioCloak) {
     const ctx = this.ctx;
-    if (!ctx || !this.cloakIn || !this.voiceIn) return;
+    if (!this.graphOk || !ctx || !this.cloakIn || !this.voiceIn) return;
     const t = ctx.currentTime;
     const ramp = (p: AudioParam, v: number, tc = 0.03) => p.setTargetAtTime(v, t, tc);
 
@@ -621,7 +666,7 @@ export class AudioEngine {
 
   /** true once the graph is built and can carry the element's audio. */
   get ready(): boolean {
-    return !!this.ctx && !!this.source;
+    return this.graphOk && !!this.ctx && !!this.source;
   }
 
   /**
@@ -643,32 +688,53 @@ export class AudioEngine {
   }
 
   /**
-   * Last resort: hand the element its own audio back.
+   * Hand the element its own audio back and forget the graph.
    *
    * Closing the context detaches the MediaElementAudioSourceNode, so the
    * preview can start even when the audio graph is what the browser is
    * unhappy about. The mix (compressor / ducking / cloak) is gone, which is
-   * far better than a preview that will not move at all.
+   * far better than a preview that will not move at all. Never throws.
    */
-  async bypass(): Promise<void> {
-    const ctx = this.ctx;
+  detach(): void {
     try {
       this.source?.disconnect();
     } catch {
       /* already detached */
     }
-    this.source = null;
+    const ctx = this.ctx;
     this.video = null;
-    this.ctx = null;
-    this.directGain = null;
+    this.source = null;
     this.splitter = null;
+    this.micIn = null;
+    this.contentIn = null;
+    this.master = null;
+    this.fastTrim = null;
+    this.duckGain = null;
+    this.micMeter = null;
+    this.contentMeter = null;
+    this.directGain = null;
+    this.directTrim = null;
+    this.cloakIn = null;
+    this.cloakDry = null;
+    this.cloakGate = null;
+    this.streamDest = null;
+    this.ctx = null;
+    this.graphOk = false;
+    this.scanning = false;
+    this.scanNode = null;
+    this.scanSink = null;
     if (ctx) {
       try {
-        await ctx.close();
+        void ctx.close();
       } catch {
         /* nothing else to do */
       }
     }
+  }
+
+  /** Last resort: see `detach()`. */
+  async bypass(): Promise<void> {
+    this.detach();
   }
 
   /**
@@ -684,7 +750,7 @@ export class AudioEngine {
     channel: "mic" | "content" = "mic"
   ): boolean {
     const ctx = this.ctx;
-    if (!ctx || !this.splitter || !this.master) return false;
+    if (!this.graphOk || !ctx || !this.splitter || !this.master) return false;
     if (typeof ctx.createScriptProcessor !== "function") return false;
     this.stopScan();
 
@@ -769,7 +835,7 @@ export class AudioEngine {
 
   update(state: AudioState, fastGainDb = 0) {
     const ctx = this.ctx;
-    if (!ctx) return;
+    if (!this.graphOk || !ctx) return;
     this.lastFastDb = fastGainDb;
     const t = ctx.currentTime;
     const ramp = (p: AudioParam, v: number) => p.setTargetAtTime(v, t, 0.02);
@@ -802,7 +868,7 @@ export class AudioEngine {
   /** Called every animation frame: reads the mic level and applies ducking. */
   tick(state: AudioState, contentMuted: boolean) {
     const ctx = this.ctx;
-    if (!ctx || !this.duckGain) return this.levels;
+    if (!this.graphOk || !ctx || !this.duckGain) return this.levels;
     if (this.direct) {
       // mixed file: mute / card segments silence the whole programme
       this.duckingNow = 0;

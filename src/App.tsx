@@ -833,7 +833,13 @@ export default function App() {
   const ensureAudio = useCallback((v: HTMLVideoElement) => {
     const eng = engine();
     const had = eng.ready;
-    eng.attach(v, audioRef.current.mic.channel);
+    try {
+      // fail-safe: a graph that cannot be built hands the element its own
+      // audio back instead of dragging `play()` into an exception
+      eng.attach(v, audioRef.current.mic.channel);
+    } catch {
+      /* attach never throws — this is belt and braces */
+    }
     if (!had && eng.ready) {
       eng.setDirect(targetRef.current === "youtube" || !!remoteRef.current);
       eng.update(audioRef.current);
@@ -865,12 +871,21 @@ export default function App() {
    */
   const startPlayback = useCallback(
     async (v: HTMLVideoElement): Promise<boolean> => {
-      const eng = ensureAudio(v);
-      await eng.unlock();
+      // The audio graph must never be able to stop the picture: if it cannot
+      // be built the element keeps its own audio and we say so, but play()
+      // still happens.
+      let eng: AudioEngine | null = null;
+      try {
+        eng = ensureAudio(v);
+        await eng.unlock();
+      } catch {
+        eng = null;
+      }
+      const audioNote = eng && !eng.ready ? eng.error : "";
       await waitSeek(v);
       try {
         await v.play();
-        setPlayNote("");
+        setPlayNote(audioNote);
         return true;
       } catch (err) {
         const name = err instanceof DOMException ? err.name : "Error";
@@ -878,7 +893,7 @@ export default function App() {
           // a seek landed on top of us — one more go is almost always enough
           try {
             await v.play();
-            setPlayNote("");
+            setPlayNote(audioNote);
             return true;
           } catch (e2) {
             setPlayNote(
@@ -890,7 +905,11 @@ export default function App() {
           }
         }
         // last resort: give the element its own audio back and try again
-        await eng.bypass();
+        try {
+          eng?.detach();
+        } catch {
+          /* nothing left to detach */
+        }
         try {
           await v.play();
           setPlayNote(
@@ -1040,26 +1059,35 @@ export default function App() {
         imgEpoch !== lastDrawRef.current.img;
 
       // ---- playback watchdog ---------------------------------------------
-      // Some engines report `paused === false` and still refuse to advance
-      // (a tunnel stall, a context that never really resumed). Rather than
-      // leaving a frozen preview, nudge play() a couple of times and then
-      // say so out loud.
+      // Some engines report `paused === false` and still refuse to advance:
+      // a context that never really resumed, a tunnel that stalled, a codec
+      // the browser will not decode. Instead of leaving a frozen preview,
+      // escalate: nudge play(), then pull the element out of the audio graph
+      // (the classic culprit) and nudge again, and only then say so out loud.
       if (!v.paused && !v.ended && !v.seeking && !scanningRef.current) {
         const st = stallRef.current;
         if (Math.abs(v.currentTime - st.t) > 1e-3) {
           st.t = v.currentTime;
           st.at = now;
           st.nudges = 0;
-        } else if (st.at && now - st.at > 1500 && st.nudges < 3 && v.readyState >= 3) {
-          st.nudges += 1;
-          st.at = now + 1000;
+        } else if (st.at && now - st.at > 1500 && st.nudges === 0 && v.readyState >= 2) {
+          st.nudges = 1;
+          st.at = now;
           void v.play().catch(() => {});
-        } else if (st.at && now - st.at > 6000 && st.nudges >= 3) {
+        } else if (st.at && now - st.at > 3000 && st.nudges === 1 && v.readyState >= 2) {
+          st.nudges = 2;
+          st.at = now;
+          // the audio graph is the usual reason a media element refuses to
+          // run — hand the element its own audio and push again
+          engineRef.current?.detach();
+          void v.play().catch(() => {});
+        } else if (st.at && now - st.at > 6000 && st.nudges === 2) {
+          st.nudges = 3;
+          st.at = 0;
           setPlaying(false);
           setPlayNote(
-            "The preview stopped moving — the stream may have stalled. Scrub the timeline to wake it, or reconnect the backend."
+            "The preview is not moving: the stream or codec stalled. Scrub the timeline to wake it, or reconnect the backend."
           );
-          st.at = 0;
         }
       }
       const busy = exportingRef.current || scanningRef.current;
@@ -1341,6 +1369,17 @@ export default function App() {
       durRef.current = d;
     }
     setDims({ w: v.videoWidth, h: v.videoHeight });
+    if (!d) {
+      // No length in the header (a MediaRecorder blob, an MP4 written without
+      // faststart, a stream Chrome only measures by scanning): nudge the
+      // element once to the very end — `durationchange` then reports the real
+      // number — instead of sitting on "Waiting for the video…" forever.
+      try {
+        if (v.seekable.length > 0) v.currentTime = 1e101;
+      } catch {
+        /* not seekable — nothing to force */
+      }
+    }
     const asp = v.videoWidth / Math.max(1, v.videoHeight);
     if (targetRef.current === "patreon") {
       setLayoutH((l) => ({ ...l, sourceMode: asp > 1.9 ? "split" : "single" }));
@@ -1695,6 +1734,9 @@ export default function App() {
           start: s.start,
           end: s.end,
           ...(s.card ? { card: s.card } : {}),
+          // per-block content mirror (Cloak tab → Mirroring → ticked blocks):
+          // the ffmpeg render must mirror exactly the blocks the preview does
+          ...(s.mirror ? { mirror: true } : {}),
         })),
         layout: layoutRef.current,
         audio: audioRef.current,
@@ -1828,8 +1870,12 @@ export default function App() {
     async (channel: "mic" | "content" = "mic") => {
       const v = videoRef.current;
       if (!v || !durRef.current) return;
-      const eng = engine();
+      // the scanner taps the graph, so it has to exist first: build it on
+      // this click (a user gesture) instead of silently doing nothing when
+      // play has never been pressed
+      const eng = ensureAudio(v);
       eng.resume();
+      await eng.unlock();
       scanChannelRef.current = channel;
       setScanChannel(channel);
       const ok = eng.startScan(
@@ -1838,7 +1884,16 @@ export default function App() {
         () => v.playbackRate,
         channel
       );
-      if (!ok) return;
+      if (!ok) {
+        setPlayNote(
+          eng.error ||
+            "The audio analysis could not start — this browser has no working " +
+              "audio graph for the preview. Load the file in This-PC mode, or " +
+              "run the analysis on the Colab side."
+        );
+        return;
+      }
+      setPlayNote("");
       if (channel === "mic") {
         setEnv(null);
         setDetection(null);
@@ -2151,6 +2206,8 @@ export default function App() {
         type: (s.type in SEGMENT_META ? s.type : "body") as Segment["type"],
         start: s.start,
         end: s.end,
+        // per-block content mirror (Cloak → Mirroring) survives a save/load
+        ...(s.mirror ? { mirror: true } : {}),
         ...(s.card && typeof s.card === "object"
           ? { card: s.card as Segment["card"] }
           : {}),
@@ -2191,8 +2248,11 @@ export default function App() {
       engine().updateCloak(merged);
     }
     if (p.videoCloak) {
-      setVideoCloak(p.videoCloak as VideoCloak);
-      videoCloakRef.current = p.videoCloak as VideoCloak;
+      // merge over the defaults: a project saved before a field existed must
+      // still come back with that field's default (mirrorMode & co.)
+      const vc = { ...defaultVideoCloak, ...(p.videoCloak as VideoCloak) };
+      setVideoCloak(vc);
+      videoCloakRef.current = vc;
     }
     if (p.sticker) {
       const st = { ...defaultSticker, ...(p.sticker as Sticker) };
@@ -2665,6 +2725,27 @@ export default function App() {
         )}
 
         <div className="ml-auto flex items-center gap-2">
+          {/* the receipt for the autosave — silence looked like "it never saved" */}
+          {autosaveNote ? (
+            <span
+              className="hidden max-w-[260px] truncate rounded-lg border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-100 xl:block"
+              title={autosaveNote}
+            >
+              autosave · storage full
+            </span>
+          ) : lastAutosaveInfo ? (
+            <span
+              className="hidden rounded-lg border border-white/10 bg-black/40 px-2 py-1 font-mono text-[10px] text-emerald-300/80 xl:block"
+              title={`Autosaved “${lastAutosaveInfo.sourceFile}” — ${lastAutosaveInfo.segmentCount} blocks at ${new Date(lastAutosaveInfo.savedAt).toLocaleString()}. Open that video again and the app offers to restore it.`}
+            >
+              saved{" "}
+              {new Date(lastAutosaveInfo.savedAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              })}
+            </span>
+          ) : null}
           <span className="hidden rounded-lg border border-white/10 bg-black/40 px-2 py-1 font-mono text-[10px] text-slate-400 xl:block">
             render <span className="text-sky-300">{fmtTime(outDur)}</span>
             {removed > 0.05 && <span className="text-rose-300"> · −{fmtTime(removed)}</span>}
@@ -3100,6 +3181,20 @@ export default function App() {
           )}
 
           {/* transport */}
+          {playNote && (
+            <div className="mt-2 flex shrink-0 items-start gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 text-[11px] leading-relaxed text-amber-100">
+              <span className="shrink-0 pt-[1px]">⚠</span>
+              <span className="min-w-0 flex-1">{playNote}</span>
+              <button
+                type="button"
+                onClick={() => setPlayNote("")}
+                className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-amber-200/70 hover:bg-amber-400/20 hover:text-amber-100"
+                title="Hide"
+              >
+                ✕
+              </button>
+            </div>
+          )}
           <div className="mt-2.5 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.025] px-2.5 py-2">
             <button
               type="button"
@@ -3261,6 +3356,10 @@ export default function App() {
                 sticker={sticker}
                 setSticker={setStickerH}
                 remote={isRemote ? remoteRef.current : null}
+                segments={segments}
+                onToggleMirror={toggleSegmentMirror}
+                onSetAllMirror={setAllSegmentMirror}
+                onSeek={seekSrc}
               />
             )}
             {rightTab === "timeline" && (
@@ -3301,6 +3400,16 @@ export default function App() {
                 onLoadProject={loadProjectFile}
                 onRestoreAutosave={doRestore}
                 projectMsg={projectMsg}
+                autosave={
+                  lastAutosaveInfo
+                    ? {
+                        at: lastAutosaveInfo.savedAt,
+                        blocks: lastAutosaveInfo.segmentCount,
+                        sourceFile: lastAutosaveInfo.sourceFile,
+                      }
+                    : null
+                }
+                autosaveNote={autosaveNote}
                 passthrough={isYT}
                 partTarget={partTarget}
                 setPartTarget={setPartTarget}
@@ -3383,7 +3492,23 @@ export default function App() {
           setPlaying(false);
           finish();
         }}
-        onError={() => setFileName((n) => n)}
+        onError={(e) => {
+          // a source the browser refuses to load is not a mystery any more
+          const code = e.currentTarget.error?.code;
+          setPlaying(false);
+          setPlayNote(
+            code === 4
+              ? "The browser cannot decode this file (unsupported codec or a " +
+                "damaged stream). The Colab preview stream is MP4/H.264 — if " +
+                "this is a local file, re-record or re-export it as MP4."
+              : code === 2
+              ? "The preview source could not be read (network error). " +
+                "Reconnect the backend and try again."
+              : "The preview source failed to load (media error " +
+                (code ?? "?") +
+                "). Reload the page, or reconnect the backend."
+          );
+        }}
       />
       <canvas
         ref={exportRef}
