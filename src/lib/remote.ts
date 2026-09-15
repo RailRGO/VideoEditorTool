@@ -17,6 +17,15 @@ import type {
   VideoCloak,
 } from "./types";
 
+/**
+ * The preview stream could not be built, but the connection itself is fine.
+ *
+ * Kept distinct from a plain Error so the UI can stay connected and offer a
+ * retry: a failed transcode used to null the whole client, which left the
+ * play button dead with no way back short of reloading the page.
+ */
+export class ProxyError extends Error {}
+
 export interface RemoteInfo {
   path: string;
   width: number;
@@ -270,6 +279,10 @@ export class RemoteClient {
     }
     return { name: j.name, url: this.url(j.url || `/files/${encodeURIComponent(j.name)}`) };
   };
+
+  /** ask the server to build the preview stream again after a failure */
+  retryProxy = (): Promise<{ ok: boolean; proxy: RemoteProxy }> =>
+    this.req("/api/proxy/retry", { method: "POST" });
 
   /** bus: "mix" (default), "mic" or "content" */
   proxyUrl = (bus: "mix" | "mic" | "content" = "mix"): string =>

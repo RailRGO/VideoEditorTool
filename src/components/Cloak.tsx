@@ -3,6 +3,18 @@ import type { AudioCloak, Sticker, VideoCloak } from "../lib/types";
 import type { RemoteClient } from "../lib/remote";
 import { Btn, Note, Section, Segmented, Slider } from "./ui";
 
+/** the built-in morph characters (colab_version/voice_morph.py PRESETS) */
+const MORPH_PRESETS = [
+  { value: "incognito", label: "Incognito", hint: "the default: still clear, unmistakably someone else" },
+  { value: "deep", label: "Deep", hint: "big low narrator" },
+  { value: "bright", label: "Bright", hint: "small bright character" },
+  { value: "warm", label: "Warm", hint: "broadcast-y, closest to the original performance" },
+  { value: "radio", label: "Radio", hint: "lo-fi intercom band" },
+  { value: "robot", label: "Robot", hint: "machine voice" },
+  { value: "alien", label: "Alien", hint: "not a voice at all — extreme tract + wobble" },
+  { value: "custom", label: "Manual", hint: "neutral carrier for the sliders below" },
+] as const;
+
 export default function CloakPanel({
   audio,
   setAudio,
@@ -138,7 +150,7 @@ export default function CloakPanel({
       </Section>
 
       <Section
-        title="Voice changer — your voice, reaction part only"
+        title="Voice changer — reaction part only"
         right={
           <button
             type="button"
@@ -154,28 +166,146 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Replaces your voice in the <b>mic track of the reaction part</b> — the content audio and
-          your intro/outro keep their natural sound. Needs the Patreon master with stems so the mic
-          can be isolated.
+          Content ID fingerprints the <b>programme audio</b>, so by default this re-voices the{" "}
+          <b>content</b> track and leaves your own commentary untouched — the show comes out
+          sounding dubbed, which is exactly what stops a match. Your intro/outro always stay clean.
+          Splitting the two needs the Patreon master with stems; a single mixed track gets
+          re-voiced as one piece.
         </p>
         <Segmented
-          value={audio.voiceMode ?? "rvc"}
+          value={audio.voiceTarget ?? "content"}
           options={[
-            { value: "rvc", label: "AI character voice (RVC)" },
+            { value: "content", label: "Content (the show)" },
+            { value: "mic", label: "My mic" },
+            { value: "both", label: "Both" },
+          ]}
+          onChange={(t) => setA({ voiceTarget: t })}
+        />
+        <Segmented
+          value={audio.voiceMode ?? "morph"}
+          options={[
+            { value: "morph", label: "Built-in morph · no setup" },
+            { value: "rvc", label: "AI character (RVC)" },
             { value: "fx", label: "Basic FX" },
           ]}
           onChange={(m) => setA({ voiceMode: m })}
         />
-        {(audio.voiceMode ?? "rvc") === "rvc" ? (
+        {(audio.voiceMode ?? "morph") === "morph" ? (
           <div className="mt-2 space-y-2">
             <p className="text-[10px] leading-relaxed text-slate-400">
-              Real voice conversion with an RVC model (<code>.pth</code> + optional{" "}
-              <code>.index</code>) — a different person speaking, not a pitch trick, so audio
-              fingerprints don't recognise you. Runs on the Colab backend during export.
+              The default engine, written into the Colab backend: resampling + a phase-vocoder
+              vocal-tract warp + vibrato, breath and tilt. <b>Nothing to install, no model file, no
+              download</b> — it runs about 10× faster than realtime on the Colab CPU, so it works on
+              a free runtime with no GPU at all.
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {MORPH_PRESETS.map((p) => (
+                <button
+                  key={p.value}
+                  type="button"
+                  title={p.hint}
+                  onClick={() => setA({ morphPreset: p.value })}
+                  className={
+                    (audio.morphPreset ?? "incognito") === p.value
+                      ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
+                      : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                  }
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <Slider
+              label="Strength"
+              value={audio.morphStrength ?? 85}
+              min={0}
+              max={100}
+              step={1}
+              display={`${Math.round(audio.morphStrength ?? 85)}%`}
+              onChange={(v) => setA({ morphStrength: v })}
+              hint="0% = untouched, 100% = the full character. Around 70–90% is the sweet spot for a dub that still sounds human"
+            />
+            <Slider
+              label="Vocal tract"
+              value={Math.round((audio.morphFormant ?? 1) * 100)}
+              min={50}
+              max={200}
+              step={1}
+              display={`${((audio.morphFormant ?? 1) * 100).toFixed(0)}%`}
+              onChange={(v) => setA({ morphFormant: v / 100 })}
+              hint="formant shift without touching the pitch: under 100% = bigger throat, over = smaller. 100% = the preset's own"
+            />
+            <Slider
+              label="Character seed"
+              value={audio.morphSeed ?? 0}
+              min={0}
+              max={9999}
+              step={1}
+              display={`#${audio.morphSeed ?? 0}`}
+              onChange={(v) => setA({ morphSeed: Math.round(v) })}
+              hint="a different seed is a different voice from the same preset — same seed on every render keeps one character across all your videos"
+            />
+            {(audio.voiceTarget ?? "content") === "both" && (
+              <div className="space-y-2 rounded-lg border border-white/10 bg-white/[0.03] p-2">
+                <span className="block text-[10px] uppercase tracking-wide text-slate-500">
+                  Second character for your mic (optional)
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {MORPH_PRESETS.map((p) => (
+                    <button
+                      key={p.value}
+                      type="button"
+                      title={p.hint}
+                      onClick={() => setA({ voicePresetMic: p.value })}
+                      className={
+                        (audio.voicePresetMic ?? "") === p.value
+                          ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100"
+                          : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                      }
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setA({ voicePresetMic: "" })}
+                    className="rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                  >
+                    same as content
+                  </button>
+                </div>
+                <label className="block">
+                  <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+                    Mic seed (optional)
+                  </span>
+                  <input
+                    type="number"
+                    value={String(audio.morphSeedMic ?? "")}
+                    onChange={(e) => setA({ morphSeedMic: e.target.value })}
+                    placeholder="same as content"
+                    className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-[11px] text-slate-200 outline-none focus:border-fuchsia-400/50"
+                  />
+                </label>
+              </div>
+            )}
+            <Note>
+              The morph runs on the export backend in one pass over the whole programme — a few
+              seconds per minute of video, no GPU, no torch, no model file.
+            </Note>
+          </div>
+        ) : (audio.voiceMode ?? "morph") === "rvc" ? (
+          <div className="mt-2 space-y-2">
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              Real neural voice conversion with an RVC model (<code>.pth</code> + optional{" "}
+              <code>.index</code>) — a different person speaking, not a pitch trick. Give a path, an{" "}
+              <code>https://</code> URL or <code>hf:owner/repo/file.pth</code> and the notebook
+              fetches it into its voice cache for you (<code>rvc-python</code> installs itself the
+              first time). Leave it empty — or write <code>builtin:morph</code> — to use the
+              built-in engine instead.
             </p>
             <label className="block">
               <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
-                Model file (.pth) — path on the notebook
+                Model — path, https URL or hf:repo/file.pth
               </span>
               <input
                 type="text"
@@ -207,7 +337,7 @@ export default function CloakPanel({
               step={1}
               display={`${(audio.rvcTranspose ?? 0) > 0 ? "+" : ""}${audio.rvcTranspose ?? 0} st`}
               onChange={(v) => setA({ rvcTranspose: v })}
-              hint="match the character to your range: male→female ≈ +12, female→male ≈ −12"
+              hint="match the character to the source range: male→female ≈ +12, female→male ≈ −12"
             />
             <Slider
               label="Index rate"
@@ -235,8 +365,9 @@ export default function CloakPanel({
               />
             </div>
             <p className="text-[10px] text-amber-300/70">
-              One-time setup in the notebook: <code>%pip install rvc-python</code>. Voice models
-              live on the notebook side (e.g. in your Drive) — paste the full path above.
+              RVC is GPU-hungry: on a CPU-only runtime one minute of audio can take several minutes.
+              If you hit that, switch the engine to <b>Built-in morph</b> — it is the same re-voicing
+              job at ~10× realtime, with no install and no model.
             </p>
           </div>
         ) : (
@@ -288,8 +419,8 @@ export default function CloakPanel({
               />
             )}
             <p className="text-[10px] text-amber-300/70">
-              Basic pitch/formant tricks — better than nothing, but a determined matcher can still
-              see through them. Use the AI character voice for a truly different voice.
+              Plain ffmpeg pitch/formant tricks — fast, but a determined matcher can still see
+              through them. The built-in morph is strictly better at the same cost.
             </p>
           </div>
         )}

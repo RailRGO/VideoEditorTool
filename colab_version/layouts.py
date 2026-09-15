@@ -351,14 +351,26 @@ def default_audio_cloak() -> Dict[str, Any]:
         "reverb": 18.0,  # 0..100
         "tilt": 2.0,     # dB, positive = brighter
         "widen": 6.0,    # ms Haas delay on right channel
-        # voice changer — applies to the MIC bus only, reaction part only
+        # voice changer — reaction part only; *which bus* is voiceTarget
         "voiceChanger": False,
-        "voiceMode": "rvc",     # rvc = AI character voice (.pth), fx = basic presets
+        # content: re-voice the PROGRAMME (that is what Content ID
+        # fingerprints) and keep your own commentary natural
+        "voiceTarget": "content",   # content | mic | both
+        # morph = the built-in numpy voice (no model, no download, cpu-fast),
+        # rvc = a neural character voice, fx = the plain ffmpeg presets
+        "voiceMode": "morph",
         "voicePreset": "anon",  # fx presets: anon|deep|high|robot|custom
         "voiceStrength": 70.0,  # 0..100 intensity (fx mode)
         "voicePitch": 0.0,      # extra pitch shift for custom preset, semitones
+        # built-in morph characters (voiceMode == "morph")
+        "morphPreset": "incognito",  # incognito|deep|bright|robot|alien|warm|radio|custom
+        "morphStrength": 85.0,       # 0..100
+        "morphSeed": 0,              # same seed = same voice on every render
+        "morphFormant": 1.0,         # 0.5..2.0 vocal-tract override (1 = preset)
+        "voicePresetMic": "",        # 2nd character for the mic when target=both
+        "morphSeedMic": "",          # 2nd seed for the mic when target=both
         # RVC character voice settings (voiceMode == "rvc")
-        "rvcModel": "",         # path to the .pth voice model
+        "rvcModel": "",         # path, https:// URL or hf:owner/repo/file.pth
         "rvcIndex": "",         # optional path to the .index file
         "rvcTranspose": 0,      # semitones (-24..24)
         "rvcIndexRate": 0.5,    # 0..1 similarity to the training voice

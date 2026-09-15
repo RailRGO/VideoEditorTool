@@ -124,6 +124,17 @@ clip, output folder and editor URL; the logic is folded away in
 `colab_launch.py`) and `video_editor_colab.ipynb` (same, plus the in-cell editor
 GUI and manual render cells). See `colab_version/README.md`.
 
+The Cloak tab's voice changer targets the **content** bus by default: the
+show gets re-voiced (that is the audio Content ID fingerprints) while your
+commentary and the intro/outro stay natural. The default engine is built in
+(`colab_version/voice_morph.py`) — numpy and ffmpeg only, no model file, no
+download, ~10× realtime on the Colab CPU, duration-exact so A/V can never
+drift. RVC character voices are an opt-in engine: paste a path, an `https://`
+URL or `hf:owner/repo/file.pth` and the notebook fetches it. Encoder choices
+are smoke-tested, and a GPU that dies mid-render re-runs the pass on
+`libx264` rather than failing the export; the preview proxy falls back the
+same way and can be rebuilt from the UI (`POST /api/proxy/retry`).
+
 Server renders are chunked and journaled, so a runtime that gets reclaimed
 mid-render costs one part instead of the whole encode — the editor's Export
 tab (or `tools("resume the unfinished render")`) finishes it from the parts

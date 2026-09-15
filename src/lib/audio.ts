@@ -26,6 +26,8 @@ const dbToLin = (db: number) => Math.pow(10, db / 20);
  */
 export class AudioEngine {
   ctx: AudioContext | null = null;
+  /** the morph preset's preview numbers, while the engine is "morph" */
+  private morphPreview: { pitch: number; lo: number; hi: number } | null = null;
   streamDest: MediaStreamAudioDestinationNode | null = null;
 
   private video: HTMLVideoElement | null = null;
@@ -427,9 +429,39 @@ export class AudioEngine {
 
     // ---- voice changer ----
     const vOn = !!(c as any).voiceChanger || !!(c as any).voiceOn;
-    const preset = (c as any).voicePreset || "anon";
-    const strength = Math.max(0, Math.min(100, (c as any).voiceStrength ?? 70)) / 100;
-    const extraPitch = (c as any).voicePitch ?? 0;
+    const mode = String((c as any).voiceMode || "morph").toLowerCase();
+    // The preview is a WebAudio approximation: the real morph is a phase
+    // vocoder + vocal-tract warp running on the export backend, and no
+    // browser graph reproduces that sample for sample. What it can do is
+    // move the pitch and the formants the same amount in the same direction,
+    // so you hear the character you picked before you spend a render on it.
+    let preset = String((c as any).voicePreset || "anon");
+    let strength =
+      Math.max(0, Math.min(100, (c as any).voiceStrength ?? 70)) / 100;
+    let extraPitch = Number((c as any).voicePitch ?? 0) || 0;
+    if (mode === "morph") {
+      const mp = String((c as any).morphPreset || "incognito");
+      const MORPH: Record<string, { pitch: number; lo: number; hi: number; robot?: boolean }> = {
+        incognito: { pitch: -2.6, lo: 3, hi: -2.5 },
+        deep: { pitch: -5.2, lo: 4.5, hi: -4 },
+        bright: { pitch: 4.6, lo: -4, hi: 4.5 },
+        warm: { pitch: -1.2, lo: 1.2, hi: -1 },
+        radio: { pitch: -0.8, lo: 5.5, hi: -6, robot: true },
+        robot: { pitch: -0.6, lo: 0.5, hi: 0.5, robot: true },
+        alien: { pitch: 3.1, lo: 6, hi: -5.5, robot: true },
+        custom: { pitch: 0, lo: 0, hi: 0 },
+      };
+      const m = MORPH[mp] ?? MORPH.incognito;
+      strength = Math.max(0, Math.min(100, (c as any).morphStrength ?? 85)) / 100;
+      extraPitch = mp === "custom" ? extraPitch : 0;
+      // morphFormant moves the tract on top of the character (1 = as picked)
+      const tract = Number((c as any).morphFormant ?? 1) || 1;
+      const fd = Math.max(-6, Math.min(6, (tract - 1) * 12));
+      preset = mp === "custom" ? "custom" : m.robot ? "robot" : "anon";
+      this.morphPreview = { pitch: m.pitch, lo: m.lo + fd, hi: m.hi - fd };
+    } else {
+      this.morphPreview = null;
+    }
 
     if (!vOn || strength < 0.01) {
       ramp(this.voiceWetA!.gain, 0, 0.05);
@@ -445,11 +477,13 @@ export class AudioEngine {
       this.voiceDistort!.curve = makeDistortionCurve(0);
     } else {
       // map preset to pitch + formant
-      let basePitch = 0;
-      let formantLo = 0;
-      let formantHi = 0;
-      let robot = false;
-      switch (preset) {
+      let basePitch = this.morphPreview?.pitch ?? 0;
+      let formantLo = this.morphPreview?.lo ?? 0;
+      let formantHi = this.morphPreview?.hi ?? 0;
+      let robot = mode === "morph" && preset === "robot";
+      switch (this.morphPreview ? "__morph__" : preset) {
+        case "__morph__":
+          break;
         case "deep":
           basePitch = -3.5;
           formantLo = 4;

@@ -137,6 +137,58 @@ Export → *Long renders* → "Also write content & mic tracks".
 The source picker in the header lists the output folder as well as the raw
 folder, because that is where the master you cut from lives.
 
+### The voice changer re-voices the show, not you
+
+Content ID matches the **programme audio** — the show you are reacting to —
+not your commentary. So `voiceTarget` defaults to **content**: the voice
+engine re-voices tracks 2 (the show) inside the reaction part, while your
+own voice and the intro/outro stay exactly as recorded. The trade is honest
+and worth stating: the show now sounds dubbed. That is the point — a dubbed
+voice is not the fingerprint that was registered.
+
+| engine | what it needs | what it does |
+| ------ | ------------- | ------------ |
+| **Built-in morph** (default) | nothing — numpy + ffmpeg | resample + phase-vocoder vocal-tract warp + vibrato/breath/tilt, ~10× realtime on the Colab **CPU**. No model, no download, no torch, no GPU |
+| **RVC** | `rvc-python` + a `.pth` | real neural conversion. Give a path, an `https://` URL or `hf:owner/repo/file.pth` and the notebook fetches it into `~/react_voices` (or `REACT_VOICE_DIR`); `pip install rvc-python` is attempted once on first use |
+| **Basic FX** | nothing | the plain ffmpeg pitch/formant/robot presets |
+
+Details worth knowing:
+
+- The morph is **duration-exact** by construction (resample, then stretch
+  back), so a re-voiced bus can never push the picture out of sync, and a
+  silence gate keeps pauses where the source had them — a mute span stays
+  silent instead of droning on.
+- Silent runs are measured (`volumedetect`) and skipped, so mute/card spans
+  cost nothing and come back bit-clean.
+- `morphSeed` picks the character: the same seed sounds the same on every
+  render, a different seed is a different voice from the same preset — which
+  is what stops two uploads of one episode sharing a fingerprint.
+- `voiceTarget = both` gives the mic its own character (`voicePresetMic`,
+  `morphSeedMic`); empty means "same as the content".
+- RVC on a CPU-only runtime is slow (minutes per minute of audio). The
+  built-in morph is the same job at ~10× realtime, which is why it is the
+  default.
+- With a source that has one mixed track there is nothing to separate: the
+  engine re-voices that track, your voice included, and the log says so.
+  Load the Patreon master (three tracks) to keep your own voice natural.
+
+### No GPU? The Colab CPU does the work
+
+Every encoder choice is smoke-tested with a real one-frame encode before it
+is picked (`compose.nvenc_available`), because *every* static ffmpeg build
+lists `h264_nvenc` while a GPU-less runtime dies opening it with
+`Cannot load libcuda.so.1`. And if the GPU goes away mid-render — driver
+hiccup, CUDA OOM, the session's GPU being reclaimed — the failing pass is
+re-run on `libx264` instead of costing the whole export (it used to fail on
+part 6 of 6, after an hour of work). `REACT_GPU=0` forces the CPU encoder.
+
+The preview proxy does the same (GPU attempt, then CPU), and tries its audio
+plans in order — all tracks mixed, first track, silent — so a three-track
+master still previews with sound. If a build does fail, the browser now
+stays connected and offers **Rebuild preview stream** (`POST
+/api/proxy/retry`) instead of leaving the play button dead until the notebook
+was restarted.
+
 ### The placeholder card covers the content, not the frame
 
 A card span used to be drawn as a near-full-frame box (0.06/0.16/0.88/0.68)
@@ -363,7 +415,14 @@ The request mentions cutting content to avoid ContentID strikes. This pipeline:
 - Keeps **intro/outro uncut** (only your face — safe).
 - Allows **manual / auto cut** of silent/repeated reaction segments so the video flows seamlessly.
 - Applies **transformative edits** (layout, blur background, retouch, audio ducking) which are part of fair-use reaction commentary.
-- Does **not** provide reverse-engineering of ContentID fingerprinting.
+- Re-voices the **programme audio** on request (Cloak → Voice changer,
+  target *Content*): a dubbed voice is a different signal, so the audio
+  fingerprint of the show no longer matches. See "The voice changer
+  re-voices the show, not you" above.
+- Does **not** provide reverse-engineering of ContentID fingerprinting, and
+  none of this is a claim that an upload becomes unmatchable: video
+  fingerprinting, manual claims and the rights holder's own policies all
+  still apply.
 
 If you want full control, use the Cuts tab (silence detection + claim
 ranges) or pass `custom_cuts=[(start, end), ...]` to `run_youtube_version()`.

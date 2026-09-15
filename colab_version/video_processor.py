@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -376,19 +377,222 @@ def _passthrough_runs(kept: List[Dict[str, Any]], fast_speed: float,
 
 
 def _voice_mode(cfg: Optional[Dict[str, Any]]) -> str:
-    """'off' | 'fx' | 'rvc' — the voice changer flavour requested."""
+    """'off' | 'morph' | 'rvc' | 'fx' — the voice changer flavour requested.
+
+    "morph" (the built-in numpy engine) is the default: it needs no model
+    file, no download and no GPU, so a project that just ticks the box gets
+    an engine that actually runs on whatever runtime the user has.
+    """
     c = cfg or {}
     if not c.get("voiceChanger", False):
         return "off"
-    mode = str(c.get("voiceMode", "fx") or "fx").lower()
-    return "rvc" if mode == "rvc" else "fx"
+    mode = str(c.get("voiceMode", "morph") or "morph").lower()
+    if mode == "rvc":
+        return "rvc"
+    if mode == "fx":
+        return "fx"
+    return "morph"
 
 
 # ---------------------------------------------------------------------------
-# RVC voice conversion (.pth character voices) — mic bus only, reaction only
+# the voice engine: which bus gets re-voiced, and by what
 # ---------------------------------------------------------------------------
+# Content ID fingerprints the PROGRAMME audio, so the bus that matters most is
+# the CONTENT one: re-voice the show and the matcher has nothing to grab,
+# while your own commentary keeps its natural sound. The mic-only behaviour
+# this started with is still available (voiceTarget = "mic"), and "both" is
+# there for the single-mixed-track case.
+#
+# Two engines, no third option to install:
+#   morph — built-in, numpy + ffmpeg only, ~10x realtime on a Colab CPU, no
+#           model files and no downloads (voice_morph.py)
+#   rvc   — a real neural conversion when rvc-python and a .pth are present;
+#           a URL / hf:repo/file model is fetched into the cache for you
 
+VOICE_TARGETS = ("mic", "content", "both")
 _RVC_CACHE: Dict[Tuple[str, str], Any] = {}
+_VOICE_CACHE = Path(os.environ.get(
+    "REACT_VOICE_DIR",
+    "/content/drive/MyDrive/react_voices"
+    if Path("/content/drive/MyDrive").is_dir()
+    else str(Path.home() / ".cache" / "reaction_studio" / "voices")))
+
+
+def _voice_targets(cfg: Optional[Dict[str, Any]]) -> set:
+    """Which buses the voice changer covers: {} / {"mic"} / {"content"} /
+    {"mic", "content"}.
+
+    A project saved before *voiceTarget* existed gets the old behaviour
+    (mic only), so loading an old file never silently re-voices the show.
+    """
+    c = cfg or {}
+    if not c.get("voiceChanger", False):
+        return set()
+    t = str(c.get("voiceTarget", "mic") or "mic").strip().lower()
+    if t == "both":
+        return {"mic", "content"}
+    if t == "content":
+        return {"content"}
+    return {"mic"}
+
+
+def _voice_engine(cfg: Optional[Dict[str, Any]], bus: str) -> str:
+    """'none' | 'morph' | 'fx' | 'rvc' — how *bus* gets re-voiced."""
+    if bus not in _voice_targets(cfg):
+        return "none"
+    c = cfg or {}
+    mode = str(c.get("voiceMode", "morph") or "morph").strip().lower()
+    if mode == "morph":
+        return "morph"
+    if mode == "fx":
+        return "fx"
+    # rvc — but a model spec that asks for the built-in engine (or one that
+    # cannot be resolved) drops back to morph instead of failing the export
+    spec = str(c.get("rvcModel", "") or "").strip()
+    if spec.lower().startswith("builtin") or spec.lower().startswith("morph"):
+        return "morph"
+    return "rvc"
+
+
+def _voice_cfg_for(cfg: Optional[Dict[str, Any]], bus: str) -> Dict[str, Any]:
+    """The config one bus is processed with.
+
+    "both" would otherwise push the same character onto the show and onto the
+    commentator; *voicePresetMic* lets the mic keep a different one (it
+    defaults to the same preset, so nothing changes unless it is set).
+    """
+    c = dict(cfg or {})
+    if bus == "mic" and str(c.get("voiceTarget", "") or "").lower() == "both":
+        alt = str(c.get("voicePresetMic", "") or "").strip()
+        if alt:
+            c["morphPreset"] = alt
+            c["voicePreset"] = alt
+        seed = c.get("morphSeedMic", None)
+        if seed not in (None, ""):
+            try:
+                c["morphSeed"] = int(seed)
+            except (TypeError, ValueError):
+                pass
+    return c
+
+
+def _rvc_model_path(spec: str) -> Optional[Path]:
+    """Resolve an RVC model spec to a local .pth (fetching it if needed).
+
+    Accepted: a path on the notebook, an http(s) URL, or ``hf:repo/file``
+    (resolved through huggingface_hub when it is installed, otherwise through
+    the public resolve URL). Downloads are cached in *_VOICE_CACHE*, so a
+    model is fetched once per Drive, not once per render. Returns None for an
+    empty spec or the ``builtin:``/``morph:`` aliases.
+    """
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    if low.startswith("builtin") or low.startswith("morph"):
+        return None
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p
+    _VOICE_CACHE.mkdir(parents=True, exist_ok=True)
+    if low.startswith(("http://", "https://")):
+        url = raw
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(urlparse(url).path).name) \
+            or "voice.pth"
+    elif low.startswith("hf:"):
+        rest = raw[3:]
+        repo, _, fname = rest.partition("/")
+        # a repo id alone is not enough: "hf:owner/repo" would otherwise
+        # resolve to .../owner/resolve/main/repo and download an HTML error
+        # page into the voice cache
+        if not fname or "/" not in repo:
+            raise RuntimeError(
+                f"hf: model specs need a file name — got {raw!r}, want "
+                f"hf:owner/repo/voice.pth")
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", fname)
+        url = f"https://huggingface.co/{repo}/resolve/main/{fname}"
+    else:
+        # a bare name: look in the cache, then next to the notebook
+        for cand in (_VOICE_CACHE / p.name, Path.cwd() / p.name,
+                     Path("/content") / p.name):
+            if cand.is_file():
+                return cand
+        raise RuntimeError(
+            f"voice model {raw!r} was not found. Put the .pth on the notebook "
+            f"and give its full path, paste an https:// or hf:owner/repo/file "
+            f"URL, or switch the engine to the built-in morph voice (no model "
+            f"needed). Looked in: {p}, {_VOICE_CACHE / p.name}")
+    return _fetch_voice_file(url, name, min_bytes=100_000,
+                             what="an RVC model (a .pth is tens of MB)")
+
+
+def _fetch_voice_file(url: str, name: str, min_bytes: int = 100_000,
+                      what: str = "voice file") -> Path:
+    """Download *url* into the voice cache (once) and return the local path."""
+    dst = _VOICE_CACHE / name
+    if dst.is_file() and dst.stat().st_size > min_bytes:
+        return dst
+    _VOICE_CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + f".{os.getpid()}.part")
+    import urllib.request
+    print(f"  voice: downloading {url} -> {dst}")
+    try:
+        with urllib.request.urlopen(url, timeout=180) as r, \
+                open(tmp, "wb") as fh:
+            shutil.copyfileobj(r, fh, 1 << 20)
+        got = tmp.stat().st_size
+        if got < min_bytes:
+            raise RuntimeError(
+                f"{url} returned {got} bytes — that is not {what}. Check the "
+                f"URL (a Hugging Face file needs "
+                f"hf:owner/repo/file, and a private repo will not resolve), "
+                f"or use the built-in morph voice, which needs no model.")
+    except RuntimeError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except Exception as e:  # noqa: BLE001 — reported with the fix
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"could not download the voice model from {url}: {e}") from e
+    tmp.replace(dst)
+    return dst
+
+
+def _rvc_index_path(spec: str) -> str:
+    """Resolve the optional .index companion (path / URL / hf:), or ""."""
+    raw = str(spec or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return str(p)
+    low = raw.lower()
+    try:
+        if low.startswith(("http://", "https://")):
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "_",
+                          Path(urlparse(raw).path).name) or "voice.index"
+            return str(_fetch_voice_file(raw, name, min_bytes=1024,
+                                         what="an RVC index"))
+        if low.startswith("hf:"):
+            repo, _, fname = raw[3:].partition("/")
+            if not fname or "/" not in repo:
+                raise RuntimeError(
+                    f"hf: index specs need a file name — got {raw!r}, want "
+                    f"hf:owner/repo/voice.index")
+            url = (f"https://huggingface.co/{repo}/resolve/main/{fname}")
+            return str(_fetch_voice_file(
+                url, re.sub(r"[^A-Za-z0-9_.-]+", "_", fname),
+                min_bytes=1024, what="an RVC index"))
+    except RuntimeError as e:
+        # an index is an optional refinement — never fail the render over it
+        print(f"  (voice: skipping the .index — {e})")
+        return ""
+    for cand in (_VOICE_CACHE / p.name, Path.cwd() / p.name,
+                 Path("/content") / p.name):
+        if cand.is_file():
+            return str(cand)
+    print(f"  (voice: .index {raw!r} not found — continuing without it)")
+    return ""
 
 
 def _rvc_pick_device() -> str:
@@ -420,8 +624,8 @@ def _rvc_convert_file(sess: Any, src: Path, dst: Path,
     transpose = int(round(float(cfg.get("rvcTranspose", 0) or 0)))
     index_rate = max(0.0, min(1.0, float(cfg.get("rvcIndexRate", 0.5) or 0.0)))
     method = str(cfg.get("rvcMethod", "rmvpe") or "rmvpe").lower()
-    index = str(cfg.get("rvcIndex", "") or "").strip()
-    if index and Path(index).is_file():
+    index = _rvc_index_path(cfg.get("rvcIndex", ""))
+    if index:
         try:
             setattr(sess, "index_path", index)
         except Exception:
@@ -449,41 +653,49 @@ def _rvc_convert_file(sess: Any, src: Path, dst: Path,
                        + (f" ({last})" if last else ""))
 
 
-def _voice_rvc_runs(proc: "ReactionVideoProcessor", wav: Path,
-                    runs: List[Dict[str, Any]], cfg: Dict[str, Any],
-                    tag: str = "rvc") -> Path:
-    """Replace the reaction runs of *wav* with their RVC conversion.
+def _run_is_silent(proc: "ReactionVideoProcessor", wav: Path,
+                   run: Dict[str, Any], thresh_db: float = -60.0) -> bool:
+    """True when a run carries no audio worth converting.
 
-    Clean runs (intro/outro) pass through bit-for-bit; each reaction run is
-    run through the character model; the runs are stitched back in order, so
-    the result is exactly as long as the input (A/V stays aligned).
+    A mute or card span silences the CONTENT bus, and pushing silence through
+    a voice converter is pure waste (minutes per part on a CPU) — it would
+    also lay a breath/noise floor exactly where the mix expects digital
+    silence. Measured with volumedetect, never assumed from the segment map.
     """
-    model = str(cfg.get("rvcModel", "") or "").strip()
-    if not model or not Path(model).is_file():
-        raise RuntimeError(
-            f"voice changer is set to an RVC character voice but the model "
-            f"file is missing: {model!r} — put the .pth on the notebook "
-            f"(e.g. inside /content/drive/MyDrive) and set its full path")
     try:
-        import rvc_python  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError(
-            "voice changer is set to an RVC character voice but rvc-python "
-            "is not installed — run  %pip install rvc-python  in the "
-            "notebook, then export again") from e
-    device = _rvc_pick_device()
-    print(f"  voice: RVC model {Path(model).name} on {device} "
-          f"(transpose {cfg.get('rvcTranspose', 0)}, method "
-          f"{cfg.get('rvcMethod', 'rmvpe')})")
-    sess = _rvc_get(model, device)
+        out = proc._ff(["ffmpeg", "-hide_banner", "-v", "info",
+                        "-ss", f"{run['a']:.3f}",
+                        "-t", f"{max(0.05, run['b'] - run['a']):.3f}",
+                        "-i", str(wav), "-map", "0:a", "-af", "volumedetect",
+                        "-f", "null", "-"], "voice: level check")
+    except RuntimeError:
+        return False
+    m = re.findall(r"max_volume:\s*(-?[\d.]+)\s*dB", out)
+    if not m:
+        return False
+    return float(m[-1]) <= thresh_db
+
+
+def _voice_runs_splice(proc: "ReactionVideoProcessor", wav: Path,
+                       runs: List[Dict[str, Any]], tag: str,
+                       convert: Callable[[Path, Path, Dict[str, Any]], None],
+                       skip_silent: bool = False) -> Path:
+    """Re-voice the reaction runs of *wav*, leaving everything else alone.
+
+    *convert(dry, wet, run)* does the actual work (RVC session, morph, …).
+    Clean runs (intro/outro) are copied bit-for-bit, silent runs are copied
+    as well when *skip_silent*, and the runs are stitched back in order, so
+    the result is exactly as long as the input — the A/V alignment the whole
+    passthrough design depends on.
+    """
     work = proc.work
     parts: List[Path] = []
+    whole = proc._media_duration(str(wav))
     for r, run in enumerate(runs):
         seg_wav = work / f"{tag}_run{r:02d}.wav"
         if run["clean"]:
             # untouched copy of the clean run (intro/outro stay as-is)
-            if run["a"] <= 0.001 and run["b"] >= \
-                    proc._media_duration(str(wav)) - 0.001:
+            if run["a"] <= 0.001 and run["b"] >= whole - 0.001:
                 parts.append(wav)   # the only run — no extraction needed
             else:
                 proc._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
@@ -492,26 +704,131 @@ def _voice_rvc_runs(proc: "ReactionVideoProcessor", wav: Path,
                          f"voice: clean run {r + 1}")
                 parts.append(seg_wav)
             continue
+        if skip_silent and _run_is_silent(proc, wav, run):
+            proc._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                      "-ss", f"{run['a']:.3f}", "-to", f"{run['b']:.3f}",
+                      "-c:a", "pcm_s16le", str(seg_wav)],
+                     f"voice: silent run {r + 1}")
+            parts.append(seg_wav)
+            print(f"  voice: run {r + 1} is silent (muted span) — passed "
+                  f"through instead of converted")
+            continue
         dry = work / f"{tag}_react{r:02d}.wav"
-        wet = work / f"{tag}_react{r:02d}_rvc.wav"
+        wet = work / f"{tag}_react{r:02d}_wet.wav"
         proc._ff(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
                   "-ss", f"{run['a']:.3f}", "-to", f"{run['b']:.3f}",
                   "-c:a", "pcm_s16le", str(dry)], f"voice: extract run {r + 1}")
-        _rvc_convert_file(sess, dry, wet, cfg)
-        # RVC output can drift a few ms — fit it back onto the run length
-        parts.append(proc._fit_audio(wet, run["b"] - run["a"], f"voice run {r + 1}"))
+        convert(dry, wet, run)
+        # a converter can drift a few ms — fit it back onto the run length
+        parts.append(proc._fit_audio(wet, run["b"] - run["a"],
+                                     f"voice run {r + 1}"))
     if len(parts) == 1 and parts[0] == wav:
         return wav
     out = work / f"{tag}_voice.wav"
     cmd = ["ffmpeg", "-y", "-v", "error"]
-    for p in parts:
-        cmd += ["-i", str(p)]
+    for p_ in parts:
+        cmd += ["-i", str(p_)]
     cmd += ["-filter_complex",
             "".join(f"[{i}:a]" for i in range(len(parts)))
             + f"concat=n={len(parts)}:v=0:a=1[vout]",
             "-map", "[vout]", "-c:a", "pcm_s16le", str(out)]
     proc._ff(cmd, "voice: join runs")
     return out
+
+
+def _rvc_ensure_installed() -> str:
+    """Import rvc-python, trying a one-shot install when it is missing.
+
+    Returns a note for the log ("" when it was already importable) and never
+    raises: the caller decides whether a missing rvc-python is fatal, and the
+    built-in morph is always there as the fallback. Set
+    REACT_RVC_AUTOINSTALL=0 to keep the runtime's packages untouched.
+    """
+    try:
+        import rvc_python  # noqa: F401
+        return ""
+    except ImportError:
+        pass
+    if os.environ.get("REACT_RVC_AUTOINSTALL", "1") == "0":
+        return " (rvc-python missing — auto-install disabled)"
+    print("  voice: rvc-python is not installed — trying  pip install "
+          "rvc-python  once (set REACT_RVC_AUTOINSTALL=0 to skip)")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "rvc-python"],
+                       check=False, timeout=1800)
+        import rvc_python  # noqa: F401  # noqa: F811
+        return (" (rvc-python was installed just now — if inference fails, "
+                "restart the runtime so torch/fairseq settle)")
+    except Exception as e:  # noqa: BLE001
+        return f" (rvc-python could not be installed: {e})"
+
+
+def _voice_rvc_runs(proc: "ReactionVideoProcessor", wav: Path,
+                    runs: List[Dict[str, Any]], cfg: Dict[str, Any],
+                    tag: str = "rvc") -> Path:
+    """Replace the reaction runs of *wav* with their RVC conversion."""
+    model_path = _rvc_model_path(str(cfg.get("rvcModel", "") or ""))
+    if model_path is None:
+        raise RuntimeError(
+            "the voice changer is set to RVC but no model was given — paste a "
+            "path, an https:// URL or hf:owner/repo/file.pth, or switch the "
+            "engine to the built-in morph voice, which needs no model at all")
+    note = _rvc_ensure_installed()
+    try:
+        import rvc_python  # noqa: F401
+    except ImportError as e:
+        hint = note or " — run  %pip install rvc-python  in the notebook"
+        raise RuntimeError(
+            "the voice changer is set to an RVC character voice but "
+            f"rvc-python is not usable{hint}; or switch the engine to the "
+            "built-in morph voice, which needs no install and no model "
+            "file") from e
+    device = _rvc_pick_device()
+    print(f"  voice: RVC model {model_path.name} on {device} "
+          f"(transpose {cfg.get('rvcTranspose', 0)}, method "
+          f"{cfg.get('rvcMethod', 'rmvpe')}){note}")
+    sess = _rvc_get(str(model_path), device)
+
+    def convert(dry: Path, wet: Path, _run: Dict[str, Any]) -> None:
+        _rvc_convert_file(sess, dry, wet, cfg)
+
+    return _voice_runs_splice(proc, wav, runs, tag, convert, skip_silent=True)
+
+
+def _voice_morph_runs(proc: "ReactionVideoProcessor", wav: Path,
+                      runs: List[Dict[str, Any]], cfg: Dict[str, Any],
+                      tag: str = "morph") -> Path:
+    """Replace the reaction runs of *wav* with the built-in morph voice.
+
+    numpy + ffmpeg only: no torch, no model files, no downloads, ~10x realtime
+    on a Colab CPU — the engine that still works when the runtime has no GPU.
+    """
+    import voice_morph as VM
+    plan = VM.plan_for(cfg)
+    print(f"  voice: built-in morph '{VM.preset_label(plan['preset'])}' on cpu "
+          f"(pitch {plan['pitch']:+.1f} st, formant {plan['formant']:.2f}, "
+          f"strength {plan['strength'] * 100:.0f}%, seed {int(plan['seed'])})")
+
+    def convert(dry: Path, wet: Path, _run: Dict[str, Any]) -> None:
+        VM.morph_file(dry, wet, cfg)
+
+    return _voice_runs_splice(proc, wav, runs, tag, convert, skip_silent=True)
+
+
+def _voice_apply(proc: "ReactionVideoProcessor", wav: Path,
+                 runs: List[Dict[str, Any]], cfg: Optional[Dict[str, Any]],
+                 bus: str, tag: str) -> Path:
+    """Run *bus* through whichever engine the config asks for."""
+    c = _voice_cfg_for(cfg, bus)
+    engine = _voice_engine(cfg, bus)
+    if engine == "morph":
+        return _voice_morph_runs(proc, wav, runs, c, tag=tag)
+    if engine == "rvc":
+        return _voice_rvc_runs(proc, wav, runs, c, tag=tag)
+    if engine == "fx":
+        return proc._voice_fx_wav(wav, runs, c, tag=tag)
+    return wav
 
 
 def _vignette_angle(amount: float) -> float:
@@ -2012,7 +2329,7 @@ class ReactionVideoProcessor:
                            cam_rect: Optional[Dict[str, float]] = None,
                            audio_fade_s: float = 0.08,
                            sticker: Optional[Dict[str, Any]] = None,
-                           mic_override: Optional[Path] = None
+                           bus_overrides: Optional[Dict[int, Path]] = None
                            ) -> Tuple[List[str], List[str], List[Path]]:
         """filter_complex for one (part of a) passthrough render.
 
@@ -2029,9 +2346,11 @@ class ReactionVideoProcessor:
         *audio_inputs* may be empty: the graph is then video-only (the
         chunked path builds the audio separately and muxes it at the end).
 
-        *mic_override* is a pre-conformed mic wav (output timeline, RVC
-        character voice already applied to the reaction runs): when given,
-        the mic bus is read from it instead of the source stream.
+        *bus_overrides* maps a bus index (0 = content, 1 = mic) to a
+        pre-conformed wav on the OUTPUT timeline with the voice engine
+        already applied to its reaction runs. An overridden bus is read from
+        that file with a plain trim — no atempo, no fades, no mute, they are
+        all baked in — which is how a re-voiced bus stays frame-accurate.
 
         *sticker* overlays a user image (subscribe button & co.) on the
         reaction spans: {on, src, x, y, w, opacity} — see _sticker_png.
@@ -2318,21 +2637,31 @@ class ReactionVideoProcessor:
         # reaction runs, and the audio cloak touches reaction runs only —
         # intro/outro leave this graph exactly as they entered it.
         if audio_inputs:
-            vmode = _voice_mode(audio_cloak)
-            vfx: List[str] = []
-            if vmode == "fx":
-                vfx, vwarns = _voice_changer_filters(audio_cloak)
-                warns.extend(vwarns)
-            elif vmode == "rvc" and mic_override is None:
-                warns.append("voice changer: RVC conversion runs in the "
-                             "full-render path — this pass keeps the "
-                             "natural voice")
+            ovr = dict(bus_overrides or {})
             stems = len(audio_inputs) > 1
             mic_idx = 1 if stems else 0
-            if vmode == "fx" and vfx and not stems:
-                warns.append("voice changer without stems: the source has one "
-                             "mixed track, so the effect covers the content "
-                             "audio too")
+            targets = _voice_targets(audio_cloak)
+            # The in-graph presets are the "fx" engine: they may only touch a
+            # bus that (a) the user asked for and (b) was not already
+            # re-voiced offline. Both halves matter — morph/RVC run before the
+            # graph over the whole programme, and a leftover rubberband pass
+            # on the mic bus shifts YOUR voice too, which is exactly what
+            # voiceTarget="content" promises not to do.
+            vfx_bus = {j for j in ({mic_idx} if stems else {0}) if j not in ovr}
+            vfx: List[str] = []
+            if targets:
+                if _voice_mode(audio_cloak) == "fx" and vfx_bus:
+                    vfx, vwarns = _voice_changer_filters(audio_cloak)
+                    warns.extend(vwarns)
+                if not stems:
+                    # one mixed track: the engine still runs (the caller
+                    # re-voices that track), but content and commentary cannot
+                    # be told apart any more
+                    warns.append("voice changer without stems: this source has "
+                                 "one mixed track, so it re-voices the "
+                                 "programme AND your voice together — load a "
+                                 "Patreon master with stems to keep your own "
+                                 "voice natural")
             states_per_bus = [[
                 ((s.get("type", "body") in ("mute", "card") and j == 0),
                  C.seg_speed(s, float(fast_speed))
@@ -2343,13 +2672,13 @@ class ReactionVideoProcessor:
             for r, run in enumerate(runs):
                 bus_labels: List[str] = []
                 for j, spec in enumerate(audio_inputs):
-                    if mic_override is not None and stems and j == mic_idx:
-                        # the pre-conformed mic (RVC voice already on the
-                        # reaction runs) — trimmed on the OUTPUT timeline,
-                        # no atempo / fades (they are baked in)
+                    if j in ovr:
+                        # a bus that was re-voiced offline: it already sits on
+                        # the OUTPUT timeline with its fades, atempo and mute
+                        # spans baked in, so all that is left is the trim
                         rl = f"jr{j}r{r}"
                         chain.append(
-                            f"[{input_index(mic_override)}:a]"
+                            f"[{input_index(ovr[j])}:a]"
                             f"atrim=start={run['a']:.3f}:end={run['b']:.3f},"
                             f"asetpts=PTS-STARTPTS[{rl}]")
                         bus_labels.append(rl)
@@ -2384,12 +2713,15 @@ class ReactionVideoProcessor:
                         chain.append(f"{''.join(outs)}"
                                      f"concat=n={len(outs)}:v=0:a=1[{rl}]")
                         bus_labels.append(rl)
-                # voice changer: the mic bus alone, reaction runs only
-                if vmode == "fx" and vfx and not run["clean"]:
-                    vl = f"jvr{r}"
-                    chain.append(f"[{bus_labels[mic_idx]}]"
-                                 f"{','.join(vfx)}[{vl}]")
-                    bus_labels[mic_idx] = vl
+                # the ffmpeg presets, in-graph: reaction runs only, and only
+                # on a bus that was not already re-voiced offline
+                if vfx and not run["clean"]:
+                    for j in sorted(vfx_bus):
+                        if j in ovr or j >= len(bus_labels):
+                            continue
+                        vl = f"jvr{r}b{j}"
+                        chain.append(f"[{bus_labels[j]}]{','.join(vfx)}[{vl}]")
+                        bus_labels[j] = vl
                 if len(bus_labels) > 1:
                     ml = f"jmr{r}"
                     chain.append(
@@ -2429,7 +2761,8 @@ class ReactionVideoProcessor:
     def _passthrough_cmd(self, chain: List[str], out: Path, crf: int,
                          preset: str,
                          inputs: Optional[List[Path]] = None,
-                         with_audio: bool = True) -> List[str]:
+                         with_audio: bool = True,
+                         prefer_gpu: bool = True) -> List[str]:
         cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(self.input)]
         # still-image inputs for the overlay PNGs (card / vignette) and, when
         # an RVC voice is active, the pre-conformed mic wav. One frame each
@@ -2441,7 +2774,7 @@ class ReactionVideoProcessor:
         # GPU encoder only when it passes a real smoke encode (see
         # compose.nvenc_available) — a GPU-less runtime falls back to
         # libx264 instead of dying mid-render on "Cannot load libcuda.so.1"
-        enc, _ = _pick_video_encoder(prefer_gpu=True)
+        enc, _ = _pick_video_encoder(prefer_gpu=prefer_gpu)
         if enc == "h264_nvenc":
             vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr_hq",
                       "-cq", str(int(crf)), "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M"]
@@ -2458,6 +2791,46 @@ class ReactionVideoProcessor:
                 "-pix_fmt", "yuv420p"] + audio_enc + [
                 "-movflags", "+faststart", str(out)]
         return cmd
+
+    def _run_encode_cpu_fallback(self, build: Callable[[bool], List[str]],
+                                 out: Path, total: float, what: str,
+                                 progress_cb=None, cancel_check=None,
+                                 stall_min: float = 30.0,
+                                 heartbeat: Optional[Callable[[], None]] = None
+                                 ) -> None:
+        """Encode, retrying once on the CPU if the GPU pass dies.
+
+        The encoder is smoke-tested before it is picked, but a paid runtime
+        can still lose its GPU mid-session (driver hiccup, CUDA OOM, the
+        session's GPU being reclaimed). Without this, that one failure costs
+        the whole render — often at part 6/6, after an hour of work. Now the
+        command is rebuilt with prefer_gpu=False and run again, which is the
+        "no GPU? use the Colab CPU" behaviour the render should always have.
+        """
+        gpu_first = C.nvenc_available(verbose=False)
+        try:
+            _EncoderRun(build(gpu_first), total, what, progress_cb=progress_cb,
+                        cancel_check=cancel_check, stall_min=stall_min,
+                        out_path=out, heartbeat=heartbeat).run()
+            return
+        except Exception as e:  # noqa: BLE001 — the retry decides if it is fatal
+            msg = str(e)
+            if not gpu_first:
+                raise   # the CPU encoder already failed: nothing left to try
+            if not any(k in msg.lower() for k in
+                       ("cuda", "nvenc", "nvidia", "gpu", "device", "driver",
+                        "cannot load", "nvenc")):
+                raise   # a genuine error (bad filter graph, cancel, stall…)
+            print(f"  {what}: the GPU encoder failed "
+                  f"({msg.splitlines()[0][:160]}) — re-running this pass on "
+                  f"the CPU encoder (libx264)")
+            if out.exists():
+                out.unlink(missing_ok=True)
+            C.force_cpu_encode(why=f"{what} hit a GPU error")
+            _EncoderRun(build(False), total, what + " (cpu)",
+                        progress_cb=progress_cb, cancel_check=cancel_check,
+                        stall_min=stall_min, out_path=out,
+                        heartbeat=heartbeat).run()
 
     def render_passthrough(
         self,
@@ -2510,39 +2883,57 @@ class ReactionVideoProcessor:
         audio_inputs, used_stems = self._passthrough_streams(stems)
         if used_stems:
             print("  passthrough: reading the content + mic stems (tracks 2/3)")
-        # RVC character voice: the mic bus is conformed to the output
-        # timeline first, the character model converts the reaction runs,
-        # and the finished wav rides into the one-pass graph as the mic.
-        mic_override: Optional[Path] = None
-        if _voice_mode(audio_cloak) == "rvc":
+        # The voice engine runs BEFORE the graph: each targeted bus is
+        # conformed to the output timeline, its reaction runs are re-voiced
+        # (built-in morph or RVC), and the finished wav rides into the
+        # one-pass graph in place of that bus — so the picture and the voice
+        # come out of the same segment map and can never drift apart.
+        bus_overrides: Dict[int, Path] = {}
+        vtargets = _voice_targets(audio_cloak)
+        if vtargets and _voice_mode(audio_cloak) in ("rvc", "morph"):
             if used_stems:
                 gs = max(0.5, min(2.0, float(
                     (video_cloak or {}).get("speed", 1.0) or 1.0)))
                 runs, _off, _tot = _passthrough_runs(kept, fast_speed, gs)
-                mic_wav = self._conform_passthrough_mic(
-                    kept, fast_speed, gs, audio_fade_s, audio_inputs[1])
-                mic_override = _voice_rvc_runs(self, mic_wav, runs,
-                                               audio_cloak or {})
+                for bus, idx in (("content", 0), ("mic", 1)):
+                    if bus not in vtargets:
+                        continue
+                    wav = self._conform_passthrough_bus(
+                        kept, fast_speed, gs, audio_fade_s, audio_inputs[idx],
+                        mute_in_card=(bus == "content"))
+                    bus_overrides[idx] = _voice_apply(
+                        self, wav, runs, audio_cloak, bus,
+                        tag=f"pt_{bus}")
             else:
-                print("  (voice: RVC needs the stems (a Patreon master with "
-                      "the mic track) — keeping the natural voice)")
+                # one mixed track: the content bus IS the programme, so the
+                # voice engine covers it (and your voice with it)
+                gs = max(0.5, min(2.0, float(
+                    (video_cloak or {}).get("speed", 1.0) or 1.0)))
+                runs, _off, _tot = _passthrough_runs(kept, fast_speed, gs)
+                wav = self._conform_passthrough_bus(
+                    kept, fast_speed, gs, audio_fade_s, audio_inputs[0])
+                bus_overrides[0] = _voice_apply(self, wav, runs, audio_cloak,
+                                                "content", tag="pt_mix")
+                print("  (voice: this source has one mixed track, so the "
+                      "voice engine covers the programme AND your voice — "
+                      "load a Patreon master with stems to split them)")
         chain, warns, extra = self._passthrough_graph(
             kept, W=W, H=H, audio_cloak=audio_cloak, video_cloak=video_cloak,
             card=card, fast_speed=fast_speed, master_gain_db=master_gain_db,
             content_rect=content_rect, out_fps=out_fps, height=height,
             audio_inputs=audio_inputs, cam_rect=cam_rect,
             audio_fade_s=audio_fade_s, sticker=sticker,
-            mic_override=mic_override)
+            bus_overrides=bus_overrides)
         for w in warns:
             print(f"  (cloak: {w})")
 
         out = self.out / f"{name}.mp4"
         _backup_existing(out)
-        _EncoderRun(self._passthrough_cmd(chain, out, crf, preset, extra),
-                    total,
-                    "passthrough render", progress_cb=progress_cb,
-                    cancel_check=cancel_check, stall_min=stall_min,
-                    out_path=out).run()
+        self._run_encode_cpu_fallback(
+            lambda gpu: self._passthrough_cmd(chain, out, crf, preset, extra,
+                                              prefer_gpu=gpu),
+            out, total, "passthrough render", progress_cb=progress_cb,
+            cancel_check=cancel_check, stall_min=stall_min)
         result = {"mp4": str(out)}
         if used_stems:
             result["stems"] = "content+mic"
@@ -2773,19 +3164,27 @@ class ReactionVideoProcessor:
         self._ff(cmd, what)
         return out
 
-    def _conform_passthrough_mic(self, kept: List[Dict[str, Any]],
+    def _conform_passthrough_bus(self, kept: List[Dict[str, Any]],
                                  fast_speed: float, global_speed: float,
-                                 fade_s: float, mic_spec: str) -> Path:
-        """Conform the mic bus to the OUTPUT timeline (single pass).
+                                 fade_s: float, spec: str,
+                                 mute_in_card: bool = False,
+                                 tag: str = "pt_bus") -> Path:
+        """Conform one audio bus to the OUTPUT timeline (single pass).
 
         Exact twin of the in-graph per-segment audio math (trim → atempo →
-        edge fades → concat, cloak speed tweak on reaction spans only), so
-        the RVC pass can work in programme time and the result can ride
-        back into the graph with output-time trims.
+        edge fades → concat, cloak speed tweak on reaction spans only), so a
+        voice engine can work in programme time and the result can ride back
+        into the graph with output-time trims. *mute_in_card* silences the
+        mute/card spans — the content bus does that in the graph, and an
+        overridden bus never reaches that branch, so it has to happen here
+        (it is also what lets the converter skip those runs entirely).
         """
         clean = _clean_flags(kept)
         gs = max(0.5, min(2.0, float(global_speed or 1.0)))
-        states = [(False, C.seg_speed(s, float(fast_speed))
+        # the fade logic has to see the same per-segment "is this bus muted"
+        # flag the graph uses, or a mute span's edges fade in the wrong place
+        states = [((mute_in_card and s.get("type", "body") in ("mute", "card")),
+                   C.seg_speed(s, float(fast_speed))
                    * (1.0 if clean[i] else gs))
                   for i, s in enumerate(kept)]
         chain: List[str] = []
@@ -2797,20 +3196,30 @@ class ReactionVideoProcessor:
             af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
             if abs(eff - 1.0) > 0.001:
                 af += "," + ",".join(_atempo_chain(eff))
+            if mute_in_card and s.get("type", "body") in ("mute", "card"):
+                af += ",volume=0"
             fi, fo = _fade_edges(kept, i, states)
             fz = _fade_filters((b - a) / max(0.125, eff), fade_s, fi, fo)
             if fz:
                 af += "," + ",".join(fz)
-            chain.append(f"[{mic_spec}]{af}[m{i}]")
+            chain.append(f"[{spec}]{af}[m{i}]")
             outs.append(f"[m{i}]")
         n = len(kept)
         chain.append("".join(outs) + f"concat=n={n}:v=0:a=1[aout]")
-        out = self.work / "pt_mic_conform.wav"
+        out = self.work / f"{tag}_conform.wav"
         self._ff(["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
                   "-filter_complex", ";".join(chain),
                   "-map", "[aout]", "-c:a", "pcm_s16le", str(out)],
-                 "voice: conform mic bus")
+                 f"voice: conform {tag} bus")
         return out
+
+    def _conform_passthrough_mic(self, kept: List[Dict[str, Any]],
+                                 fast_speed: float, global_speed: float,
+                                 fade_s: float, mic_spec: str) -> Path:
+        """Back-compat wrapper: conform the mic bus (never silenced)."""
+        return self._conform_passthrough_bus(kept, fast_speed, global_speed,
+                                             fade_s, mic_spec,
+                                             tag="pt_mic")
 
     def _voice_fx_wav(self, wav: Path, runs: List[Dict[str, Any]],
                       cfg: Dict[str, Any], tag: str = "vfx") -> Path:
@@ -2850,8 +3259,11 @@ class ReactionVideoProcessor:
 
         The buses arrive already conformed to the output timeline (same
         math as the video parts). This stage then:
-          1. voice changer — MIC bus only, reaction runs only
-             (rvc = character model, fx = ffmpeg presets),
+          1. voice engine — on whichever buses voiceTarget selects
+             (content / mic / both), reaction runs only: morph = the built-in
+             numpy voice, rvc = a character model, fx = the ffmpeg presets.
+             Content ID fingerprints the programme audio, so "content" is the
+             bus that matters; your own voice stays natural by default,
           2. mixes the buses,
           3. anti-fingerprint cloak — reaction runs only,
           4. master gain + limiter everywhere (safety, not a disguise).
@@ -2859,20 +3271,37 @@ class ReactionVideoProcessor:
         """
         runs, _off, total = _passthrough_runs(kept, fast_speed, global_speed)
         vmode = _voice_mode(audio_cloak)
+        targets = _voice_targets(audio_cloak)
         mic_v = mic_wav
-        if vmode == "rvc":
-            mic_v = _voice_rvc_runs(self, mic_wav, runs, audio_cloak or {},
-                                    tag="rvcf")
-        elif vmode == "fx":
-            if content_wav is None:
+        con_v = content_wav
+        if targets and vmode in ("rvc", "morph"):
+            if "content" in targets:
+                if con_v is not None:
+                    con_v = _voice_apply(self, con_v, runs, audio_cloak,
+                                         "content", tag="fin_content")
+                else:
+                    # no stems: the one mixed track is the programme
+                    mic_v = _voice_apply(self, mic_wav, runs, audio_cloak,
+                                         "content", tag="fin_mix")
+                    print("  (voice: no stems — the voice engine covers the "
+                          "mixed track, your voice included)")
+            if "mic" in targets and con_v is not None:
+                mic_v = _voice_apply(self, mic_wav, runs, audio_cloak,
+                                     "mic", tag="fin_mic")
+        elif targets and vmode == "fx":
+            if "mic" in targets or con_v is None:
+                mic_v = self._voice_fx_wav(mic_wav, runs, audio_cloak or {})
+            if "content" in targets and con_v is not None:
+                con_v = self._voice_fx_wav(con_v, runs, audio_cloak or {},
+                                           tag="cfx")
+            if con_v is None:
                 print("  (voice: no stems — the voice changer covers the "
                       "mixed track, content audio included)")
-            mic_v = self._voice_fx_wav(mic_wav, runs, audio_cloak or {})
 
         chain: List[str] = []
         inputs: List[Path] = []
-        if content_wav is not None:
-            inputs.append(Path(content_wav))
+        if con_v is not None:
+            inputs.append(Path(con_v))
         inputs.append(Path(mic_v))
         nbus = len(inputs)
         warned_mix_cloak = False
@@ -3239,11 +3668,13 @@ class ReactionVideoProcessor:
                     audio_fade_s=audio_fade_s, sticker=sticker)
                 for w in warns:
                     say(f"  (cloak: {w})")
-                _EncoderRun(self._passthrough_cmd(chain, vp, crf, preset,
-                                                  extra, with_audio=False), pn,
-                            f"part {i + 1}/{len(parts)}", progress_cb=cb,
-                            cancel_check=cancel_check, stall_min=stall_min,
-                            out_path=vp, heartbeat=beat).run()
+                self._run_encode_cpu_fallback(
+                    lambda gpu, _chain=chain, _vp=vp: self._passthrough_cmd(
+                        _chain, _vp, crf, preset, extra, with_audio=False,
+                        prefer_gpu=gpu),
+                    vp, pn, f"part {i + 1}/{len(parts)}", progress_cb=cb,
+                    cancel_check=cancel_check, stall_min=stall_min,
+                    heartbeat=beat)
                 report((prog_before[i] + pn * 0.97) / total_prog,
                        step="audio", part=i + 1, parts=len(parts))
                 beat()

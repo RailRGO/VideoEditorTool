@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
 import shutil
 import socket
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -192,6 +194,22 @@ def _is_ours_alive(port: int) -> bool:
 _ENCODER_CACHE: Dict[str, bool] = {}
 
 
+def _nvenc_ok() -> bool:
+    """Can h264_nvenc ACTUALLY encode here? (smoke-tested, cached)
+
+    Every static ffmpeg build *lists* h264_nvenc, and a GPU-less runtime dies
+    the moment the encoder is opened with "Cannot load libcuda.so.1". That
+    used to take the preview proxy down with it: the proxy failed, the browser
+    never got a stream, and the play button did nothing at all. compose.py
+    already runs a real one-frame encode to find out — the proxy asks the same
+    question instead of trusting the encoder list.
+    """
+    try:
+        return bool(C.nvenc_available(verbose=False))
+    except Exception:
+        return False
+
+
 def _ffmpeg_has_encoder(name: str) -> bool:
     """True when this ffmpeg build can encode with *name* (cached)."""
     if name in _ENCODER_CACHE:
@@ -238,39 +256,93 @@ def ensure_proxy(proc, width: int = 960,
         n_audio = len(proc._probe_audio(str(proc.input)))
     except Exception:
         n_audio = 1
+    vf = f"scale={width}:-2,setsar=1"
+    # Candidates, most faithful first. A multi-track source (OBS mic+desktop,
+    # or a Patreon master carrying mix/content/mic) is folded with amix so the
+    # preview has sound from every track; `amix=inputs=N` alone is NOT valid
+    # for N streams of one input — it needs N labels, which is the bug that
+    # used to kill the proxy (and with it the play button) on stems sources.
+    # Whatever fails, the next candidate is tried, so a weird stream layout
+    # can never cost the user their preview.
+    audio_plans: List[Tuple[str, List[str]]] = []
     if n_audio > 1:
-        audio_args = ["-filter_complex",
-                      f"[0:v]scale={width}:-2[v];"
-                      f"[0:a]amix=inputs={n_audio}:normalize=0,"
-                      "alimiter=limit=-1dB:attack=5:release=50[a]",
-                      "-map", "[v]", "-map", "[a]"]
-    else:
-        audio_args = ["-vf", f"scale={width}:-2", "-ac", "2"]
-    # The proxy is a throwaway preview: prioritise speed over size. NVENC when
-    # the runtime has a GPU (paid Colab) — else the fastest x264 preset. Both
-    # are far quicker than the old `veryfast` CPU encode.
-    if _ffmpeg_has_encoder("h264_nvenc"):
-        vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "28", "-b:v", "0", "-maxrate", "3M", "-bufsize", "6M"]
-    else:
-        vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-maxrate", "3M", "-bufsize", "6M"]
-    cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
-           *audio_args, *vcodec, "-c:a", "aac", "-b:a", "96k",
-           "-movflags", "+faststart", str(out)]
-    # run with progress parsed from the `time=` field
+        splits = ";".join(f"[0:a:{i}]aformat=channel_layouts=stereo[a{i}]"
+                          for i in range(n_audio))
+        labels = "".join(f"[a{i}]" for i in range(n_audio))
+        audio_plans.append(("all tracks mixed", ["-filter_complex",
+            f"[0:v]{vf}[v];{splits};"
+            f"{labels}amix=inputs={n_audio}:duration=longest:normalize=0:"
+            f"dropout_transition=0,alimiter=limit=-1dB:attack=5:release=50,"
+            f"aformat=channel_layouts=stereo[a]",
+            "-map", "[v]", "-map", "[a]"]))
+    audio_plans.append(("first track", ["-vf", vf, "-map", "0:v:0",
+                                        "-map", "0:a:0?", "-ac", "2"]))
+    audio_plans.append(("silent", ["-vf", vf, "-map", "0:v:0", "-an"]))
     dur = max(1.0, float(proc.duration or 1.0))
-    tmp = out.with_suffix(".tmp.mp4")
-    cmd[-1] = str(tmp)
-    p = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE,
-                         text=True, bufsize=1)
-    assert p.stdout is not None
-    for line in p.stdout:
-        m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
-        if m and status is not None:
-            t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-            status["progress"] = max(0.0, min(0.99, t / dur))
-    p.wait()
-    if p.returncode != 0 or not tmp.exists():
-        raise RuntimeError("proxy transcode failed (see ffmpeg output above)")
+    # a unique temp name per builder: /api/proxy/retry can start a second
+    # worker while an old one is still finishing, and two ffmpeg processes
+    # writing one file produce a corrupt proxy (the retry then has to fall
+    # back to a worse audio plan to succeed at all)
+    tmp = out.with_name(f"{out.stem}.{os.getpid()}.{threading.get_ident()}.tmp.mp4")
+
+    tail: List[str] = []
+    audio_args: List[str] = list(audio_plans[0][1])
+
+    def build(use_gpu: bool) -> int:
+        """One transcode attempt; returns the ffmpeg exit code."""
+        tail.clear()
+        # The proxy is a throwaway preview: speed over size. NVENC only when
+        # it survived a real smoke encode (a GPU-less runtime lists it and
+        # then dies on open), ultrafast x264 otherwise — both are far quicker
+        # than the old `veryfast` CPU encode.
+        if use_gpu:
+            vcodec = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "28",
+                      "-b:v", "0", "-maxrate", "3M", "-bufsize", "6M"]
+        else:
+            vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                      "-tune", "fastdecode", "-maxrate", "3M", "-bufsize", "6M"]
+        cmd = ["ffmpeg", "-y", "-v", "info", "-i", str(proc.input),
+               *audio_args, *vcodec, "-c:a", "aac", "-b:a", "96k",
+               "-movflags", "+faststart", str(tmp)]
+        p = subprocess.Popen(cmd, stderr=subprocess.STDOUT,
+                             stdout=subprocess.PIPE, text=True, bufsize=1)
+        assert p.stdout is not None
+        for line in p.stdout:
+            tail.append(line.rstrip())
+            del tail[:-25]
+            m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+            if m and status is not None:
+                t = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                     + float(m.group(3)))
+                status["progress"] = max(0.0, min(0.99, t / dur))
+        p.wait()
+        return int(p.returncode or 0)
+
+    gpu = _nvenc_ok()
+    attempts = [(True, w, a) for w, a in audio_plans] + \
+               [(False, w, a) for w, a in audio_plans] if gpu else \
+               [(False, w, a) for w, a in audio_plans]
+    rc = 1
+    for i, (use_gpu, label, args) in enumerate(attempts):
+        audio_args = args
+        rc = build(use_gpu)
+        if rc == 0 and tmp.exists():
+            if i:
+                print(f"Proxy: built with '{label}' audio"
+                      f"{' on the GPU' if use_gpu else ' on the CPU'}.")
+            break
+        why = " | ".join(t.strip() for t in tail[-4:])[:300]
+        print(f"Proxy attempt '{label}'"
+              f"{' (GPU)' if use_gpu else ' (CPU)'} failed (exit {rc}): {why}")
+        tmp.unlink(missing_ok=True)
+        if status is not None:
+            status.update(progress=0.0)
+    if rc != 0 or not tmp.exists():
+        tmp.unlink(missing_ok=True)
+        why = "\n".join(tail[-6:]) or "no ffmpeg output"
+        raise RuntimeError(
+            f"preview proxy transcode failed (ffmpeg exit {rc}). Last words: "
+            f"{why}")
     tmp.replace(out)
     if status is not None:
         status.update(ready=True, progress=1.0, path=str(out))
@@ -710,6 +782,17 @@ class App:
         self.proxy_gen = 0  # orphaned workers (after a source switch) stand down
         # set by /api/job/cancel; polled by the running render/transcript worker
         self.cancel_requested = False
+
+    def retry_proxy(self) -> Dict[str, Any]:
+        """Rebuild the preview stream after a failure (idempotent)."""
+        self.proxy_status.update(ready=False, progress=0.0, error=None)
+        for bus in ("mic", "content"):
+            st = self.bus_proxies.get(bus)
+            if isinstance(st, dict):
+                st.update(ready=False, progress=0.0, error=None)
+        self.proxy_gen += 1
+        _start_proxy_worker(self, self.proxy_width)
+        return self.proxy_status
 
     # -- state ---------------------------------------------------------------
     def segments(self) -> List[Dict[str, Any]]:
@@ -1565,6 +1648,11 @@ class Handler(BaseHTTPRequestHandler):
                 name = Path(str(body.get("path") or "layout.json")).name
                 p = proc.layout.save(Path(proc.out) / name)
                 self._json({"ok": True, "path": p})
+            elif path == "/api/proxy/retry":
+                # a failed preview build used to be permanent: the worker set
+                # proxy.error, the UI threw it, and the play button was dead
+                # until the notebook was restarted. This just runs it again.
+                self._json({"ok": True, "proxy": app.retry_proxy()})
             elif path == "/api/load_layout":
                 name = str(body.get("path") or "").strip()
                 if not name:
@@ -1611,8 +1699,11 @@ def _start_proxy_worker(app: App, proxy_width: int) -> None:
         except Exception as e:
             if gen != app.proxy_gen:
                 return
-            app.proxy_status.update(ready=False, error=str(e)[:300])
-            print(f"Proxy failed: {e} — exact stills still work.")
+            app.proxy_status.update(ready=False, progress=0.0,
+                                    error=str(e)[:600])
+            print(f"Proxy failed: {e} — exact stills still work, and "
+                  f"POST /api/proxy/retry builds the stream again.")
+            print(traceback.format_exc(limit=3))
 
     threading.Thread(target=_proxy_worker, daemon=True).start()
 

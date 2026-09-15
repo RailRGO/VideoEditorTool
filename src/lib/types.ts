@@ -430,15 +430,41 @@ export interface AudioCloak {
   tilt: number;
   /** Haas stereo widening in ms (delays the right channel) */
   widen: number;
-  /** voice changer on — applies to YOUR voice only (the mic bus) and only
-   * inside the reaction part; intro/outro keep the natural voice */
+  /** voice changer on — re-voices the reaction part only; intro/outro keep
+   * their natural sound. Which track it re-voices is voiceTarget. */
   voiceChanger: boolean;
+  /** which bus the voice engine covers:
+   *  - "content" = the PROGRAMME audio (what Content ID actually
+   *    fingerprints) — the show ends up sounding dubbed, and that is the
+   *    point: it is what stops a copyright match,
+   *  - "mic"     = your commentary only (the original behaviour),
+   *  - "both"    = everything in the reaction part.
+   * Needs the Patreon master with stems to separate the two; with a single
+   * mixed track the engine covers that track instead. */
+  voiceTarget: "content" | "mic" | "both";
   /** how the voice is changed:
-   *  - "rvc" = AI character voice from an RVC .pth model (Colab export;
-   *    a real voice conversion, not pitch tricks — this is what survives
-   *    Content ID),
-   *  - "fx"  = the basic ffmpeg presets (pitch/formant/robot) */
-  voiceMode: "rvc" | "fx";
+   *  - "morph" = the built-in engine (colab_version/voice_morph.py):
+   *    resampling + phase-vocoder formant warp + vibrato/breath/tilt. No
+   *    model file, no download, no torch — ~10x realtime on a Colab CPU,
+   *    so it is the default,
+   *  - "rvc"   = AI character voice from an RVC .pth model (a real neural
+   *    conversion; needs rvc-python and a model),
+   *  - "fx"    = the basic ffmpeg presets (pitch/formant/robot) */
+  voiceMode: "morph" | "rvc" | "fx";
+  /** built-in morph character (voiceMode === "morph") */
+  morphPreset:
+    | "incognito" | "deep" | "bright" | "robot"
+    | "alien" | "warm" | "radio" | "custom";
+  /** morph amount 0..100 — every stage of the morph scales with it */
+  morphStrength: number;
+  /** morph voice seed: same seed = same character on every render */
+  morphSeed: number;
+  /** vocal-tract length override for the morph (0.5..2, 1 = the preset's) */
+  morphFormant: number;
+  /** second character for the mic when voiceTarget === "both" */
+  voicePresetMic: string;
+  /** second seed for the mic when voiceTarget === "both" */
+  morphSeedMic: string | number;
   /** voice changer preset (fx mode) */
   voicePreset: "anon" | "deep" | "high" | "robot" | "custom";
   /** voice changer strength 0..100 (fx mode) */
@@ -465,7 +491,14 @@ export const defaultAudioCloak: AudioCloak = {
   tilt: 2,
   widen: 6,
   voiceChanger: false,
-  voiceMode: "rvc",
+  voiceTarget: "content",
+  voiceMode: "morph",
+  morphPreset: "incognito",
+  morphStrength: 85,
+  morphSeed: 0,
+  morphFormant: 1,
+  voicePresetMic: "",
+  morphSeedMic: "",
   voicePreset: "anon",
   voiceStrength: 70,
   voicePitch: 0,

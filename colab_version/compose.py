@@ -788,6 +788,27 @@ def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
 _NVENC_OK: Optional[bool] = None
 
 
+def reset_nvenc_cache() -> None:
+    """Forget the cached encoder verdict.
+
+    A paid runtime can lose its GPU mid-session (driver hiccup, CUDA OOM, the
+    GPU being reclaimed), and the cached "yes" would then keep feeding the
+    dead encoder. Callers that just watched an nvenc command fail reset it and
+    re-probe, so the next pass picks libx264 instead of dying again.
+    """
+    global _NVENC_OK
+    _NVENC_OK = None
+
+
+def force_cpu_encode(why: str = "") -> None:
+    """Pin every later encoder choice in this process to libx264."""
+    global _NVENC_OK
+    os.environ["REACT_GPU"] = "0"
+    _NVENC_OK = False
+    print(f"  encoder: switching to libx264 (CPU) for the rest of this run"
+          f"{' — ' + why if why else ''}")
+
+
 def nvenc_available(verbose: bool = True) -> bool:
     """True only when h264_nvenc can ACTUALLY encode on this machine.
 

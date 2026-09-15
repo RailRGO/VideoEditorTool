@@ -11,6 +11,7 @@ import { Btn, LiveText } from "./components/ui";
 import { AudioEngine } from "./lib/audio";
 import { FaceTracker, type TrackStatus } from "./lib/face";
 import {
+  ProxyError,
   RemoteClient,
   sleep,
   type RemoteJob,
@@ -243,6 +244,8 @@ export default function App() {
   const [sources, setSources] = useState<RemoteSource[]>([]);
   const [proxyProgress, setProxyProgress] = useState(0);
   const [proxyEta, setProxyEta] = useState(0);
+  /** the proxy build failed but the connection is fine — a retry is offered */
+  const [proxyFailed, setProxyFailed] = useState(false);
   const [remoteJob, setRemoteJob] = useState<RemoteJob | null>(null);
   /** which audio bus the remote preview element is playing */
   const [previewBus, setPreviewBus] = useState<"mix" | "mic" | "content">("mix");
@@ -1203,7 +1206,7 @@ export default function App() {
         const st = await client.state();
         if (connectToken.current !== token) return;
         setRemoteInfo(st);
-        if (st.proxy.error) throw new Error(st.proxy.error);
+        if (st.proxy.error) throw new ProxyError(st.proxy.error);
         if (st.proxy.ready) {
           const v = videoRef.current;
           if (!v) return;
@@ -1293,9 +1296,18 @@ export default function App() {
           /* older server without the job queue */
         }
         await awaitProxy(client, token);
+        if (connectToken.current === token) setProxyFailed(false);
       } catch (e) {
         if (connectToken.current === token) {
-          setRemote(null);
+          if (e instanceof ProxyError) {
+            // the connection is fine, only the preview stream failed: keep
+            // the client so the timeline and export still work, and let the
+            // user rebuild the stream (a GPU-less runtime no longer ends the
+            // session — it just falls back to the CPU encoder)
+            setProxyFailed(true);
+          } else {
+            setRemote(null);
+          }
           setRemoteError(e instanceof Error ? e.message : String(e));
         }
       } finally {
@@ -1304,6 +1316,30 @@ export default function App() {
     },
     [awaitProxy]
   );
+
+  /** rebuild the preview stream after a failed transcode */
+  const retryPreview = useCallback(async () => {
+    const client = remoteRef.current;
+    if (!client) return;
+    const token = ++connectToken.current;
+    setConnecting(true);
+    setRemoteError("");
+    setProxyFailed(false);
+    setProxyProgress(0);
+    setProxyEta(0);
+    proxyStartRef.current = 0;
+    try {
+      await client.retryProxy();
+      await awaitProxy(client, token);
+    } catch (e) {
+      if (connectToken.current === token) {
+        if (e instanceof ProxyError) setProxyFailed(true);
+        setRemoteError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (connectToken.current === token) setConnecting(false);
+    }
+  }, [awaitProxy]);
 
   const selectRemoteSource = useCallback(
     async (name: string, folder: "input" | "output" = "input") => {
@@ -1324,8 +1360,10 @@ export default function App() {
         if (connectToken.current !== token) return;
         setSources(s.sources);
         await awaitProxy(client, token);
+        if (connectToken.current === token) setProxyFailed(false);
       } catch (e) {
         if (connectToken.current === token) {
+          if (e instanceof ProxyError) setProxyFailed(true);
           setRemoteError(e instanceof Error ? e.message : String(e));
         }
       } finally {
@@ -1821,7 +1859,7 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    version: 5,
+    version: 6,
     savedAt: new Date().toISOString(),
     sourceFile: fileName,
     sourceDuration: duration,
@@ -1869,8 +1907,18 @@ export default function App() {
     if (p.layout) setLayout(p.layout as LayoutState);
     if (p.audio) setAudio(p.audio as AudioState);
     if (p.retouch) setRetouch(p.retouch as Retouch);
-    if (p.audioCloak)
-      setAudioCloak({ ...defaultAudioCloak, ...(p.audioCloak as AudioCloak) });
+    if (p.audioCloak) {
+      const ac = p.audioCloak as Partial<AudioCloak>;
+      // v5 and older had no voiceTarget: the voice changer was mic-only, so
+      // an old project keeps meaning that instead of silently re-voicing the
+      // show (the new default is "content")
+      const legacyVoice = ac.voiceChanger === true && !ac.voiceTarget;
+      setAudioCloak({
+        ...defaultAudioCloak,
+        ...ac,
+        ...(legacyVoice ? { voiceTarget: "mic" as const } : {}),
+      } as AudioCloak);
+    }
     if (p.videoCloak) setVideoCloak(p.videoCloak as VideoCloak);
     if (p.sticker) setSticker({ ...defaultSticker, ...(p.sticker as Sticker) });
     if (p.cutOpts) setCutOpts(p.cutOpts as CutOptions);
@@ -2572,10 +2620,26 @@ export default function App() {
                           about {fmtTime(proxyEta)} left
                         </p>
                       )}
-                      {remoteError && (
-                        <p className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
-                          {remoteError}
-                        </p>
+                      {(proxyFailed || remoteError) && (
+                        <div className="mx-auto mt-3 max-w-sm rounded-lg border border-rose-400/30 bg-rose-500/10 px-2.5 py-2 text-left">
+                          <p className="text-[11px] leading-relaxed text-rose-200">
+                            The preview stream could not be built. Nothing is lost — your timeline
+                            and the export still work on the server.
+                          </p>
+                          {remoteError && (
+                            <p className="mt-1 break-words font-mono text-[10px] leading-relaxed text-rose-300/80">
+                              {remoteError}
+                            </p>
+                          )}
+                          <Btn
+                            variant="primary"
+                            className="mt-2"
+                            disabled={connecting}
+                            onClick={() => void retryPreview()}
+                          >
+                            {connecting ? "Rebuilding…" : "Rebuild preview stream"}
+                          </Btn>
+                        </div>
                       )}
                     </>
                   )
