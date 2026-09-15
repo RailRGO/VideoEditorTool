@@ -938,9 +938,14 @@ export default function AutoCut({
 
       <Section title="7 · Video disguise (anti-Content ID)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Alter the picture itself so Content ID can’t match frames. Mirror is the strongest single
-          trick. Combine with zoom, hue, blur, rotate and audio pitch. Preview shows the effect; the
-          final render applies the same thing in ffmpeg (hflip, gblur, rotate).
+          Alter the picture itself so Content ID can’t match frames. Combine with zoom, hue, blur,
+          rotate and audio pitch. Preview shows the effect; the final render applies the same thing
+          in ffmpeg (gblur, eq, rotate).
+        </p>
+        <p className="mb-2 text-[11px] leading-relaxed text-sky-300/80">
+          <b>Mirroring moved to the Cloak tab</b> — mode (content only / whole picture), the
+          per-block ticks and the “keep the subtitles readable” strip all live in its own
+          <b> Mirroring</b> section there.
         </p>
         <p className="mb-2 text-[11px] leading-relaxed text-emerald-300/80">
           Intro and outro are always excluded — every disguise here lands on the reaction part only,
@@ -948,25 +953,6 @@ export default function AutoCut({
           it passes a real smoke encode; otherwise it falls back to CPU automatically.
         </p>
         <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() =>
-                setVideoCloak((c) => {
-                  const on = !(c.flipContent || c.flip);
-                  return { ...c, flipContent: on, flip: false };
-                })
-              }
-              className={
-                videoCloak.flipContent || videoCloak.flip
-                  ? "rounded border border-fuchsia-400/40 bg-fuchsia-500/15 px-2 py-1 text-[11px] font-semibold text-fuchsia-100"
-                  : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"
-              }
-            >
-              {videoCloak.flipContent || videoCloak.flip ? "Mirror content ON" : "Mirror content off"}
-            </button>
-            <span className="text-[10px] text-slate-500">Mirrors the content area only — camera and card text stay readable</span>
-          </div>
           <div className="grid grid-cols-2 gap-x-3">
             <Slider label="Zoom" value={videoCloak.zoom} min={1} max={1.12} step={0.005} display={`${Math.round((videoCloak.zoom - 1) * 1000) / 10}%`} onChange={(v) => setVideoCloak((c) => ({ ...c, zoom: v }))} />
             <Slider label="Blur" value={videoCloak.blur} min={0} max={3} step={0.1} display={videoCloak.blur ? `${videoCloak.blur.toFixed(1)}px` : "off"} onChange={(v) => setVideoCloak((c) => ({ ...c, blur: v }))} />

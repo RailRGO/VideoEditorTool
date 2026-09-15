@@ -1,6 +1,6 @@
 # Tests
 
-Two suites. Neither needs a browser or a GPU.
+Three suites. None of them needs a browser or a GPU.
 
 ## Pipeline tests (chunked / resumable renders, stems, cards)
 
@@ -11,6 +11,25 @@ python3 webapp/tests/test_render_parts.py fast   # planning + card + limiter, <1
 python3 webapp/tests/parity_browser_vs_colab.py  # preview == render (node + esbuild)
 RENDER_TEST_DIR=/tmp/rt python3 webapp/tests/test_render_parts.py  # reuse fixtures
 ```
+
+### Mirror tests (Cloak tab → Mirroring)
+
+```bash
+python3 webapp/tests/test_mirror.py        # ~80 checks, ~10 s
+python3 webapp/tests/test_mirror.py fast   # resolve_mirror + planning, no ffmpeg
+```
+
+`resolve_mirror()` is the Python twin of `resolveMirror()` in
+`src/lib/types.ts`: mode (`content` / `frame` / off), the per-block tick when
+the scope is `blocks`, the legacy `flip`/`flipContent` flags of pre-v7
+projects, and the 0…60 % clamp on the strip that stays readable. The tests
+render real files and measure the pixels: the content rect swaps left/right,
+the kept bottom strip does NOT (burned-in subtitles and the bottom of a short
+card live there), a whole-picture mirror flips the frame and still draws the
+card upright, intro/outro never flip, a ticked block flips while its unticked
+neighbour does not — and the last check goes through
+`POST /api/job/render` so the file the webapp hands back is the file the
+preview promised, chunked renders included.
 
 The `fast` half (part planning, card geometry, card speed, the fair-use
 limiter, vignette parity) is pure math and needs no ffmpeg.

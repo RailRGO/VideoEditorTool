@@ -988,8 +988,9 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int,
     post: List[str] = []
 
     if not content_only:
-        # legacy full-frame path (mirroring is content-only there too — it
-        # happens per segment in _passthrough_graph, never full-frame).
+        # legacy full-frame path: zoom/eq/fisheye land here, and a legacy
+        # `flip` is applied once to the finished programme after the concat
+        # (see _passthrough_graph) — a content-rect mirror rides per segment.
         # The fisheye, when the caller resolved one, lands here.
         if abs(rotate) > 0.05:
             pre.append(f"rotate={rotate}*PI/180:fillcolor=black")
@@ -1022,19 +1023,96 @@ def _video_cloak_split(cfg: Optional[Dict[str, Any]], W: int, H: int,
     return pre, post
 
 
+def resolve_mirror(video_cloak: Optional[Dict[str, Any]],
+                   seg: Optional[Dict[str, Any]] = None,
+                   clean: bool = False,
+                   content_only: bool = True) -> Dict[str, Any]:
+    """Python twin of resolveMirror() in src/lib/types.ts.
+
+    Returns {mode, keep_bottom, content_flip, frame_flip}. *clean* spans
+    (intro/outro) are never mirrored — the rule the whole cloak follows:
+    your full-cam solo is exported exactly as recorded.
+
+    * mode "content" → only the watched programme is flipped (camera and the
+      card text stay readable),
+    * mode "frame"   → the whole picture, camera included,
+    * mode "legacy"  → a project saved before v7 (`flip` / `flipContent`):
+      whole frame when contentOnly is off, content rect otherwise.
+    * mirrorScope "blocks" means only the segments carrying `mirror: true`
+      flip — the tick list the Cloak tab shows.
+
+    *content_only* is the project's `videoCloak.contentOnly`: a legacy `flip`
+    on the old full-frame path flips the WHOLE frame in the browser, so it has
+    to flip the whole frame here too (the twin of `legacyWhole`).
+    """
+    off = {"mode": "off", "keep_bottom": 0.0, "content_flip": False,
+           "frame_flip": False, "legacy_whole": False}
+    if clean:
+        return off
+    c = video_cloak or {}
+    raw = c.get("mirrorMode")
+    if raw in ("off", "content", "frame"):
+        mode = str(raw)
+    elif c.get("flipContent"):
+        mode = "content"
+    elif c.get("flip"):
+        mode = "legacy"
+    else:
+        mode = "off"
+    if mode == "off":
+        return off
+    if str(c.get("mirrorScope") or "reaction").lower() == "blocks" \
+            and not (seg or {}).get("mirror"):
+        return off
+    kb = 0.0
+    if mode == "content":
+        try:
+            kb = max(0.0, min(0.6, float(c.get("mirrorKeepBottom") or 0.0)))
+        except (TypeError, ValueError):
+            kb = 0.0
+    if mode == "legacy":
+        # pre-v7 `flip`: the whole frame on the legacy (contentOnly=false)
+        # path, the content rect everywhere else — bit-for-bit what render.ts
+        # does. `legacy_whole` flips the segment's own picture (before the
+        # card and the camera restore are drawn), NOT the finished frame:
+        # that is the order the browser canvas uses.
+        return {"mode": mode, "keep_bottom": 0.0,
+                "content_flip": bool(content_only),
+                "frame_flip": False,
+                "legacy_whole": not content_only}
+    return {"mode": mode, "keep_bottom": kb,
+            "content_flip": mode == "content",
+            "frame_flip": mode == "frame",
+            "legacy_whole": False}
+
+
 def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
-                           content_rect: Optional[Dict[str, float]] = None) -> List[str]:
+                           content_rect: Optional[Dict[str, float]] = None,
+                           mirror: Optional[Dict[str, Any]] = None) -> List[str]:
     """Filters that apply ONLY to the content area when contentOnly=True.
 
     The fisheye is NOT part of this list: it is a per-segment stage (the
     `remap` filter with its map inputs, or an in-chain filter on other
     builds) that _passthrough_graph splices in AFTER these — so intro/outro
     can skip it while body/mute/fast/card keep it.
+
+    The content mirror is NOT part of this list either when a bottom strip
+    has to stay readable (`mirrorKeepBottom`): that needs a crop + hflip +
+    overlay, which the caller builds (see _passthrough_graph). With no strip
+    kept, a plain hflip is all it takes and it lands here.
     """
     c = cfg or {}
     has_on = bool(c.get("on", False))
+    mir = mirror
+    if mir is None:
+        flip_content = bool(c.get("flipContent") or c.get("flip")) if has_on else False
+        keep_bottom = 0.0
+    else:
+        flip_content = bool(mir.get("content_flip"))
+        keep_bottom = float(mir.get("keep_bottom") or 0.0)
     if not has_on or not c.get("contentOnly", True):
-        return []
+        if not flip_content:
+            return []
     zoom = max(1.0, min(1.2, float(c.get("zoom", 1.0)))) if has_on else 1.0
     saturate = float(c.get("saturate", 100.0)) / 100.0 if has_on else 1.0
     contrast = float(c.get("contrast", 100.0)) / 100.0 if has_on else 1.0
@@ -1043,12 +1121,11 @@ def _content_cloak_filters(cfg: Optional[Dict[str, Any]], W: int, H: int,
     grain = float(c.get("grain", 0.0)) if has_on else 0.0
     blur = float(c.get("blur", 0.0)) if has_on else 0.0
     rotate = float(c.get("rotate", 0.0)) if has_on else 0.0
-    # `flip` is a legacy alias — all mirroring is content-only, so the
-    # camera corner and the card text stay readable
-    flip_content = bool(c.get("flipContent", False) or c.get("flip", False)) if has_on else False
 
     f: List[str] = []
-    if flip_content:
+    if flip_content and keep_bottom <= 0.001:
+        # the whole content area flips; with a strip kept, the caller does
+        # the crop + hflip + overlay instead
         f.append("hflip")
     if abs(rotate) > 0.05:
         f.append(f"rotate={rotate}*PI/180:fillcolor=black")
@@ -1246,7 +1323,9 @@ def plan_parts(kept: List[Dict[str, Any]], fast_speed: float,
         # programme seconds per source second — a fast span's (or a sped-up
         # card's) programme time is its source time DIVIDED by its speed
         rate = 1.0 / max(1e-6, C.seg_speed(s, float(fast_speed)))
-        base = {k: s[k] for k in ("type", "card") if k in s}
+        # `mirror` rides along: a chunked render slices segments, and the
+        # tick has to survive the slice or the parts lose the mirror
+        base = {k: s[k] for k in ("type", "card", "mirror") if k in s}
         while b - a > 1e-6:
             take = b - a
             room = part_target - cur_len
@@ -2422,10 +2501,24 @@ class ReactionVideoProcessor:
             warns)
         if fe_plan.note:
             warns.append(fe_plan.note)
+        # Mirror (Cloak tab → Mirroring), resolved per segment BEFORE the
+        # filters: it needs the crop + overlay path even when the frame
+        # cloak itself is switched off. Intro/outro always resolve to "off".
+        clean = _clean_flags(kept)
+        # The browser draws the mirror with `scene.cloak ?? EMPTY_CLOAK`, and
+        # EMPTY_CLOAK is contentOnly — so with the frame cloak switched off a
+        # legacy `flip` mirrors the content rect, not the whole frame. Only a
+        # live cloak (or a resolved fisheye) makes contentOnly meaningful.
+        cloak_active = bool(vc.get("on", False)) or fe_plan.kind != "none"
+        mirror_of = [resolve_mirror(vc, s, clean[i],
+                                    content_only_mode if cloak_active else True)
+                     for i, s in enumerate(kept)]
+        any_frame_flip = any(m["frame_flip"] for m in mirror_of)
         pre, post = _video_cloak_split(vc, W, H)
         content_filters = _content_cloak_filters(vc, W, H, content_rect)
-        is_content_only = content_only_mode and (bool(vc.get("on", False))
-                                                 or fe_plan.kind != "none")
+        is_content_only = content_only_mode and (
+            bool(vc.get("on", False)) or fe_plan.kind != "none"
+            or any(m["content_flip"] for m in mirror_of))
         # camera corner, restored on top of card spans (see docstring).
         # All rects below are in unflipped coordinates: the full-frame
         # mirror (flip) is applied once to the finished programme after
@@ -2458,7 +2551,39 @@ class ReactionVideoProcessor:
         # reaction-only effect: intro/outro always play untouched at 1.00
         global_speed = float((video_cloak or {}).get("speed", 1.0) or 1.0)
         global_speed = max(0.5, min(2.0, global_speed))
-        clean = _clean_flags(kept)
+
+        def mirror_stage(label: str, i: int, mir: Dict[str, Any]) -> str:
+            """hflip a content-sized frame; keep the bottom strip readable.
+
+            The strip is `mirrorKeepBottom` of the content height, counted
+            from the bottom: a short card already shows the bottom quarter of
+            the programme, and that is exactly where burned-in subtitles sit
+            — flipping it would flip the words. Everything else about the
+            block (the camera in the corner, the card text drawn later) stays
+            readable, which is the promise of a content-only mirror.
+            """
+            if mir.get("mode") != "content":
+                # "legacy" (flip/flipContent) rides inside the content
+                # filters, and "frame" flips the whole picture after the
+                # concat — neither has a strip to keep
+                return label
+            flipped = f"vmfl{i}"
+            kb = int(round(ch * float(mir.get("keep_bottom") or 0.0)))
+            if kb <= 0:
+                chain.append(f"[{label}]hflip[{flipped}]")
+                return flipped
+            # TWO consumers of the same crop (the flip and the strip that is
+            # pasted back), so the crop has to be split first — an ffmpeg
+            # filtergraph label can only be read once
+            a, b, keep = f"vmspa{i}", f"vmspb{i}", f"vmkeep{i}"
+            out_l = f"vmmix{i}"
+            chain.append(f"[{label}]split=2[{a}][{b}]")
+            chain.append(f"[{a}]hflip[{flipped}]")
+            chain.append(f"[{b}]crop={cw}:{kb}:0:{ch - kb}[{keep}]")
+            chain.append(f"[{flipped}][{keep}]"
+                         f"overlay=x=0:y={ch - kb}:format=auto[{out_l}]")
+            return out_l
+
         for i, s in enumerate(kept):
             typ = s.get("type", "body")
             a, b = float(s["start"]), float(s["end"])
@@ -2477,20 +2602,29 @@ class ReactionVideoProcessor:
                 base_vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS"
             if pre and not clean[i]:
                 base_vf += "," + ",".join(pre)
+            mir = mirror_of[i]
+            if mir.get("legacy_whole") and not clean[i]:
+                # pre-v7 `flip` on the legacy full-frame path: the picture
+                # itself flips, then the card and the camera restore are
+                # drawn on top — exactly what the browser canvas does
+                base_vf += ",hflip"
 
             want_camfix = (typ == "card" and cam_ok
                            and _ffmpeg_has_filter("overlay"))
-            # content-only mirror for the legacy cloak path (the content-only
-            # path takes it through content_filters instead) — `flip` is a
-            # legacy alias, the camera and card text are never mirrored
-            want_mirror = (not clean[i]
-                           and bool((video_cloak or {}).get("on", False))
-                           and (bool((video_cloak or {}).get("flip", False))
-                                or bool((video_cloak or {}).get("flipContent", False)))
+            # this block's mirror: mode, per-block tick and the keep-bottom
+            # strip are already resolved (intro/outro came back "off")
+            content_mirror = bool(mir["content_flip"])
+            # the content-only pipeline is what can keep a mirrored block's
+            # bottom strip readable — take it whenever the mirror needs it,
+            # even with the frame cloak itself switched off
+            use_content_pipe = (not clean[i]) and is_content_only and \
+                (bool(content_filters) or fe is not None or content_mirror)
+            # fallback for a contentOnly=False project: mirror the content
+            # rect on its own, exactly the way flip/flipContent always did
+            want_mirror = ((not use_content_pipe) and content_mirror
                            and _ffmpeg_has_filter("overlay"))
 
-            if not clean[i] and is_content_only and \
-                    (content_filters or fe is not None):
+            if use_content_pipe:
                 # Split trimmed frame into base and content crop
                 tmp_label = f"vtmp{i}"
                 chain.append(f"[vin{i}]{base_vf}[{tmp_label}]")
@@ -2523,6 +2657,8 @@ class ReactionVideoProcessor:
                     # ensure final size matches content rect
                     cf_vf = ",".join([crop_vf] + cf + [f"scale={cw}:{ch}:flags=lanczos"])
                     chain.append(f"[{content_src_label}]{cf_vf}[{content_filt_label}]")
+                # mirror the content crop (keeps the bottom strip readable)
+                content_filt_label = mirror_stage(content_filt_label, i, mir)
                 # overlay filtered content back onto base
                 ov_x = cx
                 ov_y = cy
@@ -2553,6 +2689,17 @@ class ReactionVideoProcessor:
                     mcur = f"vm{i}"
                     chain.append(f"[{mbase}][{mfl}]overlay=x={cx}:y={cy}:"
                                  f"format=auto[{mcur}]")
+                    # keep-bottom strip: crop it off the UNFLIPPED base and
+                    # paste it back over the flipped content (subtitles)
+                    kb = int(round(ch * float(mir.get("keep_bottom") or 0.0)))
+                    if kb > 0:
+                        keep = f"vmkb{i}"
+                        chain.append(f"[{cur}]crop={cw}:{kb}:{cx}:"
+                                     f"{cy + ch - kb}[{keep}]")
+                        kn = f"vmk{i}"
+                        chain.append(f"[{mcur}][{keep}]overlay=x={cx}:"
+                                     f"y={cy + ch - kb}:format=auto[{kn}]")
+                        mcur = kn
                     cur = mcur
                 if want_camfix:
                     # a second tap of the trimmed base feeds the camera restore
@@ -2562,8 +2709,12 @@ class ReactionVideoProcessor:
                     cur = card_branch
 
             if typ == "card":
+                # a whole-picture mirror flips this overlay too, so the card
+                # is drawn pre-flipped at its unflipped spot: after the hflip
+                # it lands where the browser draws it, with upright words
                 png = self._card_png({**(card or {}), **(s.get("card") or {})},
-                                     W, H, content=content_rect)
+                                     W, H, content=content_rect,
+                                     flip=bool(mir["frame_flip"]))
                 if png is not None and _ffmpeg_has_filter("overlay"):
                     path, ox, oy = png
                     nxt = f"vo{i}"
@@ -2581,7 +2732,18 @@ class ReactionVideoProcessor:
                     warns.append("overlay filter missing — card skipped")
             chain.append(f"[{cur}]setsar=1[v{i}]")
             vouts.append(f"[v{i}]")
-        chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcat]")
+        chain.append(f"{''.join(vouts)}concat=n={n}:v=1:a=0[vcatraw]")
+        # Whole-picture mirror (mode "frame"): the finished programme flips,
+        # camera included. Done here, once, on the concatenated picture — the
+        # card, the content cloak and the camera restore above are all placed
+        # in unflipped coordinates, so an early flip could never move them
+        # into a corner they were not authored for. The vignette, the bars /
+        # frame and the sticker below are composited AFTER this, exactly the
+        # order the browser canvas draws them in.
+        if any_frame_flip:
+            chain.append("[vcatraw]hflip[vcat]")
+        else:
+            chain.append("[vcatraw]null[vcat]")
 
         # Programme-time map of the finished file. The cloak's speed tweak
         # already lives in the per-segment eff speeds above, so the runs
@@ -2943,7 +3105,8 @@ class ReactionVideoProcessor:
         return result
 
     def _card_png(self, card: Dict[str, Any], W: int, H: int,
-                  content: Optional[Dict[str, float]] = None
+                  content: Optional[Dict[str, float]] = None,
+                  flip: bool = False
                   ) -> Optional[Tuple[Path, int, int]]:
         """The placeholder card as a PNG overlay: (path, x, y).
 
@@ -2954,6 +3117,10 @@ class ReactionVideoProcessor:
         the one the Patreon render and the browser preview draw) is rendered
         to a PNG here and composited with `overlay`, which every ffmpeg
         build has. Identical cards share one file.
+
+        *flip* pre-mirrors the card horizontally: under a whole-picture
+        mirror the finished frame is flipped, and this keeps the exported
+        title/sub upright in the mirrored corner (what the browser draws).
         """
         r = content or {}
         try:
@@ -2992,7 +3159,7 @@ class ReactionVideoProcessor:
         opac = 0.9 if raw_opac is None else float(raw_opac)
         opac = max(0.0, min(1.0, opac))   # 0 = a card the user switched off
         key = (title, sub, accent, img_hash, show_text, variant,
-               round(short_h, 4), round(opac, 4), W, H, rect)
+               round(short_h, 4), round(opac, 4), W, H, rect, bool(flip))
         cache: Dict[Any, Tuple[Path, int, int]] = \
             self.__dict__.setdefault("_card_png_cache", {})
         hit = cache.get(key)
@@ -3006,6 +3173,8 @@ class ReactionVideoProcessor:
         img, x0, y0 = C.card_overlay({"variant": variant}, lay, W, H)
         if img.size == 0:
             return None
+        if flip:
+            img = np.ascontiguousarray(img[:, ::-1])
         digest = hashlib.sha1(repr(key).encode()).hexdigest()[:10]
         path = self.work / f"card_{digest}_{W}x{H}.png"
         C.write_png(path, img)

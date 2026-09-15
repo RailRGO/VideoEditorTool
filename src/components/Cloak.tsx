@@ -1,7 +1,18 @@
 import { useRef, useState } from "react";
-import type { AudioCloak, Sticker, VideoCloak } from "../lib/types";
+import {
+  MIRROR_MODE_META,
+  SEGMENT_META,
+  type AudioCloak,
+  type MirrorMode,
+  type MirrorScope,
+  type Segment,
+  type Sticker,
+  type VideoCloak,
+} from "../lib/types";
+import { fmtTime } from "../lib/timeline";
 import type { RemoteClient } from "../lib/remote";
 import { Btn, Note, Section, Segmented, Slider } from "./ui";
+import { cn } from "../utils/cn";
 
 /** the built-in morph characters (colab_version/voice_morph.py PRESETS) */
 const MORPH_PRESETS = [
@@ -23,6 +34,10 @@ export default function CloakPanel({
   sticker,
   setSticker,
   remote,
+  segments,
+  onToggleMirror,
+  onSetAllMirror,
+  onSeek,
 }: {
   audio: AudioCloak;
   setAudio: React.Dispatch<React.SetStateAction<AudioCloak>>;
@@ -32,6 +47,12 @@ export default function CloakPanel({
   setSticker: React.Dispatch<React.SetStateAction<Sticker>>;
   /** present when the Colab backend is connected (uploads + RVC) */
   remote: RemoteClient | null;
+  /** the current timeline — drives the per-block mirror ticks */
+  segments: Segment[];
+  onToggleMirror: (id: string) => void;
+  onSetAllMirror: (on: boolean) => void;
+  /** move the playhead (used by "preview a reaction block") */
+  onSeek: (t: number) => void;
 }) {
   const setA = (p: Partial<AudioCloak>) => setAudio((c) => ({ ...c, ...p }));
   const setV = (p: Partial<VideoCloak>) => setVideo((c) => ({ ...c, ...p }));
@@ -47,6 +68,15 @@ export default function CloakPanel({
     if (src.startsWith("data:") || src.startsWith("blob:") || src.startsWith("http")) return src;
     return remote ? remote.fileUrl(src) : "";
   })();
+
+  /* ------------------------------------------------------------ mirroring */
+  const mirrorMode: MirrorMode = video.mirrorMode ?? "off";
+  const mirrorScope: MirrorScope = video.mirrorScope ?? "reaction";
+  const clean = (s: Segment) => s.type === "intro" || s.type === "outro";
+  const tickable = segments.filter((s) => !clean(s));
+  const ticked = tickable.filter((s) => s.mirror).length;
+  /** a reaction block to jump to, so the effect can actually be seen */
+  const firstReaction = tickable.find((s) => s.type === "body" || s.type === "lead");
 
   const onPickFile = async (file: File | null) => {
     if (!file) return;
@@ -533,6 +563,170 @@ export default function CloakPanel({
       </Section>
 
       <Section
+        title="Mirroring (anti-Content ID)"
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            {mirrorMode === "off"
+              ? "off"
+              : mirrorMode === "frame"
+              ? "whole picture"
+              : "content only"}
+            {mirrorMode !== "off" && mirrorScope === "blocks" && ` · ${ticked} blocks`}
+          </span>
+        }
+      >
+        <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
+          Flipping the watched programme is the strongest single anti-fingerprint move — it
+          destroys frame hashes while everything else stays the same length. Intro and outro are
+          never mirrored (they stay exactly as recorded, like every disguise here).
+        </p>
+        <div className="space-y-2">
+          <Segmented
+            value={mirrorMode}
+            options={[
+              { value: "off", label: "Off" },
+              { value: "content", label: "Content only" },
+              { value: "frame", label: "Whole picture" },
+            ]}
+            onChange={(m) =>
+              // the legacy flags are cleared so the mode is the only truth
+              setV({ mirrorMode: m, flip: false, flipContent: false })
+            }
+          />
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            {MIRROR_MODE_META[mirrorMode].hint}
+          </p>
+
+          <div>
+            <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
+              Which blocks
+            </span>
+            <Segmented
+              value={mirrorScope}
+              options={[
+                { value: "reaction", label: "Reaction part" },
+                { value: "blocks", label: "Only the blocks I tick" },
+              ]}
+              onChange={(s) => setV({ mirrorScope: s })}
+            />
+          </div>
+
+          {mirrorMode === "content" && (
+            <Slider
+              label="Keep the bottom as recorded"
+              value={Math.round((video.mirrorKeepBottom ?? 0) * 100)}
+              min={0}
+              max={60}
+              step={5}
+              display={
+                (video.mirrorKeepBottom ?? 0) > 0
+                  ? `bottom ${Math.round((video.mirrorKeepBottom ?? 0) * 100)}%`
+                  : "mirror everything"
+              }
+              onChange={(v) => setV({ mirrorKeepBottom: v / 100 })}
+              hint="the strip that stays readable — subtitles and burned-in captions live down there, and a short card already shows the bottom 25%"
+            />
+          )}
+
+          {mirrorScope === "blocks" && (
+            <div className="rounded-lg border border-white/10 bg-black/25 p-1.5">
+              <div className="mb-1 flex items-center gap-1.5">
+                <span className="text-[10px] uppercase tracking-wide text-slate-500">Blocks</span>
+                <span className="font-mono text-[10px] text-sky-300">
+                  {ticked}/{tickable.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onSetAllMirror(true)}
+                  className="ml-auto rounded border border-sky-400/40 bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-sky-100 hover:bg-sky-500/25"
+                >
+                  Tick all reaction
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSetAllMirror(false)}
+                  className="rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold text-slate-300 hover:bg-white/10"
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="max-h-48 space-y-0.5 overflow-y-auto pr-0.5">
+                {segments.length === 0 && (
+                  <p className="px-1 py-1 text-[10px] text-slate-500">No timeline yet.</p>
+                )}
+                {segments.map((s) => {
+                  const locked = clean(s);
+                  const on = !!s.mirror && !locked;
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      disabled={locked}
+                      title={
+                        locked
+                          ? "Intro / outro stay exactly as recorded — never mirrored"
+                          : on
+                          ? "Mirrored — click to leave this block as recorded"
+                          : "As recorded — click to mirror this block"
+                      }
+                      onClick={() => onToggleMirror(s.id)}
+                      className={cn(
+                        "flex w-full items-center gap-1.5 rounded-md border px-1.5 py-1 text-left",
+                        on
+                          ? "border-sky-400/40 bg-sky-500/15"
+                          : "border-white/10 bg-black/25 hover:border-white/25",
+                        locked && "cursor-not-allowed opacity-40"
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "shrink-0 rounded border px-1 py-[1px] text-[9px] font-bold uppercase",
+                          SEGMENT_META[s.type].chip
+                        )}
+                      >
+                        {SEGMENT_META[s.type].short}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-400">
+                        {fmtTime(s.start, true)}–{fmtTime(s.end, true)}
+                      </span>
+                      <span
+                        className={cn(
+                          "shrink-0 text-[10px] font-semibold",
+                          locked ? "text-slate-600" : on ? "text-sky-200" : "text-slate-600"
+                        )}
+                      >
+                        {locked ? "clean" : on ? "mirrored" : "—"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1 px-1 text-[10px] leading-relaxed text-slate-500">
+                Rebuilding the timeline (auto-cut, polish, fair-use) creates new blocks and clears
+                the ticks — re-tick them here when you are happy with the cut.
+              </p>
+            </div>
+          )}
+
+          <Note>
+            {mirrorMode === "off"
+              ? "Pick a mode, then scrub the reaction part to see it. The ffmpeg render applies exactly the same flip."
+              : mirrorScope === "blocks" && ticked === 0
+              ? "No block is ticked yet — nothing will be mirrored. Tick the blocks above, or switch to “Reaction part”."
+              : "Preview follows the export: the mirror lands on the reaction spans only, and card text is redrawn unflipped over a mirrored frame."}
+          </Note>
+          {mirrorMode !== "off" && firstReaction && (
+            <Btn
+              className="w-full"
+              onClick={() => onSeek(firstReaction.start + (firstReaction.end - firstReaction.start) / 2)}
+            >
+              Jump to a reaction block to see it
+            </Btn>
+          )}
+        </div>
+      </Section>
+
+      <Section
         title="Frame cloak"
         right={
           <button
@@ -606,12 +800,10 @@ export default function CloakPanel({
             <Slider label="Subtle blur" value={video.blur} min={0} max={3} step={0.1} display={video.blur ? `${video.blur.toFixed(1)}px` : "off"} onChange={(v) => setV({ blur: v })} hint="breaks pixel hashes, keep low" />
             <Slider label="Rotate" value={video.rotate} min={-5} max={5} step={0.25} display={`${video.rotate > 0 ? "+" : ""}${video.rotate.toFixed(2)}°`} onChange={(v) => setV({ rotate: v })} hint="slight tilt adds black edges" />
           </div>
-          <div className="mt-3 space-y-2">
-            <div className="flex items-center gap-2">
-              <button type="button" onClick={() => setV({ flipContent: !(video.flipContent || video.flip), flip: false })} className={video.flipContent || video.flip ? "rounded border border-sky-400/40 bg-sky-500/15 px-2 py-1 text-[11px] font-semibold text-sky-100" : "rounded border border-white/15 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-400"}>{video.flipContent || video.flip ? "Mirror content ON" : "Mirror content off"}</button>
-              <span className="text-[10px] text-slate-500">Mirrors only the watched video — camera and card text stay readable</span>
-            </div>
-          </div>
+          <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
+            Mirroring lives in its own <b>Mirroring</b> section above, with the per-block ticks and
+            the subtitle-safe strip.
+          </p>
           <div className="mt-3 rounded border border-violet-400/20 bg-violet-500/10 p-2">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-semibold text-violet-200">Fisheye lens (content only)</span>

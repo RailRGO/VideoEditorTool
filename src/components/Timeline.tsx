@@ -424,6 +424,15 @@ export default function Timeline(props: Props) {
                     style={{ left: pct(s.start), width: pct(s.end - s.start) }}
                     onPointerDown={(e) => beginSeg(e, s, "move")}
                   >
+                    {/* content mirror tick (Cloak tab → Mirroring → blocks) */}
+                    {s.mirror && s.type !== "intro" && s.type !== "outro" && (
+                      <span
+                        className="absolute right-2.5 top-0.5 z-10 rounded-sm bg-fuchsia-500/80 px-1 text-[8px] font-bold leading-[11px] text-white"
+                        title="This block is mirrored (Cloak tab → Mirroring)"
+                      >
+                        ⇄
+                      </span>
+                    )}
                     <div className="flex h-full flex-col justify-between px-1.5 py-0.5">
                       <span className="truncate text-[9px] font-bold uppercase tracking-wider text-white/90">
                         {meta.short}

@@ -86,6 +86,8 @@ function Row({
   const meta = SEGMENT_META[s.type];
   const len = s.end - s.start;
   const outLen = s.type === "cut" ? 0 : len / segSpeed(s, fastSpeed);
+  /** intro / outro are exported exactly as recorded — never mirrored */
+  const clean = s.type === "intro" || s.type === "outro";
   return (
     <div
       onClick={() => {
@@ -135,6 +137,33 @@ function Row({
         value={s.end}
         onCommit={(v) => onCommit(reposition(segments, s.id, s.start, v))}
       />
+      <button
+        type="button"
+        title={
+          clean
+            ? "Intro / outro are never mirrored — they stay exactly as recorded"
+            : s.mirror
+            ? "Mirrored (Cloak → Mirroring → only the blocks I tick). Click to leave it as recorded"
+            : "Mirror this block on the YouTube cut (Cloak → Mirroring → only the blocks I tick)"
+        }
+        disabled={clean}
+        onClick={(e) => {
+          e.stopPropagation();
+          onCommit(
+            segments.map((x) => (x.id === s.id ? { ...x, mirror: !x.mirror } : x))
+          );
+        }}
+        className={cn(
+          "shrink-0 rounded px-1 text-[11px]",
+          clean
+            ? "cursor-not-allowed text-slate-700"
+            : s.mirror
+            ? "bg-fuchsia-500/25 text-fuchsia-100"
+            : "text-slate-600 hover:bg-white/10 hover:text-fuchsia-200"
+        )}
+      >
+        ⇄
+      </button>
       <span
         className={cn(
           "w-[52px] shrink-0 text-right font-mono text-[10px] tabular-nums",
@@ -266,6 +295,39 @@ export default function SegmentsPanel({
               output {selected.type === "cut" ? fmtTime(0) : fmtTime((selected.end - selected.start) / segSpeed(selected, layout.fastSpeed))}
               {" · "}{selected.type === "cut" ? "removed entirely" : SEGMENT_META[selected.type].text}
             </p>
+            <button
+              type="button"
+              disabled={selected.type === "intro" || selected.type === "outro"}
+              title={
+                selected.type === "intro" || selected.type === "outro"
+                  ? "Intro / outro stay exactly as recorded"
+                  : "Mirror this block on the YouTube cut — Cloak tab → Mirroring → “only the blocks I tick”"
+              }
+              onClick={() =>
+                onCommit(
+                  segments.map((x) =>
+                    x.id === selected.id ? { ...x, mirror: !x.mirror } : x
+                  )
+                )
+              }
+              className={cn(
+                "flex w-full items-center justify-between rounded-lg border px-2 py-1.5 text-[11px] font-semibold",
+                selected.mirror
+                  ? "border-fuchsia-400/40 bg-fuchsia-500/15 text-fuchsia-100"
+                  : "border-white/10 bg-black/25 text-slate-400 hover:border-white/25",
+                (selected.type === "intro" || selected.type === "outro") &&
+                  "cursor-not-allowed opacity-40"
+              )}
+            >
+              <span>⇄ Mirror this block</span>
+              <span className="font-mono text-[10px]">
+                {selected.type === "intro" || selected.type === "outro"
+                  ? "clean span"
+                  : selected.mirror
+                  ? "mirrored"
+                  : "as recorded"}
+              </span>
+            </button>
             {selected.type === "card" && (
               <div className="space-y-1.5 rounded-lg border border-white/10 bg-black/25 p-2">
                 <p className="text-[10px] uppercase tracking-wider text-slate-400">
