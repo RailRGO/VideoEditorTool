@@ -100,8 +100,21 @@ npx tsc --noEmit # type check
 Preview/render tests (no ffmpeg, no browser, a couple of seconds):
 
 ```bash
-npm test                                 # geometry + export-panel suites
+npm test                                 # geometry + audio graph + export panel
 node src/__tests__/render_geometry.test.mjs   # card, mirror, limiter geometry
+node src/__tests__/audio_engine.test.mjs      # attach/detach/attach audio graph
+```
+
+Opt-in real-browser check for the preview audio mix (needs Playwright, a
+Chromium and the dev server — it drives the app, forces the failed `play()`
+that detaches the graph, and checks the mix rebuilds on the same
+context/source node instead of throwing `already connected previously to a
+different MediaElementSourceNode`):
+
+```bash
+npm i -D playwright && npx playwright install chromium
+npm run dev
+node src/__tests__/browser_mix_check.mjs http://localhost:5173/ ./clip.webm
 ```
 
 Pipeline tests — the planning, card and limiter parts run anywhere, the
@@ -134,11 +147,16 @@ download, ~10× realtime on the Colab CPU, duration-exact so A/V can never
 drift. RVC character voices are an opt-in engine: paste a path, an `https://`
 URL or `hf:owner/repo/file.pth` and the notebook fetches it.
 
-Two more voice-changer options: **Keep the audio under cards** stops card
-sections from muting — once the audio is re-voiced it no longer matches the
-fingerprint, so the whole altered audio simply plays on through every card
-(mute sections still silence; cut parts, intro and outro are never altered —
-only the reaction part is). And the re-voiced bus is cached on Drive
+**Keep the audio under cards** (Cloak tab) is a tick of its own, independent
+of the voice changer: on, card sections stop muting and the programme plays
+on through every card — re-voiced exactly the same way, or left as recorded;
+off, a card silences it like it always did (mute sections silence either
+way; cut parts, intro and outro are never altered — only the reaction part
+is). **Mirroring** flips the watched programme content-only, so the camera
+and the card text stay readable and intro/outro stay exactly as recorded —
+and a **short card is never mirrored**: the strip it leaves visible, where
+burned-in subtitles live, comes through unflipped in the preview and in the
+render alike. The re-voiced bus is cached on Drive
 (`output/voice_cache/`, keyed by the audio + voice settings, pruned to the
 newest 8 entries), so a re-render with the same voice settings pulls it from
 there instead of running the engine again. Encoder choices are smoke-tested,

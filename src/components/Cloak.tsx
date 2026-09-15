@@ -213,20 +213,6 @@ export default function CloakPanel({
           ]}
           onChange={(t) => setA({ voiceTarget: t })}
         />
-        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-white/10 bg-black/25 p-2">
-          <input
-            type="checkbox"
-            checked={!!audio.voiceKeepCardAudio}
-            onChange={(e) => setA({ voiceKeepCardAudio: e.target.checked })}
-            className="mt-0.5 accent-fuchsia-400"
-          />
-          <span className="text-[10px] leading-relaxed text-slate-400">
-            <b className="text-slate-200">Keep the audio under cards</b> — with the voice changed,
-            card sections don&apos;t need muting: the whole altered audio keeps playing through
-            every card. Mute sections still silence; cut parts, intro and outro are never altered
-            (only the reaction part is).
-          </span>
-        </label>
         <Segmented
           value={audio.voiceMode ?? "morph"}
           options={[
@@ -476,6 +462,30 @@ export default function CloakPanel({
       </Section>
 
       <Section
+        title="Audio under cards"
+        right={
+          <span className="font-mono text-[10px] text-slate-500">
+            {audio.keepCardAudio ? "keeps playing" : "muted"}
+          </span>
+        }
+      >
+        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-white/10 bg-black/25 p-2">
+          <input
+            type="checkbox"
+            checked={!!audio.keepCardAudio}
+            onChange={(e) => setA({ keepCardAudio: e.target.checked })}
+            className="mt-0.5 accent-fuchsia-400"
+          />
+          <span className="text-[10px] leading-relaxed text-slate-400">
+            <b className="text-slate-200">Keep the audio under cards</b> — on: whatever the audio
+            is, altered or exactly as recorded, it keeps playing through every card. Off: card
+            sections silence it (their usual job — a card hides the stretch the matcher would
+            hear). Mute sections silence either way; cut parts, intro and outro are never altered.
+          </span>
+        </label>
+      </Section>
+
+      <Section
         title="Sticker / overlay image"
         right={
           <button
@@ -630,21 +640,15 @@ export default function CloakPanel({
             />
           </div>
 
-          {mirrorMode === "content" && (
-            <Slider
-              label="Keep the bottom as recorded"
-              value={Math.round((video.mirrorKeepBottom ?? 0) * 100)}
-              min={0}
-              max={60}
-              step={5}
-              display={
-                (video.mirrorKeepBottom ?? 0) > 0
-                  ? `bottom ${Math.round((video.mirrorKeepBottom ?? 0) * 100)}%`
-                  : "mirror everything"
-              }
-              onChange={(v) => setV({ mirrorKeepBottom: v / 100 })}
-              hint="the strip that stays readable — subtitles and burned-in captions live down there, and a short card already shows the bottom 25%"
-            />
+          {mirrorMode !== "off" && (
+            <p className="rounded-lg border border-white/10 bg-black/25 p-2 text-[10px] leading-relaxed text-slate-400">
+              <b className="text-slate-200">Short cards stay unflipped.</b> A short card only
+              covers the top of the programme, so the strip it leaves visible — where subtitles
+              and burned-in captions sit — comes through <b>exactly as recorded</b> while the card
+              is up (with <i>Whole picture</i> the flip pauses for that one span). Everything else
+              in the reaction part is mirrored as usual, and a full card covers the content
+              anyway.
+            </p>
           )}
 
           {mirrorScope === "blocks" && (
@@ -820,8 +824,8 @@ export default function CloakPanel({
             <Slider label="Rotate" value={video.rotate} min={-5} max={5} step={0.25} display={`${video.rotate > 0 ? "+" : ""}${video.rotate.toFixed(2)}°`} onChange={(v) => setV({ rotate: v })} hint="slight tilt adds black edges" />
           </div>
           <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
-            Mirroring lives in its own <b>Mirroring</b> section above, with the per-block ticks and
-            the subtitle-safe strip.
+            Mirroring lives in its own <b>Mirroring</b> section above, with the per-block ticks —
+            and short cards, whose subtitles stay readable, are never flipped by it.
           </p>
           <div className="mt-3 rounded border border-violet-400/20 bg-violet-500/10 p-2">
             <div className="flex items-center justify-between">

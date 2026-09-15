@@ -16,7 +16,8 @@
  *     whole card (backdrop, bar, words, ring) shares that alpha;
  *  4. a mirror flips the picture about its own centre — never about a rect
  *     the picture does not occupy (that used to shift it: overrun on one
- *     side, gap on the other);
+ *     side, gap on the other) — and a SHORT card is never mirrored at all,
+ *     so the strip it leaves visible stays readable;
  *  5. the fair-use limiter inserts short cards instead of long ones, never
  *     "keep the first N minutes and cut the rest".
  *
@@ -590,7 +591,7 @@ console.log("\n== fair-use limiter: trim mode");
 }
 
 /* ================= 10. the Cloak tab's mirror (mode / ticks / strip) ===== */
-console.log("\n== Cloak mirror: modes, per-block ticks, keep-bottom strip");
+console.log("\n== Cloak mirror: modes, per-block ticks, short cards");
 {
   const R0 = (cloak, seg = null) => R.resolveMirror(cloak, seg);
   check(R0(null).mode === "off", "no cloak at all -> nothing is mirrored");
@@ -604,14 +605,21 @@ console.log("\n== Cloak mirror: modes, per-block ticks, keep-bottom strip");
     "whole-picture mode flips the frame (camera included)");
   check(R0({ mirrorMode: "off" }).mode === "off", "off stays off");
 
-  check(near(R0({ mirrorMode: "content", mirrorKeepBottom: 0.25 }).keepBottom, 0.25),
-    "mirrorKeepBottom is read back");
-  check(near(R0({ mirrorMode: "content", mirrorKeepBottom: 0.9 }).keepBottom, 0.6),
-    "…and clamps at 60% of the content height");
-  check(R0({ mirrorMode: "content", mirrorKeepBottom: -2 }).keepBottom === 0,
-    "…and never goes negative");
-  check(R0({ mirrorMode: "frame", mirrorKeepBottom: 0.4 }).keepBottom === 0,
-    "a whole-picture mirror keeps no strip");
+  // a short card only covers the top of the programme: nothing under it is
+  // mirrored, so the strip it leaves visible (subtitles) stays readable
+  check(R0({ mirrorMode: "content" }, { type: "card", card: { variant: "short" } }).mode === "off",
+    "a SHORT card is never mirrored");
+  check(R0({ mirrorMode: "frame" }, { type: "card", card: { variant: "short" } }).mode === "off",
+    "…neither whole-picture nor content-only");
+  check(R0({ mirrorMode: "content" }, { type: "card", card: { variant: "full" } }).mode === "content",
+    "a full card keeps the mirror (it covers the whole content rect)");
+  check(R0({ mirrorMode: "content" }, { type: "card" }).mode === "content",
+    "a card with no variant stored is a full card");
+  check(R0({ mirrorMode: "content", mirrorScope: "blocks" },
+           { type: "card", mirror: true, card: { variant: "short" } }).mode === "off",
+    "a ticked short card stays unmirrored too");
+  check(R0({ mirrorMode: "content" }, { type: "body" }).mode === "content",
+    "reaction blocks are unaffected by the short-card rule");
 
   // projects saved before v7 (the old flip / flipContent flags)
   check(R0({ flipContent: true }).mode === "content", "legacy flipContent reads as content mode");
@@ -632,12 +640,14 @@ console.log("\n== Cloak mirror: modes, per-block ticks, keep-bottom strip");
     on: false, zoom: 1, bars: 0, border: 0, borderColor: "#0ea5e9", saturate: 100,
     contrast: 100, brightness: 100, hue: 0, grain: 0, vignette: 0, flip: false,
     flipContent: false, blur: 0, rotate: 0, speed: 1, contentOnly: true,
-    mirrorMode: "content", mirrorScope: "blocks", mirrorKeepBottom: 0,
+    mirrorMode: "content", mirrorScope: "blocks",
   };
   const segs = [
     { id: "i", type: "intro", start: 0, end: 2, mirror: true },
     { id: "b", type: "body", start: 2, end: 8, mirror: true },
     { id: "c", type: "body", start: 8, end: 10 },
+    { id: "s", type: "card", start: 10, end: 14, mirror: true, card: { variant: "short" } },
+    { id: "f", type: "card", start: 14, end: 18, mirror: true, card: { variant: "full" } },
   ];
   const sceneAt = (t, c = cloak) =>
     R.buildPassthroughScene(segs, t, halves.full, 4, LAYOUT.content, c, LAYOUT.cam, null);
@@ -646,6 +656,13 @@ console.log("\n== Cloak mirror: modes, per-block ticks, keep-bottom strip");
   check(sceneAt(9).mirror === null, "an unticked block is not");
   check(sceneAt(3, { ...cloak, on: true }).mirror?.mode === "content",
     "the mirror lands even with the frame cloak on");
+  // the preview scene is where the short-card rule has to land: the card is
+  // drawn on top, and the strip it leaves visible comes through unflipped
+  check(sceneAt(11).mirror === null, "a short-card span is drawn unmirrored");
+  check(sceneAt(15).mirror?.mode === "content", "a full-card span is mirrored as usual");
+  const shortLog = draw(LAYOUT, sceneAt(11));
+  check(shortLog.filter((e) => e.type === "drawImage" && e.m[0] < 0).length === 0,
+    "no flipped draw happens inside a short card");
 
   const frameScene = sceneAt(3, { ...cloak, mirrorMode: "frame", on: true });
   check(frameScene.mirrorFrame === true, "whole-picture mode sets mirrorFrame");

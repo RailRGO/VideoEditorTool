@@ -7,9 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "npm run test:geometry && npm run test:ui",
+    "test": "npm run test:geometry && npm run test:audio && npm run test:ui",
     "test:geometry": "node src/__tests__/render_geometry.test.mjs",
-    "test:ui": "node src/__tests__/export_panel.test.mjs"
+    "test:ui": "node src/__tests__/export_panel.test.mjs",
+    "test:audio": "node src/__tests__/audio_engine.test.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

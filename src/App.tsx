@@ -904,7 +904,12 @@ export default function App() {
             return false;
           }
         }
-        // last resort: give the element its own audio back and try again
+        // last resort: give the element its own audio back and try again.
+        // The mix is not lost for the session — the engine keeps the
+        // element's context and source node, so the next play (or scan, or
+        // render) rebuilds the graph on them instead of throwing
+        // "already connected previously to a different
+        // MediaElementSourceNode" for the rest of the page's life.
         try {
           eng?.detach();
         } catch {
@@ -913,7 +918,7 @@ export default function App() {
         try {
           await v.play();
           setPlayNote(
-            "Playing without the audio mix — the browser blocked the audio graph. Reload the page to get it back."
+            "Playing without the audio mix — the browser blocked the audio graph. Press play again to rebuild it."
           );
           return true;
         } catch {
@@ -1200,12 +1205,16 @@ export default function App() {
           if (total - timeRef.current.out < 0.08 || v.ended) finish();
         }
 
-        // in YouTube mode the file is already mixed, so mute / card silence everything;
-        // intro & outro keep playing (the voice is baked into the mix)
+        // in YouTube mode the file is already mixed, so mute / card silence
+        // everything; intro & outro keep playing (the voice is baked into the
+        // mix). Cards only silence when "keep the audio under cards" is off —
+        // that tick stands on its own now, so it holds for audio that was
+        // altered (voice changer) and for audio that was not, alike.
+        const keepCardAudio = !!audioCloakRef.current?.keepCardAudio;
         const contentMuted = act
           ? act.type === "cut" ||
             act.type === "mute" ||
-            act.type === "card" ||
+            (act.type === "card" && !keepCardAudio) ||
             (!yt && (act.type === "intro" || act.type === "outro") && lay.muteContentInSolo)
           : false;
         engine().tick(audioRef.current, contentMuted);
@@ -2166,11 +2175,12 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
-    // 8 moves the card-opacity default to 96 % and adds the voice-changer
-    // options (keep audio under cards); 7 added the mirroring block
-    // (mode / scope / keep-bottom) and the per-segment `mirror` tick;
-    // 6 added the transcript
-    version: 8,
+    // 9 makes "keep the audio under cards" a tick of its own (any audio, not
+    // just re-voiced) and drops the mirror's keep-bottom strip: a short card
+    // is never mirrored now. 8 moved the card-opacity default to 96 % and
+    // added the voice-changer options; 7 added the mirroring block
+    // (mode / scope / ticks); 6 added the transcript
+    version: 9,
     savedAt: new Date().toISOString(),
     sourceFile: fileNameRef.current || fileName,
     sourceDuration: durRef.current || duration,
@@ -2247,11 +2257,21 @@ export default function App() {
       // an old project keeps meaning that instead of silently re-voicing the
       // show (the new default is "content")
       const legacyVoice = ac.voiceChanger === true && !ac.voiceTarget;
+      // v9 renamed the card-audio tick: it used to be `voiceKeepCardAudio`
+      // and only did anything with the voice changer on, which is exactly
+      // what the new tick stopped being. An old project keeps whatever it
+      // had ticked.
+      const legacyCardAudio =
+        ac.keepCardAudio === undefined && ac.voiceKeepCardAudio !== undefined;
       const merged = {
         ...defaultAudioCloak,
         ...ac,
         ...(legacyVoice ? { voiceTarget: "mic" as const } : {}),
+        ...(legacyCardAudio
+          ? { keepCardAudio: !!ac.voiceKeepCardAudio }
+          : {}),
       } as AudioCloak;
+      delete (merged as { voiceKeepCardAudio?: boolean }).voiceKeepCardAudio;
       setAudioCloak(merged);
       audioCloakRef.current = merged;
       engine().updateCloak(merged);

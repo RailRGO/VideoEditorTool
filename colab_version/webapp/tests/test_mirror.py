@@ -10,12 +10,13 @@ What is covered, and why each check exists:
 * ``resolve_mirror`` — the Python twin of ``resolveMirror()`` in
   ``src/lib/types.ts``: mode (content / frame / off), the per-block tick
   (``mirrorScope == "blocks"``), the legacy ``flip``/``flipContent`` flags of
-  projects saved before v7, and the 0…0.6 clamp on ``mirrorKeepBottom``.
+  projects saved before v7, and the SHORT-card rule (a card that only covers
+  the top of the programme is never mirrored).
 * a content-only mirror actually flips the CONTENT rect of the finished file
   (colours left/right swap) and never touches intro/outro.
-* ``mirrorKeepBottom`` keeps the bottom strip of a mirrored block exactly as
-  recorded — the strip burned-in subtitles live in, and the bottom of a short
-  card.
+* a SHORT card is never mirrored, whole-picture mode included: the strip the
+  card leaves visible — where burned-in subtitles sit — comes through exactly
+  as recorded, while a full card and every reaction block flip as usual.
 * a whole-picture mirror (``frame``) flips the finished frame, camera and all,
   and is applied ONCE (after the concat) so the card and the camera restore
   cannot be misplaced: the card's words stay upright in the mirrored corner.
@@ -194,26 +195,36 @@ def test_resolve_mirror() -> None:
     frame = R({"mirrorMode": "frame"})
     check("mode frame", frame["mode"], "frame")
     check_true("frame flips the frame", frame["frame_flip"])
-    check_true("frame needs no keep strip", frame["keep_bottom"] == 0)
+    check_true("no keep-strip field survives anywhere",
+               all("keep_bottom" not in m
+                   for m in (content, frame,
+                             R({"mirrorMode": "content"}, {"type": "body"}))))
 
-    check("keepBottom 0.25", R({"mirrorMode": "content",
-                                "mirrorKeepBottom": 0.25})["keep_bottom"], 0.25)
-    check("keepBottom clamps at 0.6",
-          R({"mirrorMode": "content", "mirrorKeepBottom": 0.9})["keep_bottom"],
-          0.6)
-    check("keepBottom never goes negative",
-          R({"mirrorMode": "content", "mirrorKeepBottom": -1})["keep_bottom"],
-          0.0)
-    check("frame mode ignores keepBottom",
-          R({"mirrorMode": "frame", "mirrorKeepBottom": 0.3})["keep_bottom"],
-          0.0)
+    # a SHORT card only covers the top of the programme: the strip below it
+    # (subtitles) has to come through unflipped, so the span never mirrors
+    short = {"type": "card", "card": {"variant": "short"}}
+    full = {"type": "card", "card": {"variant": "full"}}
+    check("short card: content mirror -> off",
+          R({"mirrorMode": "content"}, short)["mode"], "off")
+    check("short card: whole picture -> off",
+          R({"mirrorMode": "frame"}, short)["mode"], "off")
+    check("short card with a tick -> still off",
+          R({"mirrorMode": "content", "mirrorScope": "blocks"},
+            {**short, "mirror": True})["mode"], "off")
+    check("full card keeps the mirror",
+          R({"mirrorMode": "content"}, full)["mode"], "content")
+    check("a card with no variant stored is a full card",
+          R({"mirrorMode": "content"}, {"type": "card"})["mode"], "content")
+    check("reaction blocks are unaffected",
+          R({"mirrorMode": "content"}, {"type": "body"})["mode"], "content")
+    check_true("_is_short_card reads the variant",
+               VP._is_short_card({"type": "card", "card": {"variant": "SHORT"}})
+               and not VP._is_short_card({"type": "body"}))
 
     # legacy projects (saved before v7)
     check("legacy flipContent -> content",
           R({"flipContent": True})["mode"], "content")
     check("legacy flip -> legacy", R({"flip": True})["mode"], "legacy")
-    check("legacy flip has no keep strip",
-          R({"flip": True})["keep_bottom"], 0.0)
     check("mirrorMode wins over the legacy flags",
           R({"mirrorMode": "frame", "flip": True})["mode"], "frame")
 
@@ -293,21 +304,43 @@ def test_graph_strings(proc, fixture: Path) -> None:
     check_true("content mirror emits an hflip", "hflip" in joined)
     check_true("content mirror keeps the frame unflipped",
                "[vcatraw]hflip[vcat]" not in joined)
-    check_true("no keep strip when keepBottom is 0",
-               "vmkeep0" not in joined)
+    check_true("no keep strip machinery as at all",
+               "vmkeep0" not in joined and "vmspa0" not in joined)
 
+    # a short card is sent through with no mirror, tick or no tick
     chain, _w, _e = proc._passthrough_graph(
-        [{"type": "body", "start": 0.0, "end": 2.0}],
-        W=W, H=H, audio_cloak={},
-        video_cloak={"mirrorMode": "content", "mirrorKeepBottom": 0.25},
+        [{"type": "card", "start": 0.0, "end": 2.0,
+          "card": {"variant": "short"}}],
+        W=W, H=H, audio_cloak={}, video_cloak={"mirrorMode": "content"},
         card=None, fast_speed=4.0, master_gain_db=0.0, content_rect=FULL,
         out_fps=30, height=0, audio_inputs=[], cam_rect=CAM)
     joined = ";".join(chain)
-    check_true("keep strip crops the content band", "vmkeep0" in joined)
-    check_true("keep strip is pasted back over the flip",
-               "overlay=x=0:y=270" in joined.replace(" ", ""))
-    check_true("keep strip height is 25% of 360 = 90",
-               f"crop={W}:90:0:270" in joined)
+    check_true("a short card emits no hflip", "hflip" not in joined)
+    check_true("…and no per-segment mirror label", "vmfl0" not in joined)
+
+    chain, _w, _e = proc._passthrough_graph(
+        [{"type": "body", "start": 0.0, "end": 2.0},
+         {"type": "card", "start": 2.0, "end": 4.0,
+          "card": {"variant": "short"}},
+         {"type": "card", "start": 4.0, "end": 6.0,
+          "card": {"variant": "full"}}],
+        W=W, H=H, audio_cloak={}, video_cloak={"mirrorMode": "content"},
+        card=None, fast_speed=4.0, master_gain_db=0.0, content_rect=FULL,
+        out_fps=30, height=0, audio_inputs=[], cam_rect=CAM)
+    joined = ";".join(chain)
+    check_true("the reaction block flips", "vmfl0" in joined)
+    check_true("the short card does not", "vmfl1" not in joined)
+    check_true("the full card does", "vmfl2" in joined)
+
+    chain, _w, _e = proc._passthrough_graph(
+        [{"type": "card", "start": 0.0, "end": 2.0,
+          "card": {"variant": "short"}}],
+        W=W, H=H, audio_cloak={}, video_cloak={"mirrorMode": "frame"},
+        card=None, fast_speed=4.0, master_gain_db=0.0, content_rect=FULL,
+        out_fps=30, height=0, audio_inputs=[], cam_rect=CAM)
+    joined = ";".join(chain)
+    check_true("a short card under whole-picture mode is not flipped",
+               "[vcatraw]hflip[vcat]" not in joined)
 
     chain, _w, _e = proc._passthrough_graph(
         [{"type": "body", "start": 0.0, "end": 2.0}],
@@ -404,13 +437,24 @@ def test_pixels(proc, fixture: Path, work: Path) -> None:
                q["top_right_whiteness"] > 200 and q["top_left_whiteness"] < 120,
                f"{q['top_left_whiteness']:.0f}/{q['top_right_whiteness']:.0f}")
 
-    kept = _render(proc, "keep", [{"type": "body", "start": 0.0, "end": 4.0}],
-                   {"mirrorMode": "content", "mirrorKeepBottom": 0.25})
-    q = quadrants(frame_at(kept, 2.0))
-    check("keep strip: the top still flips", q["top_left"], "blue")
-    check("keep strip: bottom-left stays green (subtitles)", q["bottom_left"],
-          "green")
-    check("keep strip: bottom-right stays yellow", q["bottom_right"], "yellow")
+    # a SHORT card is never mirrored: the strip it leaves visible — where
+    # burned-in subtitles sit — comes through exactly as recorded, while the
+    # body span in the same render flips as usual
+    mixed = _render(proc, "shortcard",
+                    [{"type": "body", "start": 0.0, "end": 2.0},
+                     {"type": "card", "start": 2.0, "end": 4.0,
+                      "card": {"variant": "short"}}],
+                    {"mirrorMode": "content"})
+    body_q = quadrants(frame_at(mixed, 1.0))
+    card_q = quadrants(frame_at(mixed, 3.0))
+    check("the body span is mirrored", body_q["top_left"], "blue")
+    check("short card: bottom-left stays green (subtitles)",
+          card_q["bottom_left"], "green")
+    check("short card: bottom-right stays yellow", card_q["bottom_right"],
+          "yellow")
+    check_true("short card: the marker stays put too",
+               card_q["top_left_whiteness"] < 120,
+               f"{card_q['top_left_whiteness']:.0f}")
 
     framed = _render(proc, "frame", [{"type": "body", "start": 0.0, "end": 4.0}],
                      {"mirrorMode": "frame"})
@@ -546,16 +590,17 @@ def test_http_render(tmp: Path, fixture: Path) -> None:
 
     body = {
         "target": "youtube", "name": "mirror_job",
-        "segments": [{"type": "body", "start": 0.0, "end": 4.0,
-                      "mirror": True}],
+        "segments": [{"type": "body", "start": 0.0, "end": 2.0,
+                      "mirror": True},
+                     {"type": "card", "start": 2.0, "end": 4.0,
+                      "mirror": True, "card": {"variant": "short"}}],
         "layout": VP.L.LayoutState().to_dict(),
         "audio": {}, "retouch": {"enabled": False},
         "audioCloak": {"on": False},
         # exactly what the Cloak tab posts: content mirror, tick list, and a
-        # bottom strip that has to stay readable
+        # short card whose visible strip has to stay readable
         "videoCloak": {"on": False, "contentOnly": True,
-                       "mirrorMode": "content", "mirrorScope": "blocks",
-                       "mirrorKeepBottom": 0.25},
+                       "mirrorMode": "content", "mirrorScope": "blocks"},
         "crf": 30, "height": 0, "partTarget": 0,
     }
     req = urllib.request.Request(base + "/api/job/render",
@@ -580,15 +625,22 @@ def test_http_render(tmp: Path, fixture: Path) -> None:
     if not fin.exists():
         check_true(False, "the render produced a file", str(fin))
         return
-    fr = frame_at(fin, 2.0)
+    # the ticked BODY block: mirrored in the finished file
+    fr = frame_at(fin, 1.0)
     # the layout's content rect (the box the renderer mirrors)
     crx, cry, crw, crh = 0.294, 0.289, 0.7, 0.7
     inx = lambda p: crx + crw * p                                       # noqa: E731
     iny = lambda p: cry + crh * p                                       # noqa: E731
     top = _dom(_mean(fr, inx(0.05), inx(0.35), iny(0.05), iny(0.3)))
-    bottom = _dom(_mean(fr, inx(0.05), inx(0.35), iny(0.85), iny(0.97)))
     check("the ticked block is mirrored in the finished file", top, "blue")
-    check("the kept bottom strip is still as recorded (green subtitles)",
+    # the ticked SHORT card: the strip it leaves visible is as recorded
+    fr_card = frame_at(fin, 3.0)
+    # the card covers the top 75 % of the content rect; below it the strip
+    # that has to stay readable
+    strip_y = cry + crh * 0.8
+    bottom = _dom(_mean(fr_card, inx(0.05), inx(0.35), strip_y,
+                        min(1.0, strip_y + 0.12)))
+    check("the short card leaves its strip as recorded (green subtitles)",
           bottom, "green")
 
 

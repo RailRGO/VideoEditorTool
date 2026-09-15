@@ -369,9 +369,10 @@ def default_audio_cloak() -> Dict[str, Any]:
         "morphFormant": 1.0,         # 0.5..2.0 vocal-tract override (1 = preset)
         "voicePresetMic": "",        # 2nd character for the mic when target=both
         "morphSeedMic": "",          # 2nd seed for the mic when target=both
-        # while the voice changer is on, card sections keep the (re-voiced)
-        # audio playing instead of silencing it — mute spans still silence
-        "voiceKeepCardAudio": False,
+        # card sections keep the audio playing instead of silencing it —
+        # a tick of its own, for re-voiced and untouched audio alike; mute
+        # spans still silence (projects before v9 stored voiceKeepCardAudio)
+        "keepCardAudio": False,
         # RVC character voice settings (voiceMode == "rvc")
         "rvcModel": "",         # path, https:// URL or hf:owner/repo/file.pth
         "rvcIndex": "",         # optional path to the .index file
