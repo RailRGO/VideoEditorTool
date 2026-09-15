@@ -83,7 +83,8 @@ export interface Scene {
   mirror?: { mode: MirrorMode | "legacy" } | null;
   /** whole-picture mirror: the camera corner is restored from a flipped rect */
   mirrorFrame?: boolean;
-  /** user overlay image — reaction spans only (YouTube passthrough) */
+  /** user overlay image — reaction spans only (Patreon composite *and*
+   * YouTube passthrough; intro/outro come through clean) */
   sticker?: Sticker | null;
 }
 
@@ -183,11 +184,23 @@ const FLAT: LayerStyle = {
   opacity: 1,
 };
 
+/**
+ * Patreon composite scene (camera corner + content block, cards, lead-in).
+ *
+ * *sticker* is the user's overlay image (subscribe button / logo): it is
+ * painted last, on the reaction part only. Intro and outro are exported
+ * exactly as recorded, so they never carry it — the same rule the Colab
+ * compositor (compose.compose_frame) and the YouTube passthrough follow.
+ * Without this the panel happily showed the uploaded thumbnail while the
+ * preview and the Patreon render drew nothing at all.
+ */
 export function buildScene(
   layout: LayoutState,
   segs: Segment[],
   srcTime: number,
-  halves: { cam: SrcRect; content: SrcRect; full: SrcRect }
+  halves: { cam: SrcRect; content: SrcRect; full: SrcRect },
+  /** user overlay image — reaction spans only */ 
+  sticker?: Sticker | null
 ): Scene {
   const active = segs.find((s) => srcTime >= s.start && srcTime < s.end);
   const type = active?.type ?? "body";
@@ -197,6 +210,7 @@ export function buildScene(
       : layout.bg.source === "camera"
       ? halves.cam
       : halves.full;
+  const stick = sticker && sticker.on && sticker.src ? sticker : null;
 
   if (type === "cut") return { bg: null, layers: [], mode: "cut", speed: 1 };
 
@@ -208,6 +222,7 @@ export function buildScene(
   });
 
   if (type === "intro" || type === "outro") {
+    // solo = the full-cam intro/outro: no effect ever lands here
     return {
       bg: bgOf(),
       layers: [
@@ -220,6 +235,7 @@ export function buildScene(
       ],
       mode: "solo",
       speed: 1,
+      sticker: null,
     };
   }
 
@@ -234,12 +250,13 @@ export function buildScene(
       speed: Math.max(1, active?.card?.speed ?? 1),
       cardRect: contentPicture(layout, halves.content),
       cardText: active?.card,
+      sticker: stick,
     };
   }
 
   // lead-in: reaction layout, but the content block is still black
   if (type === "lead") {
-    return { bg: bgOf(), layers: [camLayer()], mode: "lead", speed: 1 };
+    return { bg: bgOf(), layers: [camLayer()], mode: "lead", speed: 1, sticker: stick };
   }
 
   const base: Scene = {
@@ -253,6 +270,7 @@ export function buildScene(
     ],
     mode: "body",
     speed: 1,
+    sticker: stick,
   };
   if (type === "fast") {
     base.mode = "fast";
@@ -544,7 +562,8 @@ function drawCard(
   // Opacity is exact: 1 = fully opaque, 0 = the card isn't drawn at all.
   // (The old code clamped it to 0.05 and the gradient carried its own 0.94 /
   // 0.96 alpha, so 0 % still showed a card and 100 % was never opaque.)
-  const opacity = Math.max(0, Math.min(1, layout.card.opacity ?? 0.96));
+  // 0.97 is the house default, here and in compose.py's card_overlay().
+  const opacity = Math.max(0, Math.min(1, layout.card.opacity ?? 0.97));
   if (opacity <= 0.001 || w <= 1 || h <= 1) return;
   // Use the same shape/radius as the content layer so the card fully covers it
   // (old fixed 28px radius left tiny gaps in the corners)

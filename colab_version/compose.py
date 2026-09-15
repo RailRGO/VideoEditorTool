@@ -389,8 +389,8 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     # card the user had turned off
     _sh = getattr(layout.card, "shortHeight", 0.75)
     short_h = max(0.2, min(1.0, 0.75 if _sh is None else float(_sh)))
-    _op = getattr(layout.card, "opacity", 0.96)
-    opacity = max(0.0, min(1.0, 0.96 if _op is None else float(_op)))
+    _op = getattr(layout.card, "opacity", 0.97)
+    opacity = max(0.0, min(1.0, 0.97 if _op is None else float(_op)))
     if opacity <= 0.001:
         # 0 % means no card — not a 5 % ghost of one
         return np.zeros((0, 0, 4), np.uint8), 0, 0
@@ -513,6 +513,111 @@ def vignette_overlay(W: int, H: int, amount: float) -> np.ndarray:
     return img
 
 
+# ---------------------------------------------------------------------------
+# user sticker / overlay image (subscribe button, like reminder, logo …)
+# ---------------------------------------------------------------------------
+
+_sticker_cache: Dict[str, Optional[np.ndarray]] = {}
+
+
+def load_sticker_image(spec: str, base_dir: Optional[str] = None
+                       ) -> Optional[np.ndarray]:
+    """Decode a sticker image to BGRA (alpha preserved).
+
+    *spec* is what the UI stores in ``sticker.src``: a data URL, an http(s)
+    URL, an absolute path, or — in Colab mode — the bare name of an uploaded
+    asset, which lives next to the output (``base_dir``). Cached: the
+    compositor asks once per frame.
+    """
+    s = (spec or "").strip()
+    if not s:
+        return None
+    key = (s if len(s) < 8192 else hashlib.sha1(
+        s.encode("utf-8", "ignore")).hexdigest()) + "|" + str(base_dir or "")
+    if key in _sticker_cache:
+        return _sticker_cache[key]
+    img = None
+    try:
+        if s.startswith("data:"):
+            b64 = s.split(",", 1)[1] if "," in s else ""
+            raw = base64.b64decode(b64)
+            img = cv2.imdecode(np.frombuffer(raw, np.uint8),
+                               cv2.IMREAD_UNCHANGED)
+        elif s.startswith(("http://", "https://")):
+            import urllib.request
+            with urllib.request.urlopen(s, timeout=30) as r:
+                raw = r.read(20_000_000)
+            img = cv2.imdecode(np.frombuffer(raw, np.uint8),
+                               cv2.IMREAD_UNCHANGED)
+        else:
+            p = Path(s)
+            if not p.is_absolute() and base_dir:
+                p = Path(base_dir) / p.name
+            if p.is_file() and p.stat().st_size < 30_000_000:
+                img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    except Exception:
+        img = None
+    if img is None or getattr(img, "size", 0) == 0:
+        img = None
+    elif img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    else:
+        img = img.astype(np.uint8, copy=True)
+    if len(_sticker_cache) > 8:
+        _sticker_cache.clear()
+    _sticker_cache[key] = img
+    return img
+
+
+def draw_sticker(canvas: np.ndarray, sticker: Optional[Dict[str, Any]],
+                 W: int, H: int, base_dir: Optional[str] = None) -> bool:
+    """Alpha-blend the user's overlay image onto *canvas*, in place.
+
+    Identical math to the browser (`drawSticker` in src/lib/render.ts) and to
+    the ffmpeg passthrough (`_sticker_png` in video_processor.py): x/y is the
+    normalised top-left corner, w the width as a fraction of the frame width,
+    the height follows the image's own aspect, and the result is clamped
+    inside the frame. ``opacity`` multiplies the image's own alpha.
+
+    Returns True when something was painted. Nothing happens for an off /
+    empty / unreadable sticker, so a render never fails over a missing file.
+    """
+    if not isinstance(sticker, dict) or not sticker.get("on"):
+        return False
+    src = str(sticker.get("src") or "").strip()
+    if not src:
+        return False
+    img = load_sticker_image(src, base_dir)
+    if img is None or img.size == 0:
+        return False
+    try:
+        x = max(0.0, min(1.0, float(sticker.get("x", 0.72))))
+        y = max(0.0, min(1.0, float(sticker.get("y", 0.04))))
+        w = max(0.02, min(1.0, float(sticker.get("w", 0.18))))
+        opacity = max(0.0, min(1.0, float(sticker.get("opacity", 1.0))))
+    except (TypeError, ValueError):
+        return False
+    if opacity <= 0.004:
+        return False
+    dw = max(8, min(W, int(round(W * w))))
+    sh, sw = img.shape[:2]
+    dh = max(8, min(H, int(round(dw * sh / max(1, sw)))))
+    if (dw, dh) != (sw, sh):
+        img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
+    px = max(0, min(W - dw, int(round(x * W))))
+    py = max(0, min(H - dh, int(round(y * H))))
+    alpha = (img[:, :, 3:4].astype(np.float32) / 255.0) * opacity
+    if alpha.max() <= 0.001:
+        return False
+    roi = canvas[py:py + dh, px:px + dw].astype(np.float32)
+    bgr = img[:, :, :3].astype(np.float32)
+    canvas[py:py + dh, px:px + dw] = (roi * (1.0 - alpha) +
+                                      bgr * alpha).astype(np.uint8)
+    return True
+
+
 def write_png(path, bgra: np.ndarray) -> str:
     """Save a BGRA overlay as a PNG ffmpeg can read as an alpha input."""
     cv2.imwrite(str(path), bgra)
@@ -573,8 +678,17 @@ def split_sources(frame: np.ndarray, layout: LayoutState):
 def compose_frame(frame: np.ndarray, layout: LayoutState,
                   mode: str = "body", W: int = 1920, H: int = 1080,
                   cam_hook: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-                  card: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    """Compose one output frame. *mode* is solo|body|cut|fast|card|lead."""
+                  card: Optional[Dict[str, Any]] = None,
+                  sticker: Optional[Dict[str, Any]] = None,
+                  sticker_base: Optional[str] = None) -> np.ndarray:
+    """Compose one output frame. *mode* is solo|body|cut|fast|card|lead.
+
+    *sticker* is the user's overlay image ({on, src, x, y, w, opacity}).
+    It is painted last and only on reaction spans: intro/outro (mode
+    "solo") and cut spans stay exactly as recorded, like every other
+    effect. *sticker_base* is the directory a bare file name resolves in
+    (the output dir on Colab, where uploads land).
+    """
     canvas = np.zeros((H, W, 3), np.uint8)
     canvas[:] = BASE_COLOR
     if mode == "cut":
@@ -611,6 +725,9 @@ def compose_frame(frame: np.ndarray, layout: LayoutState,
         draw_layer(canvas, cam, layout.cam, layout.camStyle)
         if mode == "fast":
             draw_speed_badge(canvas, layout.fastSpeed)
+    # user overlay image, on top of everything, reaction spans only
+    if mode != "solo":
+        draw_sticker(canvas, sticker, W, H, sticker_base)
     return canvas
 
 
@@ -964,7 +1081,9 @@ def render_video(input_path: str, output_path: str,
                  width: int = 1920, height: int = 1080,
                  progress_cb: Optional[Callable[[int, int], None]] = None,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 cam_hook=None) -> Dict[str, Any]:
+                 cam_hook=None,
+                 sticker: Optional[Dict[str, Any]] = None,
+                 sticker_base: Optional[str] = None) -> Dict[str, Any]:
     """Render the full programme through compose_frame().
 
     Returns {path, frames, fps, duration}. Audio is NOT included here —
@@ -1036,7 +1155,8 @@ def render_video(input_path: str, output_path: str,
             if frame is None:
                 break
             out = compose_frame(frame, layout, mode=mode, W=W, H=H,
-                                cam_hook=cam_hook, card=seg_card)
+                                cam_hook=cam_hook, card=seg_card,
+                                sticker=sticker, sticker_base=sticker_base)
             if kind == "pipe":
                 try:
                     writer.stdin.write(out.tobytes())

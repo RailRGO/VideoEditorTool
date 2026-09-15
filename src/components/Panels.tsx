@@ -200,8 +200,8 @@ export function LayoutPanel({
             </Btn>
           </div>
           <p className="text-[10px] text-slate-500">
-            Tip: drag the boxes straight on the preview — they snap to the frame edges, the centre
-            and the usual camera widths, so parking the camera in a corner is one movement.
+            Drag the boxes on the preview — they snap to the frame edges and the usual
+            camera widths.
           </p>
         </div>
       </Section>
@@ -302,8 +302,8 @@ export function AudioPanel({
           <div className="space-y-1.5">
             <Meter label="mix" get={() => getLevels().mic} />
             <p className="text-[10px] leading-relaxed text-slate-500">
-              The YouTube job is cut from your finished Patreon render, so the audio is already
-              mixed — it plays through the anti-fingerprint chain (see the Cloak tab).
+              Cut from your finished Patreon render: already mixed, with the anti-fingerprint
+              chain on top (Cloak tab).
             </p>
           </div>
         </Section>
@@ -312,8 +312,7 @@ export function AudioPanel({
         </Section>
         <Note>
           <strong className="font-semibold">Mute and card segments silence everything</strong>{" "}
-          here — a mixed file can't be split back into voice and content. Cut segments are dropped
-          from the render entirely.
+          here — a mixed file can't be split. Cuts are dropped from the render.
         </Note>
       </div>
     );
@@ -333,8 +332,8 @@ export function AudioPanel({
     <div className="space-y-2.5">
       {previewMixed && (
         <Note>
-          The preview stream is mixed, so what you hear is the rough blend — but every slider
-          below is honoured by the server render, which mixes the real mic and content buses.
+          The preview stream is the rough blend — every slider below is honoured by the server
+          render, which mixes the real mic and content buses.
         </Note>
       )}
       <Section title="Meters">
@@ -463,9 +462,8 @@ export function VideoPanel({
       >
         <p className="mb-2 truncate text-[11px] text-slate-400">{fileName}</p>
         <Note>
-          <strong className="font-semibold">Full-frame passthrough.</strong> The Patreon render is
-          already composed, so it goes to the output untouched — this mode only cuts, mutes,
-          fast-forwards and covers parts with a card.
+          <strong className="font-semibold">Full-frame passthrough.</strong> The finished Patreon
+          render goes out untouched; this mode only cuts, mutes, fast-forwards and cards.
         </Note>
       </Section>
 
@@ -549,8 +547,8 @@ export function ClaimsPanel({
     <div className="space-y-2.5">
       <Section title="Claimed segments">
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          In YouTube Studio → Content → the ⚠ next to your video you can see exactly which
-          segment(s) were matched. Paste them here, one per line, in any of these forms:
+          YouTube Studio → Content → the ⚠ on your video lists the matched segments. Paste
+          them here, one per line:
         </p>
         <pre className="mb-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 p-2 text-[10px] leading-relaxed text-slate-400">
 {`02:14 - 03:40  Song title
@@ -687,32 +685,23 @@ export function ClaimsPanel({
         </p>
       </Section>
 
+      {/*
+        Claim handling. The cut version is the remedy YouTube accepts — send the
+        full reaction to Patreon, keep the trimmed one here. If a claim still
+        lands, the reliable fix is to mark the matched stretch CUT or MUTE and
+        re-render (same as YouTube's own "trim out segment"): most reaction
+        claims are monetise-only, not strikes, and a dispute only makes sense
+        with a licence or genuinely transformative commentary. CARD segments
+        carry no content and stay in — they are the Patreon funnel.
+      */}
       <Note>
-        <strong className="font-semibold">Cut version here, full version on Patreon</strong> —
-        that’s exactly what this tab and the auto-cut are for. The trimmed render simply contains
-        less of the source, which is the one thing that reliably changes what a fingerprint sees.
-        <br />
-        <br />
-        If a claim still lands on the cut version:
-        <br />
-        <span className="ml-1">1.</span> <strong>Trim or mute the matched part</strong> — mark it
+        <strong className="font-semibold">Cut version here, full version on Patreon.</strong>{" "}
+        If a claim still lands, mark the matched stretch{" "}
         <span className="mx-1 rounded border border-rose-400/30 bg-rose-500/15 px-1 text-[10px] text-rose-200">CUT</span>
-        or
-        <span className="mx-1 rounded border border-amber-400/30 bg-amber-500/15 px-1 text-[10px] text-amber-200">MUTE</span>
-        above, re-render, re-upload. This is the same remedy YouTube’s own editor offers, so it
-        clears the claim for good rather than temporarily.
-        <br />
-        <span className="ml-1">2.</span> <strong>Check the claim type.</strong> Most claims on
-        reaction videos are “monetise” (revenue is shared, video stays up, no strike) — you can
-        just accept those. A copyright <em>strike</em> only comes from a takedown request, which is
-        a different, rarer thing.
-        <br />
-        <span className="ml-1">3.</span> <strong>Dispute</strong> if you have a licence or your
-        commentary is genuinely transformative — the more you talk over it, the stronger that
-        argument gets.
-        <br />
-        <span className="ml-1">4.</span> Keep the <strong>CARD</strong> segments in: they carry no
-        content at all, and they’re your funnel to Patreon.
+        or{" "}
+        <span className="mx-1 rounded border border-amber-400/30 bg-amber-500/15 px-1 text-[10px] text-amber-200">MUTE</span>{" "}
+        and re-render — the same remedy YouTube’s own editor offers. Most reaction claims are
+        “monetise”, not strikes.
       </Note>
     </div>
   );
@@ -855,10 +844,8 @@ export function ExportPanel({
         {passthrough ? (
           <div className="space-y-2">
             <Note>
-              YouTube renders as a straight cut of your finished file at the source's own
-              resolution — nothing is resized or re-timed. The only geometry change comes from the
-              Frame Cloak's punch-in zoom and cover bars (Cloak tab → set zoom to 1 and bars to 0
-              for a clean frame).
+              A straight cut of your finished file at its own resolution. Only the Frame
+              Cloak's zoom and cover bars change geometry (Cloak tab).
             </Note>
             {!remote && (
               <>
@@ -932,10 +919,8 @@ export function ExportPanel({
                   ]}
                 />
                 <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">
-                  The server renders in parts and journals each one to Drive, so a
-                  reclaimed runtime costs one part instead of the whole render —
-                  reconnect and press Resume. Anything under 5 min renders in a
-                  single pass either way.
+                  Rendered in parts, each journalled to Drive: a reclaimed runtime costs one
+                  part, then Resume picks it up. Under 5 min is a single pass.
                 </p>
               </div>
             )}
@@ -944,10 +929,8 @@ export function ExportPanel({
                 label="Also write content &amp; mic tracks"
                 value={stems}
                 onChange={setStems}
-                hint="Track 1 is the full mix (what players and Patreon use);
-                      tracks 2 and 3 are the isolated content and mic. The
-                      YouTube cut reads those instead of the mix, so a mute or
-                      card span silences the programme and keeps your voice."
+                hint="track 1 = full mix, tracks 2/3 = content + mic; the YouTube cut
+                      reads 2/3, so a mute silences the show and keeps your voice"
               />
             )}
             {setAudioFadeMs && (
@@ -1012,9 +995,8 @@ export function ExportPanel({
                 </p>
                 {(job?.age_s ?? 0) > 60 && (
                   <p className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-[10px] leading-relaxed text-amber-200">
-                    The encoder has said nothing for {Math.round((job?.age_s ?? 0) / 60)} min.
-                    Colab throttles an idle VM — move the mouse over the notebook tab to keep it
-                    awake. Parts already written are safe.
+                    No encoder output for {Math.round((job?.age_s ?? 0) / 60)} min — move the
+                    mouse over the notebook tab to keep the VM awake. Written parts are safe.
                   </p>
                 )}
                 <p className="text-[10px] leading-relaxed text-slate-500">
@@ -1107,24 +1089,21 @@ export function ExportPanel({
             >
               {remote.encoder.gpu ? (
                 <>
-                  <b className="font-semibold">GPU encoder on.</b> Renders use h264_nvenc —
-                  this is the part that keeps the Colab GPU busy.
+                  <b className="font-semibold">GPU encoder on</b> — h264_nvenc.
                 </>
               ) : remote.encoder.pinned_by_failure ? (
                 <>
-                  <b className="font-semibold">GPU failed earlier, encoding on CPU now.</b>{" "}
-                  It re-tests the GPU automatically when the next render starts
-                  {remote.encoder.pin_reason ? ` (${remote.encoder.pin_reason})` : ""}.
+                  <b className="font-semibold">GPU failed — CPU for now.</b> The next render re-tests
+                  it{remote.encoder.pin_reason ? ` (${remote.encoder.pin_reason})` : ""}.
                 </>
               ) : remote.encoder.forced_cpu_by_user ? (
                 <>
-                  <b className="font-semibold">CPU encoder.</b> REACT_GPU=0 is set, so the
-                  GPU is deliberately bypassed.
+                  <b className="font-semibold">CPU encoder</b> — REACT_GPU=0 is set.
                 </>
               ) : (
                 <>
-                  <b className="font-semibold">CPU encoder.</b> No usable GPU / nvenc on this
-                  runtime — renders still finish, just slower.
+                  <b className="font-semibold">CPU encoder</b> — no usable GPU; renders just take
+                  longer.
                 </>
               )}
             </p>
@@ -1240,9 +1219,8 @@ export function ExportPanel({
           {!remote && (
             <>
               <p className="text-[10px] leading-relaxed text-slate-500">
-                The render plays the programme once from the top and captures the composited canvas
-                plus the processed audio bus, so it takes about as long as the video. Keep this tab
-                visible and don’t switch spaces — browsers throttle hidden tabs.
+                Captures the composited canvas in real time — about as long as the video. Keep
+                the tab visible: browsers throttle hidden tabs.
               </p>
               <p className="font-mono text-[10px] text-slate-600">container: {mime || "unsupported"}</p>
             </>
@@ -1254,9 +1232,8 @@ export function ExportPanel({
         {remote ? (
           <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
             <li>
-              <span className="text-slate-200">Preview here, render there.</span> This tab shows a
-              lightweight proxy stream; the timeline, layout and audio settings you see are sent to
-              the server as a project file.
+              <span className="text-slate-200">Preview here, render there.</span> A lightweight
+              proxy stream plays here; your timeline, layout and audio settings go to the server.
             </li>
             <li>
               <span className="text-slate-200">Full quality from the original.</span> The server
@@ -1271,19 +1248,16 @@ export function ExportPanel({
         ) : (
           <ul className="space-y-1.5 text-[11px] leading-relaxed text-slate-400">
             <li>
-              <span className="text-slate-200">All local, nothing uploaded.</span> The browser
-              streams your 3 GB file straight off the disk, composites frames on a canvas and encodes
-              with MediaRecorder. No server is involved at any point.
+              <span className="text-slate-200">All local, nothing uploaded:</span> the file is
+              read off disk, composited on a canvas and encoded with MediaRecorder.
             </li>
             <li>
-              <span className="text-slate-200">WebM uploads fine.</span> YouTube accepts WebM
-              (VP9 + Opus) natively alongside MP4 and re-encodes everything on ingest, so there is no
-              penalty for handing it a .webm.
+              <span className="text-slate-200">WebM uploads fine.</span> YouTube takes WebM
+              (VP9 + Opus) natively and re-encodes on ingest.
             </li>
             <li>
-              <span className="text-slate-200">Output is much smaller.</span> You render 1080p at the
-              bitrate above — typically a fraction of the OBS original, so the upload is far quicker
-              than re-uploading the source.
+              <span className="text-slate-200">Output is much smaller.</span> 1080p at the bitrate
+              above — far quicker to upload than the source.
             </li>
             <li>
               <span className="text-slate-200">Chrome or Edge only.</span> Safari can neither decode
@@ -1306,8 +1280,8 @@ export function ExportPanel({
             </a>
           </div>
           <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
-            WebM/VP9+Opus uploads to YouTube directly. If you need H.264 for your archive, drop
-            the file through <span className="font-mono">ffmpeg -i in.webm -c:v libx264 -crf 18 -c:a aac out.mp4</span>.
+            Uploads to YouTube as is. For an H.264 archive:{" "}
+            <span className="font-mono">ffmpeg -i in.webm -c:v libx264 -crf 18 -c:a aac out.mp4</span>.
           </p>
         </Section>
       )}

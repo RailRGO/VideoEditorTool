@@ -61,13 +61,15 @@ render the same map.
   *drawn* content picture (fit + zoom + offset), so it can neither overrun the
   picture nor leave a gap at its right/bottom edge; in YouTube mode it covers
   the same content rect the file was composed with. Opacity is literal: 100 %
-  is fully opaque, 0 % draws no card at all (default 96 %), and backdrop,
+  is fully opaque, 0 % draws no card at all (default 97 %), and backdrop,
   accent bar, words and ring share that one alpha. Short cards cover the top
   75 % of the content by default, so subtitles stay visible.
 - **Fair-use limiter** — *Short cards (cut nothing)* keeps every second of the
   reaction and lays short cards over the long talking stretches (8 s of talking
   → 4 s card, repeating; a 30 s stretch gets cards at 8–12 s and 20–24 s), and
-  the card may play a little faster to claw back time. *Trim to limit* is the
+  the stretch play*ed* under the card runs at **1.55×** by default — the card
+  hides the picture, so the faster run is invisible and the render is shorter
+  than the footage it was cut from. The slider goes back to 1× (as recorded). *Trim to limit* is the
   only tool that drops footage: it splits the reaction into equal windows and
   keeps the most speech-dense moment of each, so start, middle and end survive
   instead of the reaction being truncated after the first N minutes. Either way
@@ -84,6 +86,16 @@ render the same map.
   content-only preview streams in the background (video is a stream copy,
   only the audio is re-derived from the original). The mic-channel setting
   from the Audio tab is applied to both the previews and the render.
+- **Sticker / overlay image (Cloak tab)** — upload a transparent PNG (a
+  subscribe button, a like reminder, your logo) and it is painted on the
+  reaction part of the *finished picture*: the overview in the browser, the
+  in-browser export, the Colab **Patreon composite** and the YouTube
+  passthrough. Intro and outro come out exactly as recorded. In Colab mode the
+  image is uploaded to the notebook once and referenced by name, so the render
+  reads it from the output folder.
+- **Nothing is on out of the box** — every disguise ships OFF (frame cloak,
+  audio cloak, voice changer, mirroring, retouch, sticker): a fresh project
+  renders the footage as it was recorded until a box is ticked.
 - **EDL import** — the Claims tab can read back a Reaction Studio EDL
   `.txt`: the whole edit (segments + matched material) lands on the timeline
   in one undoable step.

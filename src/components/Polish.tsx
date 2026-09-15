@@ -156,10 +156,8 @@ export default function Polish({
     <div className="space-y-2.5">
       <Section title="1 · Read the audio">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Two passes over the file, both silent and fast. The <strong>mic</strong> pass finds
-          your pauses, stumbles and repeated takes in the intro and outro. The{" "}
-          <strong>content</strong> pass finds where the video you were watching froze and you had
-          to rewind.
+          Two silent, fast passes: the <strong>mic</strong> one finds pauses, stumbles and
+          repeated takes; the <strong>content</strong> one finds freezes and rewinds.
         </p>
         <div className="flex gap-1.5">
           <Btn
@@ -271,8 +269,8 @@ export default function Polish({
           </div>
         ) : (
           <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-            Whisper, or any tool that exports SRT / VTT / JSON with timestamps, works. (Connect
-            the Colab engine and this tab transcribes the intro/outro for you.)
+            Any tool that exports SRT / VTT / JSON with timestamps works — or the Colab engine,
+            which transcribes the intro/outro for you.
           </p>
         )}
         <div className="flex gap-1.5">
@@ -513,8 +511,7 @@ export default function Polish({
 
       <Section title="6 · Repair the interruptions">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Where the connection dropped you rewound and re-watched a stretch. Keeping the first
-          playthrough and cutting the disruption plus the duplicate gives an uninterrupted flow.
+          Keeps the first playthrough and cuts the disruption plus the duplicate.
         </p>
         <div className="space-y-2">
           <Slider

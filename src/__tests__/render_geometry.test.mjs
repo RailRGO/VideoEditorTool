@@ -223,10 +223,30 @@ function makeCanvas(id, w = 1280, h = 720) {
 }
 
 globalThis.document = { createElement: (t) => makeCanvas(t) };
+/**
+ * Stub image. The 160x40 size is what a sticker/overlay image would report,
+ * and `src =` fires onload synchronously so the sticker cache is warm by the
+ * time renderScene draws — otherwise every sticker test would silently pass
+ * on "nothing was drawn".
+ */
 globalThis.Image = class {
   constructor() {
     this.naturalWidth = 0;
     this.naturalHeight = 0;
+    this.onload = null;
+    this.onerror = null;
+    this.__id = "sticker";
+    this._src = "";
+  }
+  set src(v) {
+    this._src = v;
+    if (!v) return;
+    this.naturalWidth = 160;
+    this.naturalHeight = 40;
+    if (this.onload) this.onload();
+  }
+  get src() {
+    return this._src;
   }
 };
 
@@ -525,7 +545,27 @@ console.log("\n== fair-use limiter: cards mode");
     "chronological, no overlaps"
   );
   check(report.mode === "cards" && report.cards === 2, "report counts the cards");
-  check(near(report.originalBody, 30, 0.1) && near(report.limitedBody, 30, 0.1), "cards mode keeps the whole reaction");
+  check(near(report.originalBody, 30, 0.1), "cards mode keeps the whole reaction as the source length");
+  // the default card speed is 1.55: the picture under a card runs faster, so
+  // the programme gets time back — nothing is dropped from the timeline, the
+  // two 4 s cards simply cost ~2.6 s each
+  check(near(R.defaultFairUse.cardSpeed, 1.55, 0.001),
+    "speed under card defaults to 1.55x", String(R.defaultFairUse.cardSpeed));
+  check(cards.every((c) => near(c.card?.speed ?? 1, 1.55, 0.001)),
+    "every inserted card carries that speed",
+    JSON.stringify(cards.map((c) => c.card?.speed)));
+  const rest = out.filter((s) => s.type === "body");
+  check(near(rest.reduce((a, s) => a + (s.end - s.start), 0), 22, 0.5) &&
+    !out.some((s) => s.type === "cut"),
+    `cards mode drops no footage (${rest.length} body pieces, no cuts)`);
+  check(report.limitedBody < report.originalBody - 1,
+    `the sped cards claw programme time back (${report.limitedBody.toFixed(1)}s of ${report.originalBody.toFixed(1)}s)`);
+  // switching the slider off keeps the old real-time behaviour
+  const plain = R.buildFairUseLimit(segs, 50, { ...R.defaultFairUse, cardSpeed: 1 },
+    speech, { start: 10, end: 40 }, null, 4);
+  check(near(plain.report.limitedBody, 30, 0.2) &&
+    plain.segments.filter((s) => s.type === "card").every((c) => !c.card?.speed),
+    "card speed 1 = as recorded (no speed written on the card)");
 }
 
 /* ======================== 9. fair-use limiter (trim) ===================== */
@@ -701,6 +741,90 @@ console.log("\n== a mirror tick is a real edit");
   ]);
   check(merged2.length === 1 && merged2[0].mirror === true,
     "two ticked neighbours still merge, tick intact");
+}
+
+/* ========================= 12. the sticker overlay ======================= */
+console.log("\n== sticker / overlay image");
+{
+  const halves = R.sourceHalves(3840, 1080, "split", "left");
+  const stickerImg = (over = {}) => ({
+    on: true,
+    src: "subscribe.png",
+    x: 0.72,
+    y: 0.04,
+    w: 0.18,
+    opacity: 1,
+    ...over,
+  });
+  const segs = [
+    { id: "i", type: "intro", start: 0, end: 2 },
+    { id: "b", type: "body", start: 2, end: 6 },
+    { id: "c", type: "card", start: 6, end: 9, card: { variant: "short" } },
+    { id: "l", type: "lead", start: 9, end: 10 },
+    { id: "o", type: "outro", start: 10, end: 12 },
+  ];
+  const sceneAt = (t, st) => R.buildScene(LAYOUT, segs, t, halves, st);
+  // width 18 % of the frame, height follows the image's own 160x40 aspect
+  const want = [0.72 * W, 0.04 * H, 0.9 * W, 0.04 * H + 0.18 * W * (40 / 160)];
+
+  // the composite scene carries the overlay (this used to be null, which is
+  // why the overview and the Patreon render never showed it)
+  check(R.buildScene(LAYOUT, segs, 3, halves).sticker === null,
+    "no sticker configured -> nothing in the scene");
+  check(!!sceneAt(3, stickerImg())?.sticker, "body span: the scene carries the overlay");
+  check(!!sceneAt(6, stickerImg())?.sticker, "card span: the scene carries the overlay");
+  check(!!sceneAt(9, stickerImg())?.sticker, "lead span: the scene carries the overlay");
+  check(sceneAt(1, stickerImg())?.sticker === null,
+    "intro span: never overlaid (exported as recorded)");
+  check(sceneAt(11, stickerImg())?.sticker === null, "outro span: never overlaid");
+
+  const log = draw(LAYOUT, sceneAt(3, stickerImg()));
+  const stick = log.filter((e) => e.type === "drawImage" && e.img === "sticker");
+  check(stick.length === 1, "the overlay is drawn exactly once per frame");
+  check(bboxNear(stick[0]?.bbox, want, 1.5),
+    "at the configured position and width (height follows the aspect)", fmt(stick[0]?.bbox));
+  check(Math.abs(stick[0]?.alpha - 1) < 1e-6, "full opacity by default");
+
+  const ghost = draw(LAYOUT, sceneAt(3, stickerImg({ opacity: 0.5 })));
+  const g = ghost.filter((e) => e.type === "drawImage" && e.img === "sticker")[0];
+  check(!!g && Math.abs(g.alpha - 0.5) < 1e-6, "opacity is applied to the draw", `alpha=${g?.alpha}`);
+
+  // the picture is clamped inside the frame, exactly like _sticker_png does
+  const clamped = draw(LAYOUT, sceneAt(3, stickerImg({ x: 1, y: 1 })));
+  const cl = clamped.filter((e) => e.type === "drawImage" && e.img === "sticker")[0];
+  check(near(cl?.bbox[2], W, 1.5) && near(cl?.bbox[3], H, 1.5),
+    "x/y = 100 % clamps the image inside the frame", fmt(cl?.bbox));
+
+  check(sceneAt(3, stickerImg({ on: false }))?.sticker === null,
+    "the on/off tick is honoured");
+  check(sceneAt(3, stickerImg({ src: "" }))?.sticker === null,
+    "an empty src draws nothing");
+
+  // YouTube passthrough: same rule, different scene builder
+  const yt = R.buildPassthroughScene(segs, 3, halves.full, 4, LAYOUT.content,
+    null, LAYOUT.cam, stickerImg());
+  check(!!yt.sticker, "passthrough body span carries the overlay");
+  const ytIntro = R.buildPassthroughScene(segs, 1, halves.full, 4, LAYOUT.content,
+    null, LAYOUT.cam, stickerImg());
+  check(ytIntro.sticker === null, "passthrough intro stays clean");
+
+  // Colab mode: `sticker.src` is only a *name* on the notebook (that is what
+  // /api/upload hands back and the panel stores), so the preview can only
+  // load it through the resolver the app installs once it is connected.
+  // Without that hop the canvas drew nothing while Drive showed the file.
+  R.setStickerResolver((src) => `https://tunnel.test/files/${encodeURIComponent(src)}`);
+  check(R.stickerPreviewUrl("subscribe.png") === "https://tunnel.test/files/subscribe.png",
+    "a bare notebook name resolves to a URL the browser can load",
+    R.stickerPreviewUrl("subscribe.png"));
+  const remote = draw(LAYOUT, sceneAt(3, stickerImg()));
+  check(remote.filter((e) => e.type === "drawImage" && e.img === "sticker").length === 1,
+    "the notebook-hosted overlay still reaches the preview canvas");
+  check(R.stickerPreviewUrl("data:image/png;base64,AA") === "data:image/png;base64,AA" &&
+    R.stickerPreviewUrl("https://cdn.test/a.png") === "https://cdn.test/a.png",
+    "a local data URL / an http(s) src is used as is");
+  R.setStickerResolver(null);
+  check(R.stickerPreviewUrl("subscribe.png") === "subscribe.png",
+    "disconnecting the backend drops the resolver again");
 }
 
 fs.rmSync(tmp, { force: true });

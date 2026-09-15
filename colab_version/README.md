@@ -213,6 +213,29 @@ pass: ~PI/2) blacked out everything but the frame centre. Cover bars and
 the frame border run once over the joined programme and skip card spans
 via `enable=`, exactly like the preview does.
 
+### Every effect ships OFF, and the overlay image lands in the composite
+
+A fresh project changes nothing: the frame cloak, the audio cloak, the voice
+changer, the mirror, the retouch and the sticker are all off until a box is
+ticked (the Colab-side defaults in `layouts.py` match the browser's). The
+card's opacity default is 97 % and the stretch played under a fair-use card
+runs at 1.55×.
+
+The **sticker / overlay image** (Cloak tab — subscribe button, like reminder,
+logo) is painted last on the reaction part only, and now in *both*
+deliverables. It used to exist only in the YouTube passthrough: the Patreon
+composite — which is what the overview shows and what most people upload to
+Patreon — ignored it completely, so the panel could show the uploaded
+thumbnail while the preview and the render drew nothing. The compositor
+(`compose.draw_sticker`) and the passthrough (`_sticker_png`) share one
+geometry: x/y is the normalised top-left corner, w the width as a fraction of
+the frame, the height follows the image's own aspect, everything clamps to
+the frame, and intro/outro (mode `solo`) stay clean. A bare file name
+resolves inside the output folder, which is where `/api/upload` puts it, so
+the browser, the pre-render preview and the server render agree. The sticker
+is part of a part's cache signature: change the image or its position and the
+affected parts are rebuilt rather than reused.
+
 **Troubleshooting the tunnel link.** The printed URL is reachability-
 checked before it's shown, so if you see one, it works. If the launch
 instead reports that no tunnel could be verified, it has *already* tried,

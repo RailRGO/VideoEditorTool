@@ -155,7 +155,7 @@ console.log("export panel · server render states");
   check(/part 4 of 21/.test(text), "shows which part of how many");
   check(/~12 min left/.test(text), "shows an ETA from elapsed progress");
   check(/encoding/.test(text), "shows the current step");
-  check(!/said nothing/.test(text), "no stall warning while the encoder talks");
+  check(!/no encoder output/i.test(text), "no stall warning while the encoder talks");
   await unmount();
 }
 
@@ -169,8 +169,8 @@ console.log("export panel · server render states");
       step: "encoding", part: 8, parts: 21, eta_s: 0, elapsed_s: 900, age_s: 180,
     }),
   });
-  check(/said nothing for 3 min/.test(text), "warns when the encoder is silent");
-  check(/parts already written are safe/i.test(text), "says the parts are safe");
+  check(/no encoder output for 3 min/i.test(text), "warns when the encoder is silent");
+  check(/written parts are safe/i.test(text), "says the parts are safe");
   await unmount();
 }
 

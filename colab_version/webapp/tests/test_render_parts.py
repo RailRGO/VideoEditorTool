@@ -380,6 +380,81 @@ def test_card_covers_content_only():
     check("scene.cardText" in ts, "renderScene passes per-segment card text")
 
 
+def test_sticker_in_composite():
+    """The overlay image must land in the Patreon COMPOSITE, not just the
+    YouTube passthrough.
+
+    The panel could upload the PNG, show the thumbnail and still leave the
+    preview and the rendered composite without any overlay, because only the
+    passthrough graph knew about stickers. This checks the compositor itself:
+    painted last, on reaction spans only, clamped to the frame, opacity
+    honoured. Pure math — no ffmpeg needed.
+    """
+    print("sticker in the composite")
+    import cv2
+    work = Path(tempfile.mkdtemp(prefix="sticker_math_"))
+    W, H = 640, 360
+    # a full-alpha white square: unmissable in any composite
+    png = work / "overlay.png"
+    img = np.zeros((40, 80, 4), np.uint8)
+    img[..., :3] = 255
+    img[..., 3] = 255
+    cv2.imwrite(str(png), img)
+
+    cam = np.full((H, H * 2, 3), 40, np.uint8)      # left half
+    content = np.full((H, H * 2, 3), 120, np.uint8)  # right half
+    frame = np.hstack([cam, content])
+    lay = L.LayoutState()
+    st = {"on": True, "src": "overlay.png", "x": 0.10, "y": 0.10,
+          "w": 0.25, "opacity": 1.0}
+
+    def mean(img3, rect) -> float:
+        x, y, w, h = (int(round(v)) for v in
+                      (rect[0] * W, rect[1] * H, rect[2] * W, rect[3] * H))
+        return float(img3[y:y + h, x:x + w].mean())
+
+    box = (0.10, 0.10, 0.25, 0.25)
+    for mode in ("body", "lead", "card", "fast"):
+        plain = C.compose_frame(frame, lay, mode=mode, W=W, H=H)
+        stuck = C.compose_frame(frame, lay, mode=mode, W=W, H=H,
+                                sticker=st, sticker_base=str(work))
+        check(mean(stuck, box) > 200 and mean(stuck, box) > mean(plain, box) + 80,
+              f"'{mode}' scenery carries the overlay "
+              f"({mean(stuck, box):.0f} vs {mean(plain, box):.0f})")
+    # intro/outro (solo) are exported exactly as recorded
+    solo_a = C.compose_frame(frame, lay, mode="solo", W=W, H=H)
+    solo_b = C.compose_frame(frame, lay, mode="solo", W=W, H=H,
+                             sticker=st, sticker_base=str(work))
+    check(float(np.abs(solo_a.astype(int) - solo_b.astype(int)).mean()) < 1.0,
+          "intro/outro stay clean — no overlay on a solo frame")
+    # the sticker is never the reason a render fails
+    off = C.compose_frame(frame, lay, mode="body", W=W, H=H,
+                          sticker={**st, "on": False}, sticker_base=str(work))
+    missing = C.compose_frame(frame, lay, mode="body", W=W, H=H,
+                              sticker={**st, "src": "nope.png"},
+                              sticker_base=str(work))
+    check(float(np.abs(off.astype(int) - missing.astype(int)).mean()) < 0.01,
+          "an off / missing sticker paints nothing and does not throw")
+    # opacity is literal, and the box is clamped inside the frame
+    ghost = C.compose_frame(frame, lay, mode="body", W=W, H=H,
+                            sticker={**st, "opacity": 0.5},
+                            sticker_base=str(work))
+    check(mean(ghost, box) < mean(C.compose_frame(
+        frame, lay, mode="body", W=W, H=H, sticker=st, sticker_base=str(work)),
+        box) - 40, "opacity 0.5 blends the overlay instead of pasting it")
+    edge = C.compose_frame(frame, lay, mode="body", W=W, H=H,
+                           sticker={**st, "x": 1.0, "y": 1.0},
+                           sticker_base=str(work))
+    check(int(edge[:, -1].max()) > 200 and int(edge[-1, :].max()) > 200,
+          "x/y = 100 % clamps the image inside the frame")
+    # the passthrough sticker (ffmpeg path) and the compositor share the math
+    ts = (HERE.parent.parent.parent / "src" / "lib" / "render.ts").read_text()
+    body = ts.split("export function buildScene")[1].split("export function")[0]
+    check("stick" in body and 'mode: "solo"' in body,
+          "buildScene paints the overlay on reaction spans and skips solo")
+    shutil.rmtree(work, ignore_errors=True)
+
+
 def test_card_speed():
     """A card may carry its own playback speed — the render must obey it.
 
@@ -1384,6 +1459,68 @@ def test_sticker_reaction_only(root: Path):
     check(d_outro < 1.0, f"no sticker over the outro (Δ {d_outro:.2f})")
 
 
+def test_sticker_in_patreon_render(root: Path):
+    """The uploaded overlay image must land in the PATREON composite render.
+
+    This is the reported bug, end to end: ``/api/upload`` drops the PNG into
+    the output dir and the panel stores the *bare file name* in
+    ``sticker.src``. The browser preview paints it (buildScene → renderScene),
+    so the server render has to paint it too — in the single pass *and* in
+    every chunked part, because each part goes through the compositor on its
+    own. Reaction spans only: intro and outro come out exactly as recorded.
+    """
+    print("sticker overlay in the Patreon composite (uploaded file name)")
+    import cv2 as _cv2
+    src = root / "raw.mp4"
+    out = root / "out_stk_patreon"
+    proc = V.ReactionVideoProcessor(str(src),
+                                    work_dir=str(root / "work_stk_patreon"),
+                                    output_dir=str(out))
+    # exactly what /api/upload writes: u_<ts>_<sanitised name>
+    up_name = f"u_{int(time.time())}_subscribe.png"
+    img = np.zeros((160, 320, 4), np.uint8)
+    img[..., :3] = 0       # solid black box: darker than any scenery
+    img[..., 3] = 255
+    _cv2.imwrite(str(out / up_name), img)
+
+    segs = [{"type": "intro", "start": 0, "end": 2},
+            {"type": "body", "start": 2, "end": 11},
+            {"type": "outro", "start": 11, "end": 13}]
+    lay = L.LayoutState()
+    sticker = {"on": True, "src": up_name, "x": 0.55, "y": 0.35,
+               "w": 0.25, "opacity": 1.0}
+    box = (0.55, 0.35, 0.25, 0.12)   # 320x160 image -> h = 0.5 * w
+    SIZE = (960, 540)
+    kw = dict(target="patreon", segments=segs, layout=lay, crf=30,
+              preset="ultrafast", width=SIZE[0], height=SIZE[1],
+              part_target=3.0)
+    plain = proc.render_project(name="stk_plain", **kw)
+    stuck = proc.render_project(name="stk_on", sticker=sticker, **kw)
+    a, b = Path(plain["mp4"]), Path(stuck["mp4"])
+
+    check(plain["chunked"] is True and plain["parts"] >= 2,
+          f"the test renders in {plain['parts']} parts (one compositor call "
+          "each)")
+    d_body = region_brightness(a, 5.0, box) - region_brightness(b, 5.0, box)
+    check(d_body > 25,
+          f"the uploaded overlay is in the composite's reaction part "
+          f"(Δ {d_body:.0f}/255)")
+    d_late = region_brightness(a, 10.0, box) - region_brightness(b, 10.0, box)
+    check(d_late > 25,
+          f"…and in a later part as well (Δ {d_late:.0f}/255)")
+    d_intro = float(np.abs(frame_gray(a, 1.0, SIZE).astype(int)
+                           - frame_gray(b, 1.0, SIZE).astype(int)).mean())
+    d_outro = float(np.abs(frame_gray(a, 12.0, SIZE).astype(int)
+                           - frame_gray(b, 12.0, SIZE).astype(int)).mean())
+    check(d_intro < 1.0, f"intro stays clean — no overlay (Δ {d_intro:.2f})")
+    check(d_outro < 1.0, f"outro stays clean — no overlay (Δ {d_outro:.2f})")
+    # a renamed / deleted image never fails a render
+    gone = proc.render_project(name="stk_missing",
+                               sticker={**sticker, "src": "u_gone.png"}, **kw)
+    check(Path(gone["mp4"]).is_file(),
+          "an unreadable overlay is skipped, the render still finishes")
+
+
 def test_encoder_fallback():
     """GPU detection must be a real smoke encode, not an encoder listing.
 
@@ -1461,6 +1598,7 @@ def main() -> int:
     test_auto_part_target()
     test_card_covers_content_only()
     test_card_speed()
+    test_sticker_in_composite()
     test_fair_use_cards()
     test_vignette_matches_preview()
     test_encoder_fallback()
@@ -1481,10 +1619,10 @@ def main() -> int:
     # against last run's finished output would prove nothing)
     for d in ("out", "out_resume", "out_yt", "out_yt_single", "out_short",
               "out_http", "out_yt_rect", "out_yt_cloak", "out_fish",
-              "out_clean", "out_sticker", "work",
+              "out_clean", "out_sticker", "out_stk_patreon", "work",
               "work_resume", "work_yt", "work_yt2", "work_short",
               "work_http", "work_yt_rect", "work_cloak", "work_fish",
-              "work_clean", "work_sticker"):
+              "work_clean", "work_sticker", "work_stk_patreon"):
         shutil.rmtree(root / d, ignore_errors=True)
     test_patreon_chunked(root)
     test_short_render_single_pass(root)
@@ -1496,6 +1634,7 @@ def main() -> int:
     test_youtube_card_follows_posted_layout(root)
     test_clean_intro_outro(root)
     test_sticker_reaction_only(root)
+    test_sticker_in_patreon_render(root)
     test_http_api(root)
 
     print(f"\n{CHECKS[0]} checks, {len(FAILS)} failed ({time.time() - t0:.0f}s)")
