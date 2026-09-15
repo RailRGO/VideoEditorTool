@@ -402,9 +402,8 @@ export default function SegmentsPanel({
           </div>
         ) : (
           <p className="text-[11px] leading-relaxed text-slate-500">
-            Click a block in the timeline (or a row below) to edit its type and exact
-            start / end here. Drag a block's edge to extend it — the neighbour gives up
-            the time.
+            Click a block to edit its type and exact start / end. Drag an edge to extend it —
+            the neighbour gives up the time.
           </p>
         )}
       </Section>
@@ -475,11 +474,11 @@ export default function SegmentsPanel({
           />
           <Slider
             label="Card opacity"
-            value={Math.round((layout.card.opacity ?? 0.96) * 100)}
+            value={Math.round((layout.card.opacity ?? 0.97) * 100)}
             min={0}
             max={100}
             step={1}
-            display={`${Math.round((layout.card.opacity ?? 0.96) * 100)}%`}
+            display={`${Math.round((layout.card.opacity ?? 0.97) * 100)}%`}
             onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, opacity: v / 100 } }))}
             hint="exact: 100% hides the content, 50% ghosts through, 0% draws no card at all"
           />
@@ -524,27 +523,22 @@ export default function SegmentsPanel({
         )}
       </Section>
 
+      {/*
+        Timeline cheat sheet (kept out of the panel itself):
+        • the timeline is a partition of the source — extending one section
+          shortens its neighbour, so no second is ever unaccounted for;
+        • shift+drag marks a range for CUT / MUTE / FFWD / CARD / INTRO / LEAD /
+          REACT / OUTRO (or the +buttons for a quick section at the playhead);
+        • a selected block can be retyped and given exact in/out timecodes, and
+          split at the playhead with S.
+      */}
       <Note>
         <strong className="font-semibold">How the timeline works</strong>
         <br />
         <br />
-        Every second of the source is exactly one section, so extending one
-        <span className="mx-1 rounded border border-violet-400/30 bg-violet-500/15 px-1 text-[10px] text-violet-200">INTRO</span>
-        shortens the
-        <span className="mx-1 rounded border border-sky-400/30 bg-sky-500/15 px-1 text-[10px] text-sky-200">REACT</span>
-        next to it — drag an edge and the neighbour gives up the time.
-        <br />
-        <br />
-        <span className="ml-1">1.</span> <strong>Cut a part you don't want:</strong> shift+drag on
-        the timeline to mark the range, press <strong>CUT</strong>. Or the +CUT button for a
-        quick 4-second cut at the playhead.
-        <br />
-        <span className="ml-1">2.</span> <strong>Add sections anywhere:</strong> mark a range and
-        press INTRO / OUTRO / REACT / LEAD / FFWD / CARD / MUTE — as many as you like, in any
-        order.
-        <br />
-        <span className="ml-1">3.</span> <strong>Fine-tune:</strong> select the block, then type
-        exact times here or split it at the playhead (S).
+        Drag an edge and the neighbour gives up the time. Shift+drag a range, then press{" "}
+        <strong>CUT / MUTE / CARD</strong> … to make it that. Select a block to fine-tune
+        or split it (S).
         <br />
         <br />
         <span className="font-mono text-[10px] text-slate-400">

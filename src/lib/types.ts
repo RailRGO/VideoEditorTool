@@ -144,7 +144,7 @@ export interface CardStyle {
   /** short-card height as a fraction of the content height (default 0.75) */
   shortHeight?: number;
   /**
-   * Card opacity 0..1 (default 0.96). Exact, not a hint:
+   * Card opacity 0..1 (default 0.97). Exact, not a hint:
    *   1   = fully opaque — the content is completely hidden,
    *   0.5 = half see-through,
    *   0   = the card is not drawn at all.
@@ -385,7 +385,7 @@ export const defaultLayout: LayoutState = {
     image: "",
     showText: true,
     shortHeight: 0.75,
-    opacity: 0.96,
+    opacity: 0.97,
   },
 };
 
@@ -534,11 +534,16 @@ export const defaultAudioCloak: AudioCloak = {
 };
 
 /**
- * A user image (subscribe button, like reminder, …) overlaid on the YouTube
- * cut — drawn on the reaction part only, intro/outro stay clean. Designed
- * for transparent PNGs: x/y is the top-left corner in normalised frame
+ * A user image (subscribe button, like reminder, …) overlaid on the finished
+ * picture — drawn on the reaction part only, intro/outro stay clean. It lands
+ * in BOTH deliverables: the Patreon composite (browser preview, in-browser
+ * export and the Colab compositor) and the YouTube passthrough. Designed for
+ * transparent PNGs: x/y is the top-left corner in normalised frame
  * coordinates, w the width as a fraction of the frame width (height follows
  * the image's own aspect), opacity 0..1.
+ *
+ * Everything clamps to the frame like `_sticker_png` does on the server, so
+ * the preview and the render always agree.
  */
 export interface Sticker {
   on: boolean;
@@ -633,8 +638,15 @@ export interface VideoCloak {
   fisheyeAmount: number;
 }
 
+/**
+ * Every disguise is OFF out of the box (this is the master switch for the
+ * whole frame cloak: zoom / bars / border / colour / grain / vignette /
+ * fisheye). Same rule for the audio cloak, the voice changer, the retouch
+ * and the sticker overlay — a fresh project changes nothing until the user
+ * ticks something.
+ */
 export const defaultVideoCloak: VideoCloak = {
-  on: true,
+  on: false,
   zoom: 1.0,
   bars: 0,
   border: 0,

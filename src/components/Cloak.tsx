@@ -120,8 +120,8 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Treats the mixed programme of the <b>reaction part only</b> — your intro and outro are
-          exported exactly as recorded. Everything here keeps the duration untouched.
+          The mixed programme, <b>reaction part only</b> — intro/outro stay as recorded. The
+          duration is never touched.
         </p>
         <div className="space-y-2">
           <Slider
@@ -196,13 +196,8 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Content ID fingerprints the <b>programme audio</b>, so by default this re-voices the{" "}
-          <b>content</b> track and leaves your own commentary untouched — the show comes out
-          sounding dubbed, which is exactly what stops a match. Pick{" "}
-          <b>Everyone</b> for the CapCut-style move: every voice in the reaction part (yours and
-          the show&apos;s) comes out as the <b>same new character voice</b>. Your intro/outro
-          always stay clean. Splitting the two needs the Patreon master with stems; a single mixed
-          track gets re-voiced as one piece.
+          Re-voices the <b>reaction part only</b>. Default target: the <b>content</b> track (the
+          one Content ID fingerprints); <b>Everyone</b> re-voices you as well.
         </p>
         <Segmented
           value={audio.voiceTarget ?? "content"}
@@ -225,10 +220,8 @@ export default function CloakPanel({
         {(audio.voiceMode ?? "morph") === "morph" ? (
           <div className="mt-2 space-y-2">
             <p className="text-[10px] leading-relaxed text-slate-400">
-              The default engine, written into the Colab backend: resampling + a phase-vocoder
-              vocal-tract warp + vibrato, breath and tilt. <b>Nothing to install, no model file, no
-              download</b> — it runs about 10× faster than realtime on the Colab CPU, so it works on
-              a free runtime with no GPU at all.
+              Built into the Colab backend — <b>nothing to install, no model file</b>, and it runs
+              faster than realtime on a free CPU runtime.
             </p>
             <div className="flex flex-wrap gap-1.5">
               {MORPH_PRESETS.map((p) => (
@@ -321,22 +314,16 @@ export default function CloakPanel({
               </div>
             )}
             <Note>
-              The morph runs on the export backend in one pass over the whole programme — a few
-              seconds per minute of video, no GPU, no torch, no model file. The re-voiced audio is
-              saved on Drive (<code>output/voice_cache</code>): a re-render with the same voice
-              settings pulls it from there instead of running the engine again — so you can tweak
-              cards or mirroring and re-export without paying for the voice a second time.
+              Runs once on the export backend and is cached on Drive, so a re-render with the same
+              voice settings does not pay for the voice again.
             </Note>
           </div>
         ) : (audio.voiceMode ?? "morph") === "rvc" ? (
           <div className="mt-2 space-y-2">
             <p className="text-[10px] leading-relaxed text-slate-400">
-              Real neural voice conversion with an RVC model (<code>.pth</code> + optional{" "}
-              <code>.index</code>) — a different person speaking, not a pitch trick. Give a path, an{" "}
-              <code>https://</code> URL or <code>hf:owner/repo/file.pth</code> and the notebook
-              fetches it into its voice cache for you (<code>rvc-python</code> installs itself the
-              first time). Leave it empty — or write <code>builtin:morph</code> — to use the
-              built-in engine instead.
+              Neural conversion from an RVC model — give a path, an <code>https://</code> URL
+              or <code>hf:owner/repo/file.pth</code> and the notebook fetches it. Empty ={" "}
+              <code>builtin:morph</code>.
             </p>
             <label className="block">
               <span className="mb-1 block text-[10px] uppercase tracking-wide text-slate-500">
@@ -400,9 +387,8 @@ export default function CloakPanel({
               />
             </div>
             <p className="text-[10px] text-amber-300/70">
-              RVC is GPU-hungry: on a CPU-only runtime one minute of audio can take several minutes.
-              If you hit that, switch the engine to <b>Built-in morph</b> — it is the same re-voicing
-              job at ~10× realtime, with no install and no model.
+              Needs a GPU — on a CPU runtime one minute of audio can take several minutes. Switch to
+              <b>Built-in morph</b> in that case.
             </p>
           </div>
         ) : (
@@ -477,10 +463,8 @@ export default function CloakPanel({
             className="mt-0.5 accent-fuchsia-400"
           />
           <span className="text-[10px] leading-relaxed text-slate-400">
-            <b className="text-slate-200">Keep the audio under cards</b> — on: whatever the audio
-            is, altered or exactly as recorded, it keeps playing through every card. Off: card
-            sections silence it (their usual job — a card hides the stretch the matcher would
-            hear). Mute sections silence either way; cut parts, intro and outro are never altered.
+            <b className="text-slate-200">Keep the audio under cards</b> — on: the audio plays through
+            every card. Off: a card silences it, as before. Mute sections always silence.
           </span>
         </label>
       </Section>
@@ -605,9 +589,8 @@ export default function CloakPanel({
         }
       >
         <p className="mb-2 text-[10px] leading-relaxed text-slate-500">
-          Flipping the watched programme is the strongest single anti-fingerprint move — it
-          destroys frame hashes while everything else stays the same length. Intro and outro are
-          never mirrored (they stay exactly as recorded, like every disguise here).
+          Flipping the watched programme is the strongest single anti-fingerprint move. Intro and
+          outro are never mirrored.
         </p>
         <div className="space-y-2">
           <Segmented
@@ -642,12 +625,8 @@ export default function CloakPanel({
 
           {mirrorMode !== "off" && (
             <p className="rounded-lg border border-white/10 bg-black/25 p-2 text-[10px] leading-relaxed text-slate-400">
-              <b className="text-slate-200">Short cards stay unflipped.</b> A short card only
-              covers the top of the programme, so the strip it leaves visible — where subtitles
-              and burned-in captions sit — comes through <b>exactly as recorded</b> while the card
-              is up (with <i>Whole picture</i> the flip pauses for that one span). Everything else
-              in the reaction part is mirrored as usual, and a full card covers the content
-              anyway.
+              <b className="text-slate-200">Short cards stay unflipped</b> — the strip of subtitles
+              they leave visible stays readable.
             </p>
           )}
 
@@ -824,15 +803,14 @@ export default function CloakPanel({
             <Slider label="Rotate" value={video.rotate} min={-5} max={5} step={0.25} display={`${video.rotate > 0 ? "+" : ""}${video.rotate.toFixed(2)}°`} onChange={(v) => setV({ rotate: v })} hint="slight tilt adds black edges" />
           </div>
           <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
-            Mirroring lives in its own <b>Mirroring</b> section above, with the per-block ticks —
-            and short cards, whose subtitles stay readable, are never flipped by it.
+            Mirroring has its own section above, with the per-block ticks.
           </p>
           <div className="mt-3 rounded border border-violet-400/20 bg-violet-500/10 p-2">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-semibold text-violet-200">Fisheye lens (content only)</span>
               <button type="button" onClick={() => setV({ fisheye: !video.fisheye })} className={video.fisheye ? "rounded border border-violet-400/40 bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-violet-100" : "rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-400"}>{video.fisheye ? "on" : "off"}</button>
             </div>
-            <p className="mt-1 text-[10px] text-slate-500">Distorts content area like a fisheye lens — strong anti-ContentID, camera stays clean. Applies to the reaction parts only — intro/outro (full-cam) stay untouched. Off by default.</p>
+            <p className="mt-1 text-[10px] text-slate-500">Fisheye lens on the content area only; camera stays clean. Reaction part only.</p>
             {video.fisheye && (
               <div className="mt-2">
                 <Slider label="Fisheye strength" value={video.fisheyeAmount} min={0} max={100} step={1} display={`${video.fisheyeAmount}%`} onChange={(v) => setV({ fisheyeAmount: v })} hint="higher = more bulge distortion, breaks frame hash" />
@@ -847,19 +825,14 @@ export default function CloakPanel({
 
       <Section title="How to use it">
         <p className="text-[11px] leading-relaxed text-slate-400">
-          Every setting on this page touches the <b>reaction part only</b> — your intro and outro
-          are exported exactly as recorded (no video disguise, no audio cloak, no voice changer,
-          no sticker, no speed tweak). Start gentle and check after upload — these are a starting
-          point, push further only where claims actually land. Small values already move the
-          needle; large values annoy viewers faster than they fool matchers.
+          Everything here touches the <b>reaction part only</b>. Start gentle and push only where
+          claims land.
         </p>
       </Section>
 
       <Note tone="warn">
-        <strong className="font-semibold">Honest caveat.</strong> This lowers fingerprint-match
-        confidence — it does not guarantee a claim-free upload. Fingerprinting keeps getting better
-        at seeing through pitch, EQ and crops. The only reliable remedy for a claimed stretch is
-        still to <strong>cut it, mute it, or cover it with a card</strong> — then re-upload.
+        <strong className="font-semibold">Honest caveat.</strong> This lowers match confidence —
+        not a guarantee. If a claim still lands, <strong>cut, mute or cover</strong> that stretch.
       </Note>
     </div>
   );

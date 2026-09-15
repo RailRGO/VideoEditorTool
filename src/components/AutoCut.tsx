@@ -258,8 +258,8 @@ export default function AutoCut({
       <Section title="1 · Find your commentary (audio level)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
           {mixed
-            ? "The auto-cut plays your Patreon render once (silently, at high speed) and measures the mixed audio, then keeps only the stretches where you are actually talking — plus a little context on each side. Intro and outro are never touched."
-            : "The auto-cut plays your recording once (silently, at high speed) and measures the mic channel, then keeps only the stretches where you are actually talking — plus a little context on each side. Intro and outro are never touched."}
+            ? "Scans the Patreon render's mixed audio once at high speed and keeps the stretches where you talk — plus context on each side."
+            : "Scans the mic channel once at high speed and keeps the stretches where you talk — plus context on each side."}
         </p>
         <div className="flex items-center gap-1.5">
           <Segmented
@@ -403,11 +403,10 @@ export default function AutoCut({
             />
             <p className="mt-2 text-[11px] leading-relaxed text-slate-400">
               {opts.replace === "card" &&
-                "The content area becomes a placeholder — your camera stays in its corner and the viewer is pointed at Patreon. Nothing copyrighted is shown or heard."}
+                "Content area becomes a Patreon placeholder — nothing copyrighted is shown or heard."}
               {opts.replace === "fast" &&
-                "The skipped part stays visible but sped up, so the video still makes sense. Content audio keeps playing (ducked, and quieter)."}
-              {opts.replace === "cut" &&
-                "The part is simply removed. Shortest possible video, but the viewer loses all context for what they’re reacting to."}
+                "Kept but sped up; content audio runs ducked and quieter."}
+              {opts.replace === "cut" && "Removed. Shortest video, no context."}
             </p>
             {opts.replace === "card" && (
               <div className="mt-2 space-y-1.5">
@@ -487,11 +486,8 @@ export default function AutoCut({
 
       <Section title="5 · Silent gaps → Patreon card (transcript)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Transcribe your commentary, then every stretch <em>without words</em> becomes a card that
-          points to Patreon. The content area is covered (camera corner stays), audio silenced,
-          and the rest of the silent stretch is hard-cut. Short pauses under 1 s can stay, be
-          fast-forwarded, or muted — your call. This is the strongest Content ID shield because
-          long no-dialog sections simply disappear.
+          Every stretch <em>without words</em> becomes a Patreon card (content covered, audio
+          silenced); the rest of the gap is cut.
         </p>
 
         {canTranscribe ? (
@@ -726,8 +722,8 @@ export default function AutoCut({
               Apply transcript cut → card+cut
             </Btn>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Rewrites only the reaction part: speech stays, long silences become a {transcriptCutOpts.cardDuration}s
-              Patreon card (content area only, camera stays) plus hard cut for the rest. Drag segments after if needed.
+              Reaction part only: speech stays, gaps become a {transcriptCutOpts.cardDuration}s card
+              plus a hard cut.
             </p>
           </div>
         )}
@@ -735,11 +731,9 @@ export default function AutoCut({
 
       <Section title="6 · Fair-use limiter (Content ID)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Two different jobs, pick one. <strong className="text-slate-300">Short cards</strong> keeps
-          every second of the reaction and covers long talking stretches with short cards — nothing
-          is cut, Content ID just never gets an uninterrupted run.{" "}
-          <strong className="text-slate-300">Trim to limit</strong> is the harder tool that drops
-          footage until the reaction fits the budget.
+          <strong className="text-slate-300">Short cards</strong> cuts nothing — long talking
+          stretches get covered. <strong className="text-slate-300">Trim to limit</strong> drops
+          footage to fit a duration budget.
         </p>
         <div className="mb-2">
           <Segmented
@@ -798,9 +792,7 @@ export default function AutoCut({
               />
             </div>
             <p className="rounded border border-fuchsia-400/20 bg-fuchsia-500/10 px-2 py-1 text-[10px] leading-relaxed text-fuchsia-200/90">
-              Every card this step inserts is a <strong>short</strong> card — the bottom of the
-              content stays visible, so the subtitles and the reaction still read. The limiter
-              never places a full-height card.
+              Every card here is <strong>short</strong> — subtitles and the reaction stay visible.
             </p>
             <div className="rounded-lg border border-white/10 bg-black/25 p-2">
               <div className="grid grid-cols-3 gap-1.5 text-center">
@@ -837,10 +829,8 @@ export default function AutoCut({
                 : `Lay ${fairUsePreview?.cards ?? 0} short card${(fairUsePreview?.cards ?? 0) === 1 ? "" : "s"} over the long talk`}
             </Btn>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Nothing is removed: every kept second of the reaction stays, short cards are only laid
-              on top of the content. Default 8 s of talking → 4 s card, repeating, only inside
-              stretches at least {fu.minRunSec}s long — a 30 s talking stretch gets cards at 8–12 s
-              and 20–24 s. Play a touch faster under the card to claw back some of that time.
+              Nothing is removed — cards go on top of the content: 8 s of talk
+              → 4 s card, only inside stretches at least {fu.minRunSec}s long.
             </p>
           </div>
         ) : (
@@ -879,9 +869,8 @@ export default function AutoCut({
               />
             </div>
             <p className="rounded border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200/90">
-              This mode <strong>drops footage</strong> — it is the only way to hit a hard duration
-              target. Pointers it leaves behind are short cards, never full-height ones. Use{" "}
-              <em>Short cards</em> above if you would rather keep every second.
+              Drops footage to hit a hard duration target. Pointers it leaves are
+              short cards.
             </p>
             <div className="rounded-lg border border-white/10 bg-black/25 p-2">
               <div className="grid grid-cols-3 gap-1.5 text-center">
@@ -925,32 +914,31 @@ export default function AutoCut({
                 : "Reaction already within limit"}
             </Btn>
             <p className="text-[10px] leading-relaxed text-slate-500">
-              Only rewrites reaction footage — cards, cuts and intro/outro are preserved. The
-              reaction is split into equal windows and the most speech-dense moment of each window
-              is kept, so start, middle and end all survive in order — the reaction stays the same
-              length from beginning to end and is never truncated after the first N minutes. Run the
-              audio scan (or transcribe) first — without speech info the windows are sampled evenly,
-              which keeps the pacing but not the best bits.
+              Keeps the most speech-dense moment of each equal-length window, so start,
+              middle and end all survive in order. Run the audio scan first.
             </p>
           </div>
         )}
       </Section>
 
+      {/*
+        Frame-level disguise for the reaction part. Quick reference for whoever
+        (or whatever) touches this next — none of it belongs on screen:
+        • the values here are the same ones the ffmpeg graph applies on export
+          (gblur / eq / rotate / vignette), so the preview is WYSIWYG;
+        • mirroring is NOT here any more: mode + per-block ticks live in the
+          Cloak tab's Mirroring section, and a SHORT card is never mirrored so
+          the subtitles under it stay readable;
+        • intro and outro (full-cam solo) are always excluded from every
+          disguise — Patreon and YouTube alike;
+        • the encoder is picked by a real smoke encode: h264_nvenc only if the
+          GPU actually encodes a test frame, otherwise libx264, and a GPU that
+          dies mid-render re-runs that pass on the CPU.
+      */}
       <Section title="7 · Video disguise (anti-Content ID)">
         <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-          Alter the picture itself so Content ID can’t match frames. Combine with zoom, hue, blur,
-          rotate and audio pitch. Preview shows the effect; the final render applies the same thing
-          in ffmpeg (gblur, eq, rotate).
-        </p>
-        <p className="mb-2 text-[11px] leading-relaxed text-sky-300/80">
-          <b>Mirroring moved to the Cloak tab</b> — mode (content only / whole picture) and the
-          per-block ticks live in its own <b>Mirroring</b> section there. Short cards are never
-          mirrored, which is what keeps the subtitles under them readable.
-        </p>
-        <p className="mb-2 text-[11px] leading-relaxed text-emerald-300/80">
-          Intro and outro are always excluded — every disguise here lands on the reaction part only,
-          so your full-cam solo stays exactly as recorded. The GPU encoder (nvenc) is used only when
-          it passes a real smoke encode; otherwise it falls back to CPU automatically.
+          Alters the picture so frame matching fails. Reaction part only —{" "}
+          <b className="text-slate-300">Mirroring</b> lives in the Cloak tab.
         </p>
         <div className="space-y-2">
           <div className="grid grid-cols-2 gap-x-3">
@@ -984,12 +972,10 @@ export default function AutoCut({
 
       {env && detection && density < 12 && (
         <Note tone="warn">
-          <strong>{bodyDensity.toFixed(0)}% of the reaction has you talking.</strong> That’s on the
-          quiet side — the cut version will lean heavily on{" "}
-          {opts.replace === "cut" ? "hard cuts" : opts.replace === "fast" ? "fast-forward" : "cards"}.
-          If you can, try narrating reactions as they happen (“oh wait—”, “no way”, “look at
-          this”) — even short interjections give the auto-cut something to hold on to, and they’re
-          what makes a cut version worth watching.
+          <strong>{bodyDensity.toFixed(0)}% of the reaction has you talking.</strong> The cut will
+          lean on{" "}
+          {opts.replace === "cut" ? "hard cuts" : opts.replace === "fast" ? "fast-forward" : "cards"} —
+          narrate more for a tighter cut.
         </Note>
       )}
     </div>

@@ -3752,7 +3752,10 @@ class ReactionVideoProcessor:
                                    step="compositing", part=1, parts=1))[0],
                                cancel_check=cancel_check, cam_hook=hook,
                                fps=fps, width=int(width),
-                               height=int(height) or 1080)
+                               height=int(height) or 1080,
+                               # user overlay image — the composite paints it
+                               # on the reaction spans, like the passthrough
+                               sticker=sticker, sticker_base=str(self.out))
                 report(0.86, step="mixing audio")
                 beat()
                 mix = self.mix_audio(
@@ -3818,9 +3821,12 @@ class ReactionVideoProcessor:
                                    # must rebuild the parts when it changes
                                    _keep_card_audio(audio_cloak)]
         else:
+            # the sticker overlay is baked into the picture, so a part
+            # rendered without it (or with a different image / position)
+            # must not be reused
             look_src = [lay.to_dict() if lay is not None else None,
                         dict(self.audio_cfg), dict(self.retouch_cfg),
-                        master_gain_db]
+                        master_gain_db, sticker]
         look = hashlib.sha1(json.dumps(
             look_src, sort_keys=True, default=str).encode()).hexdigest()[:12]
         # av3: youtube parts now journal the raw content/mic buses (video
@@ -3989,7 +3995,8 @@ class ReactionVideoProcessor:
                                segments=part, crf=crf, progress_cb=cb,
                                cancel_check=cancel_check, cam_hook=hook,
                                fps=fps, width=int(width),
-                               height=int(height) or 1080)
+                               height=int(height) or 1080,
+                               sticker=sticker, sticker_base=str(self.out))
                 report((prog_before[i] + pn * 0.9) / total_prog,
                        step="audio", part=i + 1, parts=len(parts))
                 beat()
@@ -4542,7 +4549,10 @@ class ReactionVideoProcessor:
             mode = "cards"
         every_sec = max(1.5, float(o.get("everySec", o.get("every_sec", 8.0)) or 8.0))
         card_sec = max(0.5, float(o.get("cardSec", o.get("card_sec", 4.0)) or 4.0))
-        card_speed = max(1.0, float(o.get("cardSpeed", o.get("card_speed", 1.0)) or 1.0))
+        # 1.55 is the default: the card hides the picture, so the stretch
+        # under it may run faster and claw back programme time
+        card_speed = max(1.0, float(o.get("cardSpeed",
+                                        o.get("card_speed", 1.55)) or 1.55))
         min_run = max(0.0, float(o.get("minRunSec", o.get("min_run_sec", 6.0)) or 0.0))
         # every card the limiter inserts is short, whatever an old project
         # stored: the bottom of the content (subtitles) has to stay visible

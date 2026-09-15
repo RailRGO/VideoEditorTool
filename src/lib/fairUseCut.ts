@@ -18,7 +18,13 @@ export interface FairUseOptions {
   everySec: number;
   /** cards mode: how long the card stays up */
   cardSec: number;
-  /** cards mode: playback speed while a card is up (1 = normal) */
+  /**
+   * Cards mode: playback speed while a card is up (1 = normal, 1.55 is the
+   * default). The card hides the picture, so the stretch under it can run
+   * faster and claw back part of the programme time the limiter spends on
+   * cards. 1 in a saved project means "as recorded" — keep the tick honest,
+   * never round it up here.
+   */
   cardSpeed: number;
   /** cards mode: talking stretches shorter than this are left alone */
   minRunSec: number;
@@ -43,7 +49,7 @@ export const defaultFairUse: FairUseOptions = {
   mode: "cards",
   everySec: 8,
   cardSec: 4,
-  cardSpeed: 1,
+  cardSpeed: 1.55,
   minRunSec: 6,
   maxBodySec: 600,
   removedAction: "cut",

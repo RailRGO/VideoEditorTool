@@ -79,7 +79,7 @@ class CardStyle:
     shortHeight: float = 0.75
     # card opacity 0..1, exact: 1 = fully opaque, 0 = no card is drawn at all
     # (the whole card — backdrop, bar, words, ring — shares this alpha)
-    opacity: float = 0.96
+    opacity: float = 0.97
 
 
 @dataclass
@@ -169,7 +169,7 @@ class LayoutState:
                 # into the default — only a missing/None value may default
                 shortHeight=(0.75 if card.get("shortHeight") is None
                              else float(card["shortHeight"])),
-                opacity=(0.96 if card.get("opacity") is None
+                opacity=(0.97 if card.get("opacity") is None
                          else float(card["opacity"])),
             ),
         )
@@ -344,8 +344,9 @@ def default_retouch() -> Dict[str, Any]:
 
 
 def default_audio_cloak() -> Dict[str, Any]:
+    """Audio disguise defaults — every effect OFF, like the browser."""
     return {
-        "on": True,
+        "on": False,
         "pitch": 0.5,    # semitones, tempo-preserving
         "chorus": 25.0,  # 0..100
         "reverb": 18.0,  # 0..100
@@ -401,8 +402,10 @@ def default_sticker() -> Dict[str, Any]:
 
 
 def default_video_cloak() -> Dict[str, Any]:
+    """Frame cloak defaults — off, exactly like the browser (every effect
+    ships off; nothing changes the picture until a box is ticked)."""
     return {
-        "on": True,
+        "on": False,
         "zoom": 1.0,
         "bars": 0.0,       # % of height, top + bottom — 0 by default to avoid black lines
         "border": 0.0,     # px @1080p

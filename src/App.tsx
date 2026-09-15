@@ -1156,7 +1156,15 @@ export default function App() {
               // the export: intro/outro stay clean)
               stickerRef.current
             )
-          : buildScene(lay, segs, v.currentTime, halves);
+          : buildScene(
+              lay,
+              segs,
+              v.currentTime,
+              halves,
+              // the Patreon composite carries the same overlay image (the
+              // Colab compositor paints it too, so preview == render)
+              stickerRef.current
+            );
         // intro/outro rule for the local audio cloak: clean spans bypass the
         // whole chain and play exactly as recorded (the Colab export does the
         // same with its run-based audio graph)
@@ -2175,12 +2183,16 @@ export default function App() {
 
   const projectData = () => ({
     app: "reaction-studio" as const,
+    // 10: card opacity default 96 % -> 97 %, "speed under card" default 1 ->
+    // 1.55, every effect off out of the box (the video cloak used to ship
+    // ON), and the sticker overlay now renders in the Patreon composite as
+    // well as the YouTube passthrough.
     // 9 makes "keep the audio under cards" a tick of its own (any audio, not
     // just re-voiced) and drops the mirror's keep-bottom strip: a short card
     // is never mirrored now. 8 moved the card-opacity default to 96 % and
     // added the voice-changer options; 7 added the mirroring block
     // (mode / scope / ticks); 6 added the transcript
-    version: 9,
+    version: 10,
     savedAt: new Date().toISOString(),
     sourceFile: fileNameRef.current || fileName,
     sourceDuration: durRef.current || duration,
@@ -2233,11 +2245,12 @@ export default function App() {
     if (Array.isArray(p.claims)) setClaims(p.claims as Claim[]);
     if (p.layout) {
       const lay = p.layout as LayoutState;
-      // v8: the card-opacity default moved 0.9 -> 0.96. Saved projects carry
-      // the old default as an explicit number, so one that still says
-      // exactly 0.9 gets the new default instead of the stale one.
-      if (lay.card && lay.card.opacity === 0.9) {
-        lay.card = { ...lay.card, opacity: 0.96 };
+      // Card-opacity default moved 0.9 (pre-v8) -> 0.96 (v8/v9) -> 0.97.
+      // Saved projects carry the old default as an explicit number, so one
+      // that still says exactly 0.9 — or exactly 0.96 — gets the current
+      // default instead of the stale one (a hand-set value is untouched).
+      if (lay.card && (lay.card.opacity === 0.9 || lay.card.opacity === 0.96)) {
+        lay.card = { ...lay.card, opacity: 0.97 };
       }
       setLayout(lay);
       layoutRef.current = lay;
@@ -2293,8 +2306,14 @@ export default function App() {
       cutRef.current = p.cutOpts as CutOptions;
     }
     if (p.transcriptCutOpts) setTranscriptCutOpts(p.transcriptCutOpts as TranscriptCutOptions);
-    if (p.fairUseOpts)
-      setFairUseOpts({ ...defaultFairUse, ...(p.fairUseOpts as FairUseOptions) });
+    if (p.fairUseOpts) {
+      const fu = { ...defaultFairUse, ...(p.fairUseOpts as FairUseOptions) };
+      // v10: "speed under card" default moved 1 -> 1.55. A project that
+      // still stores exactly the old default (1 = as recorded) picks up the
+      // new one; anything the user chose by hand stays.
+      if (fu.cardSpeed === 1) fu.cardSpeed = defaultFairUse.cardSpeed;
+      setFairUseOpts(fu);
+    }
     if (p.polish) setPolish(p.polish as PolishRules);
     if (p.disruptRules) setDisruptRules(p.disruptRules as DisruptRules);
     if (p.leadCfg) setLeadCfg(p.leadCfg as LeadConfig);
@@ -3070,10 +3089,9 @@ export default function App() {
                         Connect the Colab backend
                       </p>
                       <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
-                        Run the server cell in the notebook, paste its tunnel URL
-                        {remoteDraft ? " above" : " below"} and press Connect. Your files stay on
-                        the Colab side — the browser only previews a light stream, and the
-                        finished render downloads straight from the server.
+                        Run the server cell, paste its tunnel URL
+                        {remoteDraft ? " above" : " below"} and press Connect. Files stay on the
+                        Colab side; the render downloads from there.
                       </p>
                       <form
                         className="mx-auto mt-4 flex max-w-sm gap-1.5"
@@ -3151,9 +3169,8 @@ export default function App() {
                       Drop your Patreon render here
                     </p>
                     <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
-                      Load the finished 1920×1080 version with its mixed audio. It plays through
-                      full-frame — mark what stays with auto-cut, claims or straight cuts, then
-                      render the upload. Everything runs locally.
+                      The finished 1920×1080 render with its mixed audio — plays through
+                      full-frame. Mark what stays, then render the upload.
                     </p>
                   </>
                 ) : (
@@ -3162,10 +3179,8 @@ export default function App() {
                       Drop your OBS recording here
                     </p>
                     <p className="mx-auto mt-2 max-w-sm text-[11px] leading-relaxed text-slate-400">
-                      Built for the 3840×1080 side-by-side capture: webcam on one half, watched
-                      content on the other, mic and desktop audio on separate channels. Polish the
-                      intro and outro, repair the dropouts, compose the frame. Everything runs
-                      locally — your 3 GB file never leaves the machine.
+                      The 3840×1080 side-by-side OBS capture (webcam | content, mic + desktop
+                      audio). Nothing leaves your machine.
                     </p>
                   </>
                 )}

@@ -65,8 +65,8 @@ export default function RetouchPanel({
         </div>
         <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
           {status === "failed"
-            ? `Couldn't fetch the model — ${statusText}. Use manual placement below, or check the connection.`
-            : "The model (~3 MB) is fetched once and then cached by the browser. It runs locally on your GPU after that."}
+            ? `Couldn't fetch the model — ${statusText}. Use manual placement, or check the connection.`
+            : "The model (~3 MB) is fetched once and cached; it runs locally."}
         </p>
         {status === "tracking" && (
           <p className="mt-1 font-mono text-[10px] text-emerald-300">{fps} detections/s</p>
@@ -192,9 +192,8 @@ export default function RetouchPanel({
             <Slider label="Width" value={manualBox.w} min={0.05} max={1} step={0.005} display={`${Math.round(manualBox.w * 100)}%`} onChange={(v) => setManualBox({ ...manualBox, w: v })} />
             <Slider label="Height" value={manualBox.h} min={0.05} max={1} step={0.005} display={`${Math.round(manualBox.h * 100)}%`} onChange={(v) => setManualBox({ ...manualBox, h: v })} />
             <p className="col-span-2 text-[10px] leading-relaxed text-slate-500">
-              Percentages are of the camera layer, so the box moves with it. Skin, teeth and the
-              warps are approximated from this box — good for a mostly-still framing, not for
-              leaning around.
+              Percentages are of the camera layer. Skin, teeth and the warps are approximated
+              from this box — fine for still framing, not for leaning around.
             </p>
           </div>
         )}
@@ -208,11 +207,8 @@ export default function RetouchPanel({
       </Section>
 
       <Note tone="warn">
-        <strong className="font-semibold">Keep it subtle.</strong> Skin smoothing and a few percent
-        of eye/nose adjustment read as “good camera”. Push it far enough that viewers notice the
-        warp and it starts working against you — the seam shows on glasses frames, hair and
-        anything crossing the face. If you want a noticeably different look, that's better done
-        with OBS filters while recording, where it's applied to the raw feed.
+        <strong className="font-semibold">Keep it subtle.</strong> Heavy warping shows at
+        glasses, hair and edges. For a bigger change, use OBS filters while recording.
       </Note>
     </div>
   );
