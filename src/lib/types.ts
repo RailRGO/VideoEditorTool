@@ -144,7 +144,7 @@ export interface CardStyle {
   /** short-card height as a fraction of the content height (default 0.75) */
   shortHeight?: number;
   /**
-   * Card opacity 0..1 (default 0.9). Exact, not a hint:
+   * Card opacity 0..1 (default 0.96). Exact, not a hint:
    *   1   = fully opaque — the content is completely hidden,
    *   0.5 = half see-through,
    *   0   = the card is not drawn at all.
@@ -385,7 +385,7 @@ export const defaultLayout: LayoutState = {
     image: "",
     showText: true,
     shortHeight: 0.75,
-    opacity: 0.9,
+    opacity: 0.96,
   },
 };
 
@@ -471,6 +471,15 @@ export interface AudioCloak {
   voicePresetMic: string;
   /** second seed for the mic when voiceTarget === "both" */
   morphSeedMic: string | number;
+  /**
+   * Keep the audio playing under CARD sections while the voice changer is
+   * on. Normally a card mutes the programme audio (the card hides a claimed
+   * stretch); once that audio is re-voiced it no longer matches the
+   * fingerprint, so it can simply keep playing — the whole altered audio
+   * stays continuous instead of going quiet at every card. MUTE sections
+   * still silence, and intro/outro/cut spans are never altered.
+   */
+  voiceKeepCardAudio: boolean;
   /** voice changer preset (fx mode) */
   voicePreset: "anon" | "deep" | "high" | "robot" | "custom";
   /** voice changer strength 0..100 (fx mode) */
@@ -505,6 +514,7 @@ export const defaultAudioCloak: AudioCloak = {
   morphFormant: 1,
   voicePresetMic: "",
   morphSeedMic: "",
+  voiceKeepCardAudio: false,
   voicePreset: "anon",
   voiceStrength: 70,
   voicePitch: 0,

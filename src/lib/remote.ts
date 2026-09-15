@@ -102,6 +102,17 @@ export interface BusProxy {
   error?: string | null;
 }
 
+/** which encoder the server will use for renders (and why) */
+export interface RemoteEncoder {
+  /** true = renders encode on the GPU (h264_nvenc) */
+  gpu: boolean;
+  /** true = a GPU failure pinned this session to the CPU; the next job retries */
+  pinned_by_failure: boolean;
+  /** true = REACT_GPU=0 was set by the user, never auto-overridden */
+  forced_cpu_by_user: boolean;
+  pin_reason?: string;
+}
+
 export interface RemoteState {
   info: RemoteInfo;
   proxy: RemoteProxy;
@@ -109,6 +120,8 @@ export interface RemoteState {
   mic_channel?: "left" | "right" | string;
   /** channel-split previews (missing when the source has one audio track) */
   bus_proxies?: Record<string, BusProxy>;
+  /** GPU/CPU encoder verdict (missing on old servers) */
+  encoder?: RemoteEncoder;
   job: RemoteJob;
 }
 

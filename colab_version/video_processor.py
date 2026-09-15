@@ -436,6 +436,29 @@ def _voice_targets(cfg: Optional[Dict[str, Any]]) -> set:
     return {"mic"}
 
 
+def _voice_keep_card_audio(cfg: Optional[Dict[str, Any]]) -> bool:
+    """True when CARD sections keep their audio instead of silencing it.
+
+    Only meaningful while the voice changer is on: a card normally mutes the
+    programme because the card HIDES a claimed stretch — but once that audio
+    is re-voiced it no longer matches the fingerprint, so it can keep
+    playing and the altered audio stays continuous through the cards. MUTE
+    spans still silence either way; intro/outro are never altered.
+
+    The card silences the CONTENT bus, so it may keep playing only when
+    that bus is actually covered by the voice changer — an unaltered
+    programme under a card would hand the fingerprint straight back. A
+    single mixed track is processed through the content bus as well, so the
+    rule is the same either way: the content bus must be a target.
+    """
+    c = cfg or {}
+    if not c.get("voiceChanger", False):
+        return False
+    if not c.get("voiceKeepCardAudio", False):
+        return False
+    return "content" in _voice_targets(c)
+
+
 def _voice_engine(cfg: Optional[Dict[str, Any]], bus: str) -> str:
     """'none' | 'morph' | 'fx' | 'rvc' — how *bus* gets re-voiced."""
     if bus not in _voice_targets(cfg):
@@ -816,19 +839,105 @@ def _voice_morph_runs(proc: "ReactionVideoProcessor", wav: Path,
     return _voice_runs_splice(proc, wav, runs, tag, convert, skip_silent=True)
 
 
+# ---------------------------------------------------------------------------
+# the re-voiced bus, cached on Drive
+# ---------------------------------------------------------------------------
+# Re-voicing a full episode is the slowest audio step (minutes of CPU on the
+# built-in morph, far more on RVC) — and a render is usually re-run several
+# times while the cut is tweaked (cards moved, mirror changed…). The input
+# bus and the voice settings rarely change between those re-renders, so the
+# finished re-voiced wav is saved into <output>/voice_cache/ on Drive and
+# pulled from there on the next run: same source audio + same voice settings
+# = same result, bit for bit (the morph is deterministic per seed). A new
+# episode, a different timeline audio or any voice knob produces a different
+# key and runs the engine again.
+
+_VOICE_CFG_KEYS = ("voiceMode", "voiceTarget", "morphPreset", "morphStrength",
+                   "morphSeed", "morphFormant", "voicePreset", "voiceStrength",
+                   "voicePitch", "voicePresetMic", "morphSeedMic",
+                   "rvcModel", "rvcIndex", "rvcTranspose", "rvcIndexRate",
+                   "rvcMethod")
+_VOICE_CACHE_KEEP = 8          # newest wavs kept in voice_cache/
+
+
+def _voice_cache_key(wav: Path, cfg: Dict[str, Any], bus: str
+                     ) -> Optional[str]:
+    """One identity for (input audio, voice settings, bus); None if the wav
+    cannot be read (the caller then simply skips the cache)."""
+    try:
+        h = hashlib.md5()
+        with open(wav, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        spec = {k: cfg.get(k) for k in _VOICE_CFG_KEYS}
+        spec["bus"] = bus
+        h.update(json.dumps(spec, sort_keys=True,
+                            default=str).encode("utf-8"))
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _prune_voice_cache(cache: Path, keep: int = _VOICE_CACHE_KEEP) -> None:
+    """Keep only the *keep* newest wavs — an episode's re-voiced bus is
+    hundreds of MB, and Drive should not collect one per experiment."""
+    try:
+        wavs = sorted((p for p in cache.glob("*.wav") if p.is_file()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for p_ in wavs[max(1, keep):]:
+            p_.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _voice_apply(proc: "ReactionVideoProcessor", wav: Path,
                  runs: List[Dict[str, Any]], cfg: Optional[Dict[str, Any]],
                  bus: str, tag: str) -> Path:
-    """Run *bus* through whichever engine the config asks for."""
+    """Run *bus* through whichever engine the config asks for.
+
+    Results are cached on Drive (<output>/voice_cache/): a re-render with the
+    same audio and the same voice settings re-uses the re-voiced bus instead
+    of running the engine again.
+    """
     c = _voice_cfg_for(cfg, bus)
     engine = _voice_engine(cfg, bus)
+    if engine == "none":
+        return wav
+    cache = proc.out / "voice_cache"
+    key = _voice_cache_key(wav, c, bus)
+    if key:
+        hit = cache / f"{bus}_{key[:24]}.wav"
+        if hit.is_file():
+            try:
+                want = proc._media_duration(str(wav))
+                got = proc._media_duration(str(hit))
+            except Exception:  # noqa: BLE001 — probe failed: re-run the engine
+                got, want = -1.0, 0.0
+            if got > 0 and abs(got - want) < 0.05:
+                print(f"  voice: cache hit — re-using the re-voiced {bus} bus "
+                      f"from Drive ({hit.name})")
+                return hit
+            hit.unlink(missing_ok=True)     # stale/truncated: rebuild it
     if engine == "morph":
-        return _voice_morph_runs(proc, wav, runs, c, tag=tag)
-    if engine == "rvc":
-        return _voice_rvc_runs(proc, wav, runs, c, tag=tag)
-    if engine == "fx":
-        return proc._voice_fx_wav(wav, runs, c, tag=tag)
-    return wav
+        out = _voice_morph_runs(proc, wav, runs, c, tag=tag)
+    elif engine == "rvc":
+        out = _voice_rvc_runs(proc, wav, runs, c, tag=tag)
+    else:
+        out = proc._voice_fx_wav(wav, runs, c, tag=tag)
+    if key and out != wav:
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            dst = cache / f"{bus}_{key[:24]}.wav"
+            tmp = cache / f".{bus}_{key[:24]}.{os.getpid()}.part"
+            shutil.copyfile(str(out), str(tmp))
+            tmp.replace(dst)
+            _prune_voice_cache(cache)
+            print(f"  voice: saved the re-voiced {bus} bus on Drive "
+                  f"({dst.parent.name}/{dst.name}) — a re-render with the "
+                  f"same voice settings pulls it from there")
+        except OSError as e:
+            print(f"  (voice: Drive cache not written — {e})")
+    return out
 
 
 def _vignette_angle(amount: float) -> float:
@@ -2824,8 +2933,12 @@ class ReactionVideoProcessor:
                                  "programme AND your voice together — load a "
                                  "Patreon master with stems to keep your own "
                                  "voice natural")
+            # with the voice changer on, card spans may keep their (re-voiced)
+            # audio instead of silencing it — see _voice_keep_card_audio
+            card_kept = _voice_keep_card_audio(audio_cloak)
+            silenced_types = ("mute",) if card_kept else ("mute", "card")
             states_per_bus = [[
-                ((s.get("type", "body") in ("mute", "card") and j == 0),
+                ((s.get("type", "body") in silenced_types and j == 0),
                  C.seg_speed(s, float(fast_speed))
                  * (1.0 if clean[i] else global_speed))
                 for i, s in enumerate(kept)]
@@ -2859,7 +2972,7 @@ class ReactionVideoProcessor:
                         af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
                         if abs(eff - 1.0) > 0.001:
                             af += "," + ",".join(_atempo_chain(eff))
-                        if typ in ("mute", "card") and j == 0:
+                        if typ in silenced_types and j == 0:
                             af += ",volume=0"
                         fi, fo = _fade_edges(kept, i, states_per_bus[j])
                         fz = _fade_filters((b - a) / max(0.125, eff),
@@ -3052,30 +3165,41 @@ class ReactionVideoProcessor:
         # come out of the same segment map and can never drift apart.
         bus_overrides: Dict[int, Path] = {}
         vtargets = _voice_targets(audio_cloak)
+        keep_card_audio = _voice_keep_card_audio(audio_cloak)
+        if keep_card_audio:
+            print("  voice: card sections keep their audio — the re-voiced "
+                  "programme plays on through them (mute spans still "
+                  "silence)")
         if vtargets and _voice_mode(audio_cloak) in ("rvc", "morph"):
             if used_stems:
                 gs = max(0.5, min(2.0, float(
                     (video_cloak or {}).get("speed", 1.0) or 1.0)))
                 runs, _off, _tot = _passthrough_runs(kept, fast_speed, gs)
+                content_silence: Tuple[str, ...] = (
+                    ("mute",) if keep_card_audio else ("mute", "card"))
                 for bus, idx in (("content", 0), ("mic", 1)):
                     if bus not in vtargets:
                         continue
                     wav = self._conform_passthrough_bus(
                         kept, fast_speed, gs, audio_fade_s, audio_inputs[idx],
-                        mute_in_card=(bus == "content"))
+                        silence_types=(content_silence
+                                       if bus == "content" else ()))
                     bus_overrides[idx] = _voice_apply(
                         self, wav, runs, audio_cloak, bus,
                         tag=f"pt_{bus}")
             else:
-                # one mixed track: the content bus IS the programme, so the
-                # voice engine covers it (and your voice with it)
+                # one mixed track: it IS the programme and your voice at
+                # once, so whichever bus was picked the engine covers the
+                # whole track (voiceTarget "both" expresses exactly that)
                 gs = max(0.5, min(2.0, float(
                     (video_cloak or {}).get("speed", 1.0) or 1.0)))
                 runs, _off, _tot = _passthrough_runs(kept, fast_speed, gs)
                 wav = self._conform_passthrough_bus(
                     kept, fast_speed, gs, audio_fade_s, audio_inputs[0])
-                bus_overrides[0] = _voice_apply(self, wav, runs, audio_cloak,
-                                                "content", tag="pt_mix")
+                bus_overrides[0] = _voice_apply(
+                    self, wav, runs,
+                    dict(audio_cloak or {}, voiceTarget="both"),
+                    "content", tag="pt_mix")
                 print("  (voice: this source has one mixed track, so the "
                       "voice engine covers the programme AND your voice — "
                       "load a Patreon master with stems to split them)")
@@ -3336,23 +3460,26 @@ class ReactionVideoProcessor:
     def _conform_passthrough_bus(self, kept: List[Dict[str, Any]],
                                  fast_speed: float, global_speed: float,
                                  fade_s: float, spec: str,
-                                 mute_in_card: bool = False,
+                                 silence_types: Tuple[str, ...] = (),
                                  tag: str = "pt_bus") -> Path:
         """Conform one audio bus to the OUTPUT timeline (single pass).
 
         Exact twin of the in-graph per-segment audio math (trim → atempo →
         edge fades → concat, cloak speed tweak on reaction spans only), so a
         voice engine can work in programme time and the result can ride back
-        into the graph with output-time trims. *mute_in_card* silences the
-        mute/card spans — the content bus does that in the graph, and an
+        into the graph with output-time trims. *silence_types* are the
+        segment types this bus goes quiet on — the content bus uses
+        ("mute", "card"), or ("mute",) when cards keep their re-voiced
+        audio; the mic bus uses (). The graph silences the same set, and an
         overridden bus never reaches that branch, so it has to happen here
         (it is also what lets the converter skip those runs entirely).
         """
         clean = _clean_flags(kept)
         gs = max(0.5, min(2.0, float(global_speed or 1.0)))
+        silenced = tuple(silence_types)
         # the fade logic has to see the same per-segment "is this bus muted"
         # flag the graph uses, or a mute span's edges fade in the wrong place
-        states = [((mute_in_card and s.get("type", "body") in ("mute", "card")),
+        states = [((s.get("type", "body") in silenced),
                    C.seg_speed(s, float(fast_speed))
                    * (1.0 if clean[i] else gs))
                   for i, s in enumerate(kept)]
@@ -3365,7 +3492,7 @@ class ReactionVideoProcessor:
             af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS"
             if abs(eff - 1.0) > 0.001:
                 af += "," + ",".join(_atempo_chain(eff))
-            if mute_in_card and s.get("type", "body") in ("mute", "card"):
+            if s.get("type", "body") in silenced:
                 af += ",volume=0"
             fi, fo = _fade_edges(kept, i, states)
             fz = _fade_filters((b - a) / max(0.125, eff), fade_s, fi, fo)
@@ -3444,19 +3571,23 @@ class ReactionVideoProcessor:
         mic_v = mic_wav
         con_v = content_wav
         if targets and vmode in ("rvc", "morph"):
-            if "content" in targets:
-                if con_v is not None:
+            if con_v is not None:
+                if "content" in targets:
                     con_v = _voice_apply(self, con_v, runs, audio_cloak,
                                          "content", tag="fin_content")
-                else:
-                    # no stems: the one mixed track is the programme
+                if "mic" in targets:
                     mic_v = _voice_apply(self, mic_wav, runs, audio_cloak,
-                                         "content", tag="fin_mix")
-                    print("  (voice: no stems — the voice engine covers the "
-                          "mixed track, your voice included)")
-            if "mic" in targets and con_v is not None:
-                mic_v = _voice_apply(self, mic_wav, runs, audio_cloak,
-                                     "mic", tag="fin_mic")
+                                         "mic", tag="fin_mic")
+            else:
+                # no stems: the one mixed track is the programme and your
+                # voice at once — whichever bus was picked, the engine
+                # covers the whole track
+                mic_v = _voice_apply(self, mic_wav, runs,
+                                     dict(audio_cloak or {},
+                                          voiceTarget="both"),
+                                     "content", tag="fin_mix")
+                print("  (voice: no stems — the voice engine covers the "
+                      "mixed track, your voice included)")
         elif targets and vmode == "fx":
             if "mic" in targets or con_v is None:
                 mic_v = self._voice_fx_wav(mic_wav, runs, audio_cloak or {})
@@ -3698,7 +3829,11 @@ class ReactionVideoProcessor:
         # once — a fixed render resumed straight into the broken parts).
         if target == "youtube":
             look_src: List[Any] = [video_cloak, card, rect, master_gain_db,
-                                   sticker]
+                                   sticker,
+                                   # whether card spans carry audio is baked
+                                   # into each part's bus wavs, so a toggle
+                                   # must rebuild the parts
+                                   _voice_keep_card_audio(audio_cloak)]
         else:
             look_src = [lay.to_dict() if lay is not None else None,
                         dict(self.audio_cfg), dict(self.retouch_cfg),
@@ -3853,7 +3988,8 @@ class ReactionVideoProcessor:
                 gspeed = max(0.5, min(2.0, float(
                     (video_cloak or {}).get("speed", 1.0) or 1.0)))
                 achain, alabels = self._part_audio_chain(
-                    part, fast, fade_s=audio_fade_s, global_speed=gspeed)
+                    part, fast, fade_s=audio_fade_s, global_speed=gspeed,
+                    mute_card=not _voice_keep_card_audio(audio_cloak))
                 label_field = {"cout": "ac", "mout": "am", "aout": "a"}
                 label_file = {"cout": "c", "mout": "m", "aout": "a"}
                 acmd = ["ffmpeg", "-y", "-v", "error", "-i", str(self.input),
@@ -3972,7 +4108,8 @@ class ReactionVideoProcessor:
 
     def _part_audio_chain(self, part: List[Dict[str, Any]],
                           fast_speed: float, fade_s: float = 0.08,
-                          global_speed: float = 1.0
+                          global_speed: float = 1.0,
+                          mute_card: bool = True
                           ) -> Tuple[str, List[str]]:
         """Audio for one passthrough part (YouTube path).
 
@@ -3982,18 +4119,23 @@ class ReactionVideoProcessor:
         (intro/outro stay untouched). Returns (chain, out_labels): with
         stems the buses leave UNMIXED ([cout], [mout]) so the join stage
         can run the voice changer on the mic alone; otherwise one [aout].
+
+        *mute_card* False keeps the audio playing through CARD spans (the
+        voice changer is re-voicing it anyway — see
+        _voice_keep_card_audio); mute spans silence either way.
         """
         inputs, used = self._passthrough_streams(None)
         n = len(part)
         gs = max(0.5, min(2.0, float(global_speed or 1.0)))
         clean = _clean_flags(part)
+        silenced = ("mute",) if not mute_card else ("mute", "card")
         chain: List[str] = []
         cats: List[str] = []
         for j, spec in enumerate(inputs):
             outs = []
             chain.append(f"[{spec}]asplit={n}"
                          + "".join(f"[j{j}s{i}]" for i in range(n)))
-            states = [((s.get("type", "body") in ("mute", "card") and j == 0),
+            states = [((s.get("type", "body") in silenced and j == 0),
                        C.seg_speed(s, float(fast_speed))
                        * (1.0 if clean[i] else gs))
                       for i, s in enumerate(part)]
@@ -4005,7 +4147,7 @@ class ReactionVideoProcessor:
                     (1.0 if clean[i] else gs)
                 if eff > 1.001:
                     af += "," + ",".join(_atempo_chain(eff))
-                if typ in ("mute", "card") and j == 0:
+                if typ in silenced and j == 0:
                     af += ",volume=0"
                 fi, fo = _fade_edges(part, i, states)
                 fz = _fade_filters((b - a) / max(0.125, eff), fade_s, fi, fo)

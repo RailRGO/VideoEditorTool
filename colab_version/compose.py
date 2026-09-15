@@ -389,8 +389,8 @@ def card_overlay(card: Optional[Dict[str, Any]], layout: LayoutState,
     # card the user had turned off
     _sh = getattr(layout.card, "shortHeight", 0.75)
     short_h = max(0.2, min(1.0, 0.75 if _sh is None else float(_sh)))
-    _op = getattr(layout.card, "opacity", 0.9)
-    opacity = max(0.0, min(1.0, 0.9 if _op is None else float(_op)))
+    _op = getattr(layout.card, "opacity", 0.96)
+    opacity = max(0.0, min(1.0, 0.96 if _op is None else float(_op)))
     if opacity <= 0.001:
         # 0 % means no card — not a 5 % ghost of one
         return np.zeros((0, 0, 4), np.uint8), 0, 0
@@ -786,6 +786,12 @@ def render_duration(segments: List[Segment], fast_speed: float = 4.0) -> float:
 # ---------------------------------------------------------------------------
 
 _NVENC_OK: Optional[bool] = None
+# REACT_GPU=0 present when the process STARTED is a user decision — an
+# automatic retry must never override it. A pin set later by
+# force_cpu_encode is a failure pin, and the next job re-tests the GPU.
+_GPU_USER_FORCED = os.environ.get("REACT_GPU", "1") == "0"
+# why the last GPU failure pinned this process to the CPU ("" = not pinned)
+_GPU_PINNED: str = ""
 
 
 def reset_nvenc_cache() -> None:
@@ -801,12 +807,60 @@ def reset_nvenc_cache() -> None:
 
 
 def force_cpu_encode(why: str = "") -> None:
-    """Pin every later encoder choice in this process to libx264."""
-    global _NVENC_OK
+    """Pin every later encoder choice in this process to libx264.
+
+    The pin is remembered as a FAILURE pin: the GPU usually comes back
+    (driver hiccup, a reclaimed-then-restored session), so the next job
+    re-runs the smoke test via retry_gpu_encode() instead of staying on the
+    CPU for the rest of the runtime — which is exactly the state Colab
+    reports as "GPU is not being used".
+    """
+    global _NVENC_OK, _GPU_PINNED
     os.environ["REACT_GPU"] = "0"
     _NVENC_OK = False
+    if not _GPU_USER_FORCED:
+        _GPU_PINNED = why or "an encoder failure"
     print(f"  encoder: switching to libx264 (CPU) for the rest of this run"
           f"{' — ' + why if why else ''}")
+
+
+def gpu_failure_pin() -> str:
+    """The reason a GPU failure pinned the process to the CPU ("" = none)."""
+    return _GPU_PINNED
+
+
+def retry_gpu_encode() -> bool:
+    """Give the GPU another chance at the start of a new job.
+
+    After a failure pin the CPU keeps doing the work, but the GPU is
+    normally fine again by the next render — re-test it. Returns True when
+    h264_nvenc is usable. A REACT_GPU=0 the user set themselves is never
+    overridden; an already-working GPU returns instantly.
+    """
+    global _NVENC_OK, _GPU_PINNED
+    if _GPU_USER_FORCED:
+        return False
+    if _NVENC_OK is True:
+        return True
+    _GPU_PINNED = ""
+    os.environ.pop("REACT_GPU", None)      # the pin set it, not the user
+    _NVENC_OK = None
+    ok = nvenc_available()
+    if ok:
+        print("  encoder: the GPU smoke test passed again — h264_nvenc "
+              "re-enabled for this job")
+    return ok
+
+
+def encoder_status() -> Dict[str, Any]:
+    """Machine-readable encoder state (published by the server's /api/state):
+    is the GPU doing the encoding, and if not, why."""
+    return {
+        "gpu": nvenc_available(verbose=False),
+        "pinned_by_failure": bool(_GPU_PINNED),
+        "forced_cpu_by_user": _GPU_USER_FORCED,
+        "pin_reason": _GPU_PINNED,
+    }
 
 
 def nvenc_available(verbose: bool = True) -> bool:

@@ -475,11 +475,11 @@ export default function SegmentsPanel({
           />
           <Slider
             label="Card opacity"
-            value={Math.round((layout.card.opacity ?? 0.9) * 100)}
+            value={Math.round((layout.card.opacity ?? 0.96) * 100)}
             min={0}
             max={100}
             step={1}
-            display={`${Math.round((layout.card.opacity ?? 0.9) * 100)}%`}
+            display={`${Math.round((layout.card.opacity ?? 0.96) * 100)}%`}
             onChange={(v) => setLayout((l) => ({ ...l, card: { ...l.card, opacity: v / 100 } }))}
             hint="exact: 100% hides the content, 50% ghosts through, 0% draws no card at all"
           />

@@ -3,7 +3,7 @@ import type { Claim, LayerStyle, LayoutState, AudioState, Segment } from "../lib
 import { LAYOUT_PRESETS } from "../lib/types";
 import { fmtTime } from "../lib/timeline";
 import type { Levels } from "../lib/audio";
-import type { RemoteJob } from "../lib/remote";
+import type { RemoteEncoder, RemoteJob } from "../lib/remote";
 import { Btn, CardImagePicker, LiveText, Meter, Note, Section, Segmented, Slider, Toggle } from "./ui";
 import { cn } from "../utils/cn";
 
@@ -789,6 +789,8 @@ export function ExportPanel({
     /** finish a stopped render from the parts already on the server */
     onResume: (key: string) => void;
     fileUrl: (name: string) => string;
+    /** GPU/CPU encoder verdict from the server (null until known) */
+    encoder?: RemoteEncoder | null;
   } | null;
   /** seconds of programme per server part; 0 = automatic */
   partTarget?: number;
@@ -1089,6 +1091,42 @@ export function ExportPanel({
           {remote && remote.error && (
             <p className="rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200">
               {remote.error}
+            </p>
+          )}
+          {remote && remote.connected && remote.encoder && (
+            <p
+              className={cn(
+                "rounded-lg border px-2 py-1.5 text-[10px] leading-relaxed",
+                remote.encoder.gpu
+                  ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
+                  : remote.encoder.pinned_by_failure
+                  ? "border-amber-400/30 bg-amber-500/10 text-amber-200"
+                  : "border-white/10 bg-white/5 text-slate-400"
+              )}
+              title={remote.encoder.pin_reason || undefined}
+            >
+              {remote.encoder.gpu ? (
+                <>
+                  <b className="font-semibold">GPU encoder on.</b> Renders use h264_nvenc —
+                  this is the part that keeps the Colab GPU busy.
+                </>
+              ) : remote.encoder.pinned_by_failure ? (
+                <>
+                  <b className="font-semibold">GPU failed earlier, encoding on CPU now.</b>{" "}
+                  It re-tests the GPU automatically when the next render starts
+                  {remote.encoder.pin_reason ? ` (${remote.encoder.pin_reason})` : ""}.
+                </>
+              ) : remote.encoder.forced_cpu_by_user ? (
+                <>
+                  <b className="font-semibold">CPU encoder.</b> REACT_GPU=0 is set, so the
+                  GPU is deliberately bypassed.
+                </>
+              ) : (
+                <>
+                  <b className="font-semibold">CPU encoder.</b> No usable GPU / nvenc on this
+                  runtime — renders still finish, just slower.
+                </>
+              )}
             </p>
           )}
           {remote && job?.state === "error" && (
